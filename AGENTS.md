@@ -171,7 +171,7 @@ out whether the previous one worked.
 |---|---|---|
 | 1 | Confirm **4K pages** are achievable on the SoC. FEX requires them absolutely. If the vendor kernel and the hardware force 16K/64K, stop — the project has no point on that device. | `CONFIG_ARM64_4K_PAGES=y`, asserted in `scripts/assert-alioth-boot-image.sh` |
 | 2 | Device tree. Start from postmarketOS's if one exists; it is usually closer to working than anything you will write. | `external-and-mods/kernel-sm8250/dts/sm8250-xiaomi-alioth.dts` |
-| 3 | Boot image format. Which header version the bootloader accepts, whether `dtbo` must be erased, what the kernel command line needs. Measure this from the device's own UART or USB console, not from a wiki. | `make-steamos-alioth.sh` (`KERNEL_CMDLINE_EXTRA`, `mkbootimg-v0.py`) |
+| 3 | Boot image format. Which header version the bootloader accepts, whether `dtbo` must be erased, what the kernel command line needs. Measure this from the device's own UART or USB console, not from a wiki. **On devices with a Qualcomm ABL, `fastboot erase dtbo_<slot>` is usually mandatory** -- see `docs/op8p/README.md` §17, where it took ten failed boots to rediscover a rule already written in `docs/alioth.md`. | `make-steamos-alioth.sh` (`KERNEL_CMDLINE_EXTRA`, `mkbootimg-v0.py`) |
 | 4 | A log channel that survives a reset, before you need it. On alioth `ramoops` was ruled unusable (PSHOLD hard reset loses the record) and the USB ACM console replaced it. Getting this wrong means every later failure looks identical: a black screen. | `docs/alioth.md` 日志通道的真相 |
 | 5 | Panel and touch. Both were forward-ports; the API adaptation is small, the hard part is the panel's init sequence and the touch IC's firmware state. | patches `0017`, `0018`, `0020`–`0024` |
 | 6 | Device-signed firmware. Find out which blobs your SoC's TrustZone insists on. | `scripts/extract-alioth-firmware.sh`, `scripts/assert-alioth-firmware.sh` |
@@ -194,6 +194,41 @@ Three rules that earned their place on this port:
   ADSP returned `EBADPARAM` twice against two plausible theories. The third
   round added a configuration dump and the answer was visible immediately:
   24-bit samples in 16-bit slots.
+
+Three more earned on the OnePlus 8 Pro port (`docs/op8p/`), each of which
+cost several flash cycles:
+
+- **Never delete a rule from this repo's own scripts without evidence that
+  it does not apply.** `flash-alioth.sh` erases `dtbo`; when writing
+  `flash-op8p.sh` that step was dropped on the reasoning "OnePlus probably
+  does not need it". That was invented, not measured, and it was the single
+  root cause of ten failed boots (`docs/op8p/README.md` §17.3). Keeping a
+  rule costs one wasted write; dropping one costs a night.
+- **The bootloader has a log partition.** On Qualcomm devices `abl_log`
+  holds the ABL's own trace of every boot, including the DTB matching keys
+  it computed and the exact error it stopped on. Read it with
+  `su -c 'strings /dev/block/by-name/abl_log'`. Four hypotheses (header
+  version, image size, kernel format, ramdisk size) were each disproved in
+  one read once the log was consulted.
+- **Read the return-value contract before believing an error.** On the
+  OnePlus 8 Pro panel, `mipi_dsi_dcs_read()` returning `1` was read as
+  "error 1" and sent the whole display investigation down a wrong path for
+  hours. It returns the number of bytes read; `1` means success. The same
+  log line would have meant the opposite thing. When a driver function has
+  a suspicious return value, open the source before acting on it.
+- **A patch that embeds a whole file (`@@ -0,0 +1,N @@`) is checked by its
+  own line count.** Scripts that extract a file out of a patch and diff it
+  again can truncate the tail without any error: on this port it silently
+  dropped `module_mipi_dsi_driver()`, so the driver compiled, got linked,
+  and never probed. The only symptom was `warning: '..._probe' defined but
+  not used`. After regenerating such a patch, assert that the `+` line count
+  equals `N`.
+- **`/proc/device-tree/.../status` answers "is this node enabled" in one
+  command.** A black screen on this port came down to `&dispcc` being
+  `"disabled"` in the upstream DTS; the running kernel said so directly
+  (`cat /proc/device-tree/soc@0/clock-controller@af00000/status`), while
+  dmesg only reported an `-ETIMEDOUT` twelve seconds later, pointing at the
+  wrong device.
 
 ---
 

@@ -1,0 +1,184 @@
+# OnePlus 8 Pro (instantnoodlep / IN2020) 硬件清单
+# 采集时间: 2026-10-25 17:45:26 +0800
+# 来源: 设备自身 sysfs / devicetree，非推断
+
+## 整机
+serial: 0025ed26
+project_name: 19811
+hw_version: 15
+platform: SM8250  id=356
+codename: instantnoodlep
+sku: 3
+slot: _b
+avb: unlocked / orange
+kernel: 4.19.110-perf+
+PAGESIZE: 4096
+dt_board_id: 0000000800000000
+dt_msm_id:    0000016400020001
+
+## cmdline
+androidboot.bootdevice=1d84000.ufshc
+msm_drm.dsi_display0=qcom,mdss_dsi_samsung_ana6706_dsc_cmd:
+panel_type=normal
+androidboot.hw_version=15
+
+
+## 分区表（/dev/block/by-name/ 实测，关键项）
+boot_a -> /dev/block/sde11
+boot_b -> /dev/block/sde35
+dtbo_a -> /dev/block/sde17
+dtbo_b -> /dev/block/sde41
+userdata -> /dev/block/sda23
+super -> /dev/block/sda14
+modem_a -> /dev/block/sde4
+modem_b -> /dev/block/sde28
+dsp_a -> /dev/block/sde9
+dsp_b -> /dev/block/sde33
+abl_a -> /dev/block/sde8
+abl_b -> /dev/block/sde32
+vbmeta_a -> /dev/block/sde16
+vbmeta_b -> /dev/block/sde40
+bluetooth_a -> /dev/block/sde5
+
+## 显示（DSI0 面板 ANA6706）
+panel-name: samsung ana6706 dsc cmd mode panel
+panel-node: /sys/firmware/devicetree/base/soc/qcom,mdss_mdp@ae00000/qcom,mdss_dsi_samsung_ana6706_dsc_cmd
+type: dsi_cmd_mode / burst_mode / DSC
+cmdline: msm_drm.dsi_display0=qcom,mdss_dsi_samsung_ana6706_dsc_cmd
+reset-gpio: 000000650000004b00000000
+te-gpio:    000000650000004200000000
+pixelworks iris: pxlw,iris-chip-enable present (1 pxlw i2c on bus 6)
+
+### 时序表（4 组，实测）
+idx  WxH        fps  hfp hbp hpw  vfp  vbp  vpw  slice
+0    1080x2376  60   64  48  8    1100 1100 188  540x72
+1    1080x2376  120  64  48  8    2    8    2    540x72
+2    1440x3168  120  88  56  8    8    8    8    720x96
+3    1440x3168  60   80  80  8    180  180  12   720x16
+bpp=8 (idx3=10)  DSC slice-per-pkt=2
+
+## 触摸（Samsung S6SY761 / SY79x）
+node: /sys/firmware/devicetree/base/soc/i2c@a94000/sec-s6sy761@48
+compatible: sec-s6sy761   chip-name: SY79x   panel: (空)   project: 19811
+i2c bus: a94000 (i2c4)  addr 0x48
+tx-rx: 17x38   panel-coords/display-coords: 1439x3168
+irq-gpio:  tlmm 39  flags 0x2008 (IRQ_TYPE_EDGE_FALLING|ONESHOT)
+reset-gpio: tlmm 38
+vdd_2v8: 0x2de600 = 3009024 uV
+input dev: /dev/input/event3  name=touchpanel  ABS_MT_POSITION_X max 1439  Y max 3168
+
+
+## 音频
+声卡: kona-mtp-snd-card（DT qcom,model）
+codec: WCD938x（wcd938x_codec）+ bolero（rx/tx/va/wsa macro）
+扬声器功放: nxp,tfa98xx x2  @ i2c@884000 : tfa98xx_right@34 / tfa98xx_left@35
+  reset-gpio: left=tlmm 99 (0x63)  right=tlmm 91 (0x5b)   [cell1=0x65 tlmm]
+  ** 不是 CS35L41，不走 TERTIARY TDM，不走 WSA SoundWire **
+qcom,wsa-max-devs = 0  -> WSA881x 不存在
+qcom,wsa-aux-dev-prefix = SpkrLeft / SpkrRight（aux dev 前缀仍在）
+qcom,codec-aux-devs phandle = 0x65f（指向 tfa 之一）
+耳机 jack: kona-mtp-snd-card Headset Jack / Button Jack（已枚举）
+USB-C 音频: fsa4480 @ i2c@884000 typec-mux@42 (未在本次节点列表中出现，待核)
+
+## 充电 / 电量
+bms/voltage_max_design = 4420000 uV   <-- 4.42V，不是 DTS 里的 4.35V，也不是 alioth 的 4.45V
+bms/charge_full_design  = 3991000 uAh  <-- 3991 mAh
+bms/voltage_now         = 4433000 uV
+bms/temp                = 235 (23.5C)   capacity=100%
+gauge:  bq27541-battery @ i2c@888000 0x55  (TI BQ27541, 外部电量计)
+charger: bq2597x-charger @ 0x66 / chgpump-charger @ 0x19 / dash_fastchg @ 0x26
+          smb1390_slave @ 0x18 / chgpump-charger(7-0019)
+dumpsys: AC powered=true  max_chg_current=2250000  max_chg_voltage=5000000
+
+## GPU / 固件
+GPU: Adreno 650 (kgsl-3d0)
+/vendor/firmware/: a650_zap.{mdt,b00,b01,b02,elf} + a650_gmu.bin + a650_sqe.fw
+  -> 需要 pil-squasher 合成 a650_zap.mbn（与 alioth 同法）
+  a650_zap.mdt = 6860 B, b01=6712 B, b02=1676 B, b00=148 B
+
+## 无线
+WiFi/BT: QCA6390, PCI 0000:01:00.0  id 17cb:1101（与 alioth 相同）
+/vendor/firmware_mnt/image/qca6390/: amss20.bin, m3.bin, bdwlan.e01..eNN, Data.msc
+  -> 需 ath11k-bdencoder 合成 board-2.bin（本机专属 BDF）
+蓝牙: /vendor/firmware_mnt/image/qca6390/ 同目录；bluetooth_a 分区
+NFC: nq-nci @ i2c@984000 0x28 (已绑定)
+
+## ADSP / DSP
+/vendor/dsp/  (dsp_a=sde9, ext4, 挂在 /vendor/dsp)
+/vendor/firmware_mnt/image/: adsp.mdt + adsp.b00..b18, cdsp.*, slpi.*
+  -> 需要 pil-squasher 合成 adsp.mbn
+
+
+## USB
+控制器: ssusb@a600000 -> dwc3@a600000
+dr_mode = drd   maximum-speed = super-speed   (USB 3.0, 与 alioth 的 USB2-only 不同)
+typec: /sys/class/typec/port0  data_role='host [device]'  power_role='source [sink]'
+cmdline: androidboot.usbcontroller=a600000.dwc3
+第二个 USB: ssusb@a800000（DP alt mode / 显示口）
+
+## 内存 / 留白区（DT reserved-memory 实测）
+cont_splash_region@9c000000  size 0x2300000   <- simpledrm framebuffer 用
+disp_rdump_region@9c000000   size 0x800000
+dfps_data_region@9e300000    size 0x100000
+ramoops@0xA9800000           size 0x400000    <- 比 alioth 的 0x100000 大 4 倍
+pil_adsp_region@8fe00000     size 0x2500000
+pil_gpu_region@8c51a000      size 0x2000
+pil_slpi_region@8e900000     size 0x1500000
+
+## 输入设备（getevent -pl 实测）
+event0 qpnp_pon         电源键（Power）
+event1 qti-haptics      振动马达
+event2 gpio-keys        音量上/下
+event3 touchpanel       S6SY761 触摸
+event4 touchpanel_kpd   
+event5 touchpanel_ps    
+event6 gf_input         屏下指纹（Goodix）
+event7 STM VL53L1       距离传感器（真实 ToF，与 alioth 的超声方案不同）
+event8 Headset Jack
+event9 Button Jack
+
+## 其他 i2c 器件（已绑定驱动）
+0-0034 -> tfa98xx        右扬声器功放
+0-0035 -> tfa98xx        左扬声器功放
+4-0048 -> sec-s6sy761    触摸
+5-0018 -> hall-ist8801-down
+5-0019 -> hall-ist8801-up  (霍尔，翻盖检测)
+5-0028 -> nq-nci         NFC
+6-0022 -> pixelworks-i2c  PXLW Iris 协处理器
+6-0026 -> pixelworks
+7-0019 -> chgpump-charger
+7-003b -> wlchg_rx       无线充电（K40 没有，这里有）
+7-0066 -> bq2597x-charger
+8-0026 -> dash_fastchg   Dash/Warp 快充
+8-0055 -> bq27541-battery 电量计
+
+## HW 版本
+hw_version=15  rf_version=11  prj_version=11
+注意: hw_version 15 可能与首批 hw_version 更低的机型面板/触摸不同，移植时以本机实测为准
+
+## DCS 初始化序列（2026-10-25 补充采集，P3 用）
+源: qcom,mdss-dsi-display-timings/timing@N/qcom,mdss-dsi-on-command
+编码: Qualcomm 打包格式，每包 = [dtype][last][wait_hi][wait_lo][delay_ms][len_hi][len_lo][payload]
+      dtype 0x05=DCS短写 0x15=DCS长写 0x39=通用长写 0x07=通用短写
+
+timing@0  638 B  58 包   1080x2376@60
+timing@1  668 B  61 包   1080x2376@120
+timing@2  638 B  58 包   1440x3168@120
+timing@3  638 B  58 包   1440x3168@60
+
+差异: 只有 timing@1 在 0x60 处写 0x22（其余写 0x02），并多一组
+      0xb9 01 / 0xb0 01 / 0xb9 0c 54 00 0b
+延迟: 3 处 —— exit sleep 后 11ms、0xf0 0xa5 0xa5 后 11ms、另一处 111ms
+
+## 面板电源（qcom,panel-supply-entries 实测）
+vddi    1800000 uV  post-on-sleep  2 ms
+vddr    1300000 uV  post-off-sleep 1 ms
+vci     3000000 uV
+px_v18r 1800000 uV  (Iris 供电, qcom,iris-supply-entries)
+
+## 面板 GPIO / 背光
+reset-gpio          tlmm 75
+te-gpio             tlmm 66
+bl-pmic-control-type bl_ctrl_dcs
+bl-min / bl-max     1 / 2047
+brightness-default  360

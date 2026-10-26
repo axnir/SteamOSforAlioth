@@ -342,7 +342,22 @@ scripts/
   alioth-selfflash-boot.sh flash a kernel from the running device
   alioth-speaker-test.sh   the only safe way to test audio (see the warning above)
 docs/                      the write-ups
+
+# Second device, in progress: OnePlus 8 Pro (instantnoodlep)
+make-op8p.sh               --gzip | --v2   (boot image; DTB appended or in a v2 slot)
+flash-op8p.sh              --boot | --test  (writes boot_<inactive> and ERASES dtbo_<inactive>)
+external-and-mods/kernel-sm8250/dts/sm8250-oneplus-instantnoodlep.dts
+external-and-mods/kernel-sm8250/patches/0029-drm-panel-add-the-samsung-ana6706-panel.patch
+external-and-mods/kernel-common/mkbootimg-v2.py, mkdtbo.py
+external-and-mods/kernel-common/initramfs/drmtest.c
+scripts/assert-op8p-flash.sh
+docs/op8p/                 hardware inventory, port log, driver assessment
 ```
+
+`docs/op8p/` documents a second device in progress — an OnePlus 8 Pro that
+boots the same kernel. It is not a finished port: the kernel runs and reaches a
+USB shell, but the panel is not lit yet. Read `docs/op8p/README.md` §17 for the
+`erase dtbo` rule and §18 for where the display work stopped.
 
 Three pieces come from the upstream project this is forked from, kept because
 the build genuinely needs them: `external-and-mods/kernel-common` (the build
