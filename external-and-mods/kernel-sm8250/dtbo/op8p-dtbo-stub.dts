@@ -1,0 +1,100 @@
+/*
+ * dtbo stub for OnePlus 8 Pro (instantnoodlep).
+ *
+ * The ABL's display/kernel bring-up is two-stage, and this partition is
+ * the second stage. It picks one of the overlays on `dtbo` by dtbo_idx,
+ * verifies that the overlay's board-id matches the base DTB's, then
+ * merges it. That is why the stock partition is not empty: it holds 11
+ * overlays, all board-id <8 0>, and dtbo_idx=5 selects the one whose
+ * model string is "kona MTP dvt/mp 19811 14 15" -- exactly this phone's
+ * project_name=19811 and hw_version=15.
+ *
+ * postmarketOS does not ship Qualcomm overlays; its device package builds
+ * this same file and flashes it to `dtbo` instead of the stock one. It
+ * carries nothing but the match keys, so merging it is a no-op on the
+ * device tree, but it satisfies the ABL's second-stage check.
+ *
+ * Two values here are load-bearing and must agree with
+ * external-and-mods/kernel-sm8250/dts/sm8250-oneplus-instantnoodlep.dts:
+ *
+ *   qcom,board-id = <8 0>     -- identical to the base DTB's
+ *   qcom,msm-id   = <356 0x10000>  -- 356 = QCOM_ID_SM8250 (0x164)
+ *
+ * 356 is written in decimal here on purpose: this is a byte-for-byte
+ * reproduction of what postmarketOS generates for this device, and
+ * keeping the same spelling makes a diff against theirs meaningful.
+ *
+ * If the base DTB and this file ever disagree on board-id, the ABL log
+ * says:
+ *
+ *   No match found for Soc Dtb type
+ *   Error: Appended Soc Device Tree blob not found
+ *
+ * which reads like a missing DTB but is a mismatch between these two.
+ */
+/dts-v1/;
+
+/ {
+	model = "Qualcomm Technologies, Inc. kona MTP dvt/mp 19811 14 15 52 53";
+	compatible = "qcom,kona-mtp", "qcom,kona", "qcom,mtp";
+	chassis-type = "handset";
+
+	/*
+	 * Matching keys, copied from the stock overlay this partition
+	 * normally carries (dtbo_idx=5, measured 2026-10-25):
+	 *
+	 *   qcom,board-id     = <8 0>
+	 *   oem,project-id    = <0x4d63>        (0x4d63 = 19811)
+	 *   oem,hw-id         = <14 15 52 53>   (this phone: hw_version 15)
+	 *   qcom,msm-id       -- ABSENT
+	 *
+	 * The absence of msm-id is the important part. A previous revision
+	 * of this file carried `qcom,msm-id = <356 0x10000>`, taken from
+	 * postmarketOS' stub, and the ABL then parsed it as a *SoC* DTB:
+	 *
+	 *   board PfId= 164 Soc= 10000 ... pr= 0 hw= 0
+	 *
+	 * with pmOS' value, against
+	 *
+	 *   board PfId= 0   Soc= 0     ... pr= 19811 hw= 15
+	 *
+	 * for the stock overlay, which is matched on project-id and hw-id
+	 * instead. Both descriptions made ApplyOverlay report
+	 * `ufdt apply overlay failed`, but for different reasons: with
+	 * msm-id the ABL takes the board-DTB branch with the wrong
+	 * identity, and without a fragment libufdt has nothing to apply.
+	 *
+	 * 0x4d63 is 19811 in hex; written in hex here to match the stock
+	 * decoded dump so the two can be diffed by eye.
+	 */
+	qcom,board-id = <8 0>;
+	oem,project-id = <0x4d63>;
+	oem,hw-id = <14 15 52 53>;
+
+	/*
+	 * The fragment is what makes this a legal overlay.
+	 *
+	 * postmarketOS' stub has no fragment at all, and on their build it is
+	 * never handed to libufdt -- their ABL path resolves the base DTB
+	 * from the boot image's v2 dtb segment and treats dtbo as a
+	 * candidate pool only. This ABL calls ApplyOverlay unconditionally,
+	 * and libufdt returns an error for an overlay with zero fragments:
+	 *
+	 *   ApplyOverlay: ufdt apply overlay failed
+	 *   Error: Dtb overlay failed
+	 *
+	 * So add one fragment that merges into the root node and changes
+	 * nothing. Applying it is a no-op on the tree, but it gives libufdt
+	 * the shape it validates before it will report success.
+	 *
+	 * target-path rather than target: a phandle would have to resolve
+	 * into the base DTB, and the base DTB's phandle numbering is not
+	 * something to bake in here -- ufdt resolves target-path by string.
+	 */
+	fragment@0 {
+		target-path = "/";
+
+		__overlay__ {
+		};
+	};
+};

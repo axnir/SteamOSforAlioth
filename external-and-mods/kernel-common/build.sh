@@ -327,6 +327,18 @@ build_initramfs() {
   install -m0755 "${HERE}/initramfs/init" "$d/root/init"
   install -m0755 "${HERE}/initramfs/konkr-update-recover" "$d/root/konkr-update-recover"
   install -m0755 "${HERE}/initramfs/bootdebug" "$d/root/bootdebug"
+  # drmtest: force one modeset with raw drmModeSetCrtc. Phase 1 on the
+  # OnePlus 8 Pro probes the whole display chain (dispcc, mdss, dsi, phy,
+  # panel, backlight) and the DSI interrupt fires continuously, yet
+  # /sys/kernel/debug/dri/0/state stays empty and the panel is black:
+  # with no compositor nothing ever commits a frame. Running this by hand
+  # from the initramfs shell separates "hardware is fine, nobody is
+  # driving it" from "something below DRM is wrong", which no amount of
+  # reading dmesg can settle. Optional: only bundled when the binary
+  # exists, so a plain build is unaffected.
+  if [[ -x "${DRMTEST:-${HERE}/initramfs/drmtest}" ]]; then
+    install -m0755 "${DRMTEST:-${HERE}/initramfs/drmtest}" "$d/root/bin/drmtest"
+  fi
   # Test builds only: fixed root files, laid over the installed ones (see init).
   if [[ -n "${INITRAMFS_HOTFIX:-}" ]]; then
     mkdir -p "$d/root/hotfix" && cp -a "${INITRAMFS_HOTFIX}/." "$d/root/hotfix/"

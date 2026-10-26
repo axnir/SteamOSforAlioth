@@ -111,3 +111,8 @@ _agent_*
 
 # 内核与镜像构建产物（约 40GB）
 work/
+
+# Built artifacts for the OnePlus 8 Pro port. drmtest.c is the source; the
+# binary is produced by the command in docs/op8p/README.md and is only
+# bundled into the initramfs when present (build.sh checks -x).
+external-and-mods/kernel-common/initramfs/drmtest
