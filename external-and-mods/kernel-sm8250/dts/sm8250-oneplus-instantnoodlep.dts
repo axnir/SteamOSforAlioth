@@ -867,6 +867,48 @@
 		bias-pull-down;
 	};
 
+	/*
+	 * Panel power and synchronisation pins. gpio8 is the panel VOUT
+	 * enable -- the one that actually powers the panel; see the comment
+	 * on panel@0. gpio66 is TE and has to be mdp_vsync so the DSI host
+	 * sees the tear signal, not a plain GPIO edge.
+	 */
+	panel_reset_default: panel-reset-default-state {
+		pins = "gpio75";
+		function = "gpio";
+		drive-strength = <8>;
+		bias-disable;
+	};
+
+	panel_reset_suspend: panel-reset-suspend-state {
+		pins = "gpio75";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-down;
+	};
+
+	panel_vout_default: panel-vout-default-state {
+		pins = "gpio8";
+		function = "gpio";
+		drive-strength = <8>;
+		bias-disable;
+		output-high;
+	};
+
+	panel_vout_suspend: panel-vout-suspend-state {
+		pins = "gpio8";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-down;
+	};
+
+	panel_vsync: panel-vsync-state {
+		pins = "gpio66";
+		function = "mdp_vsync";
+		drive-strength = <2>;
+		bias-pull-down;
+	};
+
 	wlan_en_state: wlan-default-state {
 		wlan-en {
 			pins = "gpio20";
@@ -1033,9 +1075,48 @@
 
 		reset-gpios = <&tlmm 75 GPIO_ACTIVE_LOW>;
 
+		/*
+		 * There is a third power control the regulator list does not
+		 * cover: gpio8 drives the panel VOUT enable. Without it pulled
+		 * high the panel receives no supply, and the failure looks like
+		 * nothing at all -- no picture, no backlight, while every
+		 * software check passes: DSI talks both ways, get_power_mode
+		 * answers, err_count stays 0. The supply that does reach the
+		 * panel through vddi is enough for its low-voltage side to
+		 * respond to DCS reads, which is why the link looked healthy.
+		 *
+		 * gpio66 carries TE and must be muxed to mdp_vsync rather than
+		 * used as a plain GPIO, or the host never sees the tear signal
+		 * a command-mode panel relies on.
+		 *
+		 * Both, and the reset line's drive strength, are taken from
+		 * postmarketOS' sm8250-oneplus-common.dtsi, which is the only
+		 * OnePlus tree in that fork that configures this panel power.
+		 */
+		pinctrl-names = "default", "sleep";
+		pinctrl-0 = <&panel_reset_default &panel_vout_default &panel_vsync>;
+		pinctrl-1 = <&panel_reset_suspend &panel_vout_suspend &panel_vsync>;
+
 		/* Physical mounting: long edge vertical. 90 not 270 -- see the
 		 * driver's get_orientation comment. */
 		rotation = <90>;
+
+		/*
+		 * DSC packetisation. The vendor DT says two slices go into one
+		 * DSI packet; without this the host assumes one and the panel
+		 * decodes half a line as a whole line, which is the two-stripe
+		 * garbling seen on hardware. patch 0030 makes the host read it.
+		 */
+		qcom,mdss-dsc-slice-per-pkt = <2>;
+
+		/*
+		 * Iris analog-bypass ready, input only. The Pixelworks chip sits
+		 * between the DSI host and the panel; it passes data through
+		 * only once its ABYP logic reports ready on this line. Reading
+		 * it is the cheapest way to find out whether Iris is in the way:
+		 * 1 means transparent, 0 means it is still holding the link.
+		 */
+		iris-abyp-ready-gpios = <&tlmm 112 GPIO_ACTIVE_HIGH>;
 
 		status = "okay";
 

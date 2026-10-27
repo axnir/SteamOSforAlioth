@@ -1,0 +1,135 @@
+drm/msm/dsi: honour qcom,mdss-dsc-slice-per-pkt
+
+The DSI host hardcodes DSI packet layout for DSC as one slice per
+packet. The vendor kernel does not: mdss_panel_dsc_pclk_param_calc()
+computes
+
+    bytes_per_pkt = bytes_in_slice * slice_per_pkt;
+    pkt_per_line  = slice_per_intf / slice_per_pkt;
+
+from qcom,mdss-dsc-slice-per-pkt in the panel node, clamping
+slice_per_pkt to 1 when it exceeds slice_per_intf.
+
+Panels that ask for 2 (the OnePlus 8 Pro ANA6706 among them) are told a
+line is split into slice_count slices and the slices travel two per
+packet. With the driver assuming 1, the two sides disagree on packet
+boundaries: WC comes out as slice_chunk_size + 1 instead of
+slice_chunk_size * 2 + 1, and PKT_PER_LINE is programmed one step too
+high. The panel then decodes one half-slice of data as if it were a
+whole line, which shows up as the display splitting into two garbled
+stripes rather than failing outright.
+
+Read the property from the panel node, default to 1 so every existing
+panel is bit-for-bit unaffected, and use it in both places.
+
+Signed-off-by: SteamOS for alioth port
+
+---
+--- a/drivers/gpu/drm/msm/dsi/dsi_host.c
++++ b/drivers/gpu/drm/msm/dsi/dsi_host.c
+@@ -166,6 +166,13 @@
+ 
+ 	struct drm_display_mode *mode;
+ 	struct drm_dsc_config *dsc;
++	/*
++	 * How many DSC slices go into one DSI packet. The vendor DT expresses
++	 * this as qcom,mdss-dsc-slice-per-pkt, and for this panel it is 2,
++	 * while this driver has always assumed 1. Defaulted to 1 so every
++	 * existing panel behaves exactly as before.
++	 */
++	u32 dsc_slice_per_pkt;
+ 
+ 	/* connected device info */
+ 	unsigned int channel;
+@@ -952,18 +959,33 @@
+ 	slice_per_intf = dsc->slice_count;
+ 
+ 	total_bytes_per_intf = dsc->slice_chunk_size * slice_per_intf;
+-	bytes_per_pkt = dsc->slice_chunk_size; /* * slice_per_pkt; */
+ 
+-	eol_byte_num = total_bytes_per_intf % 3;
+-
+ 	/*
+-	 * Typically, pkt_per_line = slice_per_intf * slice_per_pkt.
++	 * The vendor kernel's mdss_panel_dsc_pclk_param_calc() does:
+ 	 *
+-	 * Since the current driver only supports slice_per_pkt = 1,
+-	 * pkt_per_line will be equal to slice per intf for now.
++	 *     bytes_per_pkt = bytes_in_slice * slice_per_pkt;
++	 *     pkt_per_line  = slice_per_intf / slice_per_pkt;
++	 *
++	 * and clamps slice_per_pkt to 1 when it exceeds slice_per_intf.
++	 * Reproduce that, with slice_per_pkt defaulting to 1.
+ 	 */
+-	pkt_per_line = slice_per_intf;
++	if (msm_host->dsc_slice_per_pkt > slice_per_intf)
++		msm_host->dsc_slice_per_pkt = 1;
++	if (!msm_host->dsc_slice_per_pkt)
++		msm_host->dsc_slice_per_pkt = 1;
+ 
++	dev_info(msm_host->dev->dev,
++		 "dsc: slice_per_pkt=%u slice_per_intf=%u chunk=%u pkt_per_line=%u\n",
++		 msm_host->dsc_slice_per_pkt, slice_per_intf,
++		 dsc->slice_chunk_size,
++		 slice_per_intf / msm_host->dsc_slice_per_pkt);
++
++	bytes_per_pkt = dsc->slice_chunk_size * msm_host->dsc_slice_per_pkt;
++
++	eol_byte_num = total_bytes_per_intf % 3;
++
++	pkt_per_line = slice_per_intf / msm_host->dsc_slice_per_pkt;
++
+ 	if (is_cmd_mode) /* packet data type */
+ 		reg = DSI_COMMAND_COMPRESSION_MODE_CTRL_STREAM0_DATATYPE(MIPI_DSI_DCS_LONG_WRITE);
+ 	else
+@@ -1118,12 +1140,11 @@
+ 		else
+ 			/*
+ 			 * When DSC is enabled, WC = slice_chunk_size * slice_per_pkt + 1.
+-			 * Currently, the driver only supports default value of slice_per_pkt = 1
+-			 *
+-			 * TODO: Expand mipi_dsi_device struct to hold slice_per_pkt info
+-			 *       and adjust DSC math to account for slice_per_pkt.
++			 * dsc_slice_per_pkt is 1 unless a panel asked for something
++			 * else through the panel driver.
+ 			 */
+-			wc = msm_host->dsc->slice_chunk_size + 1;
++			wc = msm_host->dsc->slice_chunk_size *
++				msm_host->dsc_slice_per_pkt + 1;
+ 
+ 		dsi_write(msm_host, REG_DSI_CMD_MDP_STREAM0_CTRL,
+ 			DSI_CMD_MDP_STREAM0_CTRL_WORD_COUNT(wc) |
+@@ -1935,6 +1956,9 @@
+ 	const char *te_source;
+ 	int ret = 0;
+ 
++	/* One slice per packet unless the attached panel says otherwise. */
++	msm_host->dsc_slice_per_pkt = 1;
++
+ 	/*
+ 	 * Get the endpoint of the output port of the DSI host. In our case,
+ 	 * this is mapped to port number with reg = 1. Don't return an error if
+@@ -1945,6 +1969,23 @@
+ 	if (!endpoint) {
+ 		DRM_DEV_DEBUG(dev, "%s: no endpoint\n", __func__);
+ 		return 0;
++	}
++
++	/*
++	 * How many DSC slices go into one DSI packet. The panel node carries
++	 * it as qcom,mdss-dsc-slice-per-pkt, same property name the vendor
++	 * kernel reads. Absent means 1, which is what every mainline panel
++	 * has used so far.
++	 */
++	{
++		struct device_node *remote;
++
++		remote = of_graph_get_remote_port_parent(endpoint);
++		if (remote) {
++			of_property_read_u32(remote, "qcom,mdss-dsc-slice-per-pkt",
++					     &msm_host->dsc_slice_per_pkt);
++			of_node_put(remote);
++		}
+ 	}
+ 
+ 	ret = dsi_host_parse_lane_data(msm_host, endpoint);

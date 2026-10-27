@@ -66,7 +66,7 @@ Signed-off-by: SteamOS for alioth port
 +obj-$(CONFIG_DRM_PANEL_ONEOPLUS_ANA6706) += panel-oneplus-ana6706.o
 --- /dev/null
 +++ b/drivers/gpu/drm/panel/panel-oneplus-ana6706.c
-@@ -0,0 +1,750 @@
+@@ -0,0 +1,964 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Samsung ANA6706 1440x3168 DSC command-mode panel, as used on the
@@ -170,6 +170,8 @@ Signed-off-by: SteamOS for alioth port
 +	struct mipi_dsi_device *dsi;
 +	struct regulator_bulk_data *supplies;
 +	struct gpio_desc *reset_gpio;
++	/* Pixelworks Iris ABYP-ready, input. NULL if the DT omits it. */
++	struct gpio_desc *iris_abyp_ready_gpio;
 +};
 +
 +/*
@@ -194,22 +196,34 @@ Signed-off-by: SteamOS for alioth port
 + * (for a DSC command panel) the panel keeps its rails. Delays rounded
 + * into usleep_range() ranges as mainline drivers do.
 + */
++/*
++ * Reset pulse.
++ *
++ * Vendor DT: qcom,mdss-dsi-reset-sequence = <1 10>, <0 10>, <1 10>, i.e.
++ * the physical line goes high, low, high again with 10 ms at each step,
++ * ending de-asserted.
++ *
++ * The reset GPIO is declared GPIO_ACTIVE_LOW, so gpiod_set_value() takes
++ * the *logical* value and the polarity inverts: logical 1 drives the pin
++ * low, which is the asserted (in reset) state. Writing the vendor's
++ * physical levels straight into gpiod_set_value() therefore produces
++ * exactly the opposite sequence -- and that is not a subtle failure: with
++ * the line ending asserted, DCS reads time out (-110) instead of
++ * returning power_mode.
++ *
++ * So the logical sequence is 0, 1, 0: assert, release, and stay released.
++ * The trailing low (physical high) is what leaves the panel running.
++ */
 +static void ana6706_reset(struct ana6706 *ctx)
 +{
-+	gpiod_set_value_cansleep(ctx->reset_gpio, 1);
++	gpiod_set_value_cansleep(ctx->reset_gpio, 0);	/* physical high */
 +	usleep_range(10000, 11000);
-+	gpiod_set_value_cansleep(ctx->reset_gpio, 0);
-+	usleep_range(5000, 6000);
++	gpiod_set_value_cansleep(ctx->reset_gpio, 1);	/* physical low: reset */
++	usleep_range(10000, 11000);
++	gpiod_set_value_cansleep(ctx->reset_gpio, 0);	/* physical high: release */
++	usleep_range(10000, 11000);
 +}
 +
-+/*
-+ * The DCS init sequence.
-+ *
-+ * Frame only -- see the file header for why the body is empty and how to
-+ * fill it. What is here is what every Samsung DSC command panel needs
-+ * regardless of the model, and what can be written without guessing:
-+ * leaving LP mode, exit sleep, TE on, then the sleep-out settle.
-+ */
 +static int ana6706_init_sequence(struct ana6706 *ctx)
 +{
 +	struct mipi_dsi_device *dsi = ctx->dsi;
@@ -228,8 +242,36 @@ Signed-off-by: SteamOS for alioth port
 +
 +	/* --- vendor DCS init, transcribed from the phone's DT --- */
 +
++	/*
++	 * 120 ms after exit_sleep, not the vendor's 11 ms, and read back to
++	 * confirm it worked.
++	 *
++	 * Measured on hardware: with 11 ms the sequence runs to completion and
++	 * get_power_mode still reports 0x0c -- bit4 (sleep_out) is 0, i.e. the
++	 * panel says it is still asleep while also claiming display-on. That
++	 * is the state that produces "backlight flashes once, then black":
++	 * the DCS writes land, brightness takes effect, but the panel never
++	 * leaves sleep so it never scans out a frame.
++	 *
++	 * The vendor's 11 ms is what their path gets away with because the
++	 * bootloader has already woken the panel; from cold, mainline owns
++	 * reset and has to wait the full sleep-out time. 120 ms is also the
++	 * MIPI DCS worst case for T SOT.
++	 */
 +	mipi_dsi_dcs_exit_sleep_mode_multi(&dsi_ctx);
-+	mipi_dsi_usleep_range(&dsi_ctx, 11000, 12000);
++	mipi_dsi_usleep_range(&dsi_ctx, 120000, 121000);
++
++	/*
++	 * Confirm sleep-out actually took, right here, so a future run can
++	 * tell this apart from the many later steps that also read
++	 * power_mode. bit4 set means the panel left sleep.
++	 */
++	if (!dsi_ctx.accum_err) {
++		u8 pm_after = 0;
++		int ra = mipi_dsi_dcs_read(dsi, MIPI_DCS_GET_POWER_MODE, &pm_after, 1);
++		dev_info(&dsi->dev, "sleep-out check: r=%d power_mode=0x%02x sleep_out=%d\n",
++			 ra, pm_after, !!(pm_after & 0x10));
++	}
 +	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
 +	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x09);
 +	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb5, 0x08);
@@ -245,11 +287,32 @@ Signed-off-by: SteamOS for alioth port
 +	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
 +	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x03);
 +	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xcb, 0xff, 0xff);
++
++	/* bisect probe: after#15_cmd15 */
++	if (!dsi_ctx.accum_err) {
++		u8 bp = 0;
++		int br = mipi_dsi_dcs_read(dsi, MIPI_DCS_GET_POWER_MODE, &bp, 1);
++		dev_info(&dsi->dev, "bisect after#15_cmd15: r=%d power_mode=0x%02x sleep_out=%d\n",
++			 br, bp, !!(bp & 0x10));
++	}
 +	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf7, 0x0f);
 +	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
 +	mipi_dsi_usleep_range(&dsi_ctx, 11000, 12000);
 +	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
-+	mipi_dsi_generic_write_seq_multi(&dsi_ctx, 0x01);
++	/*
++	 * DSC compression mode. The vendor sequence carries this as
++	 * dtype 0x07 (DTYPE_COMPRESSION_MODE in mdss_dsi_cmd.h) with a
++	 * single 0x01 byte, at packet 19 -- between the page-lock pair and
++	 * the PPS write that follows at packet 21.
++	 *
++	 * An earlier revision sent it as mipi_dsi_generic_write_seq_multi(),
++	 * which produces a Generic Long Write (dtype 0x29), not a
++	 * compression-mode packet. The panel ignores it, so it stayed
++	 * uncompressed while everything after packet 19 assumed otherwise:
++	 * DCS reads return 0xff from around command 30, and by the end of the
++	 * sequence power_mode reads 0x0c with sleep-out cleared.
++	 */
++	mipi_dsi_compression_mode_multi(&dsi_ctx, true);
 +	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xba, 0x02);
 +	mipi_dsi_dcs_write_seq_multi(&dsi_ctx,
 +		0x9e, 0x11, 0x00, 0x00, 0x89, 0x30, 0x80, 0x09, 0x48, 0x04,
@@ -272,6 +335,14 @@ Signed-off-by: SteamOS for alioth port
 +	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
 +	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
 +	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x0a);
++
++	/* bisect probe: after#30_cmd30 */
++	if (!dsi_ctx.accum_err) {
++		u8 bp = 0;
++		int br = mipi_dsi_dcs_read(dsi, MIPI_DCS_GET_POWER_MODE, &bp, 1);
++		dev_info(&dsi->dev, "bisect after#30_cmd30: r=%d power_mode=0x%02x sleep_out=%d\n",
++			 br, bp, !!(bp & 0x10));
++	}
 +	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xfb, 0x00);
 +	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
 +	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
@@ -288,6 +359,14 @@ Signed-off-by: SteamOS for alioth port
 +	mipi_dsi_usleep_range(&dsi_ctx, 111000, 112000);
 +	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
 +	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x0b);
++
++	/* bisect probe: after#45_cmd45 */
++	if (!dsi_ctx.accum_err) {
++		u8 bp = 0;
++		int br = mipi_dsi_dcs_read(dsi, MIPI_DCS_GET_POWER_MODE, &bp, 1);
++		dev_info(&dsi->dev, "bisect after#45_cmd45: r=%d power_mode=0x%02x sleep_out=%d\n",
++			 br, bp, !!(bp & 0x10));
++	}
 +	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb1, 0x01);
 +	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x02);
 +	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb5, 0x13);
@@ -334,15 +413,53 @@ Signed-off-by: SteamOS for alioth port
 +	 * 0x7ff/2 is what the backlight device reports as its default, so this
 +	 * matches what `cat actual_brightness` says rather than fighting it.
 +	 */
-+	mipi_dsi_dcs_set_display_brightness_multi(&dsi_ctx, 0x7ff / 2);
++	/*
++	 * 16-bit brightness (bl-max-level is 0x7ff). There is no _large_multi
++	 * variant in this tree, so this one call is made outside the
++	 * multi-context; its error is folded back in so the sequence still
++	 * stops at the first failure like every other step.
++	 */
++	if (!dsi_ctx.accum_err) {
++		int br = mipi_dsi_dcs_set_display_brightness_large(dsi, 0x7ff / 2);
++		if (br < 0)
++			dsi_ctx.accum_err = br;
++	}
 +	mipi_dsi_usleep_range(&dsi_ctx, 20000, 21000);
 +
 +	if (!dsi_ctx.accum_err) {
 +		u8 pm = 0xff, ec = 0xff;
 +		int r1 = mipi_dsi_dcs_read(dsi, MIPI_DCS_GET_POWER_MODE, &pm, 1);
 +		int r2 = mipi_dsi_dcs_read(dsi, MIPI_DCS_GET_ERROR_COUNT_ON_DSI, &ec, 1);
-+		dev_info(&dsi->dev, "readback: power_mode r=%d 0x%02x, "
-+			 "err_count r=%d 0x%02x\n", r1, pm, r2, ec);
++		/*
++		 * Read the panel's own view of itself, not just power_mode.
++		 *
++		 * power_mode was the only byte read back until now, and it
++		 * reports 0x0c -- booster on, display on -- while the screen
++		 * stays black. Either the panel is not where it claims to be,
++		 * or the picture is reaching it and being discarded. These
++		 * four registers separate the two:
++		 *
++		 *   0x0a get_power_mode        sleep/display/booster bits
++		 *   0x0d get_display_mode      normal vs partial vs idle
++		 *   0x0e get_signal_mode       video vs command, TE, polarity
++		 *   0x0f get_diagnostic_result frame sync / tearing / underrun
++		 *   0x52 get_display_brightness  what the panel thinks DBV is
++		 *
++		 * 0x0f is the interesting one: its low bits report frame sync
++		 * and tearing-effect errors, so a panel that is refreshed but
++		 * not showing anything should say so there.
++		 */
++		u8 dm = 0, sm = 0, diag = 0;
++		u16 dbv = 0;
++		int r3 = mipi_dsi_dcs_read(dsi, MIPI_DCS_GET_DISPLAY_MODE, &dm, 1);
++		int r4 = mipi_dsi_dcs_read(dsi, MIPI_DCS_GET_SIGNAL_MODE, &sm, 1);
++		int r5 = mipi_dsi_dcs_read(dsi, MIPI_DCS_GET_DIAGNOSTIC_RESULT, &diag, 1);
++		int r6 = mipi_dsi_dcs_get_display_brightness_large(dsi, &dbv);
++
++		dev_info(&dsi->dev, "readback: power_mode=%d/0x%02x "
++			 "display_mode=%d/0x%02x signal_mode=%d/0x%02x "
++			 "diag=%d/0x%02x brightness=%d/%u err_count=%d/0x%02x\n",
++			 r1, pm, r3, dm, r4, sm, r5, diag, r6, dbv, r2, ec);
 +	}
 +
 +	return dsi_ctx.accum_err;
@@ -593,6 +710,28 @@ Signed-off-by: SteamOS for alioth port
 +	struct drm_dsc_picture_parameter_set pps;
 +	int ret;
 +
++	/*
++	 * Iris analog-bypass status, read before anything else.
++	 *
++	 * The Pixelworks chip sits between the DSI host and the panel. The
++	 * vendor driver brings it into analog bypass with
++	 *
++	 *     iris_send_ipopt_cmds(IRIS_IP_SYS, 0x8);
++	 *     ... poll gpio until it reads 1 ...
++	 *     iris_send_ipopt_cmds(IRIS_IP_SYS, 0x22);  // power domains off
++	 *     iris_send_ipopt_cmds(IRIS_IP_SYS, 0x23);  // PLL off
++	 *
++	 * and treats this line being 1 as "data now passes through".
++	 * mainline does none of that, so the value here says whether Iris
++	 * happens to be transparent anyway (it may if the bootloader left it
++	 * in bypass) or is still holding the link. That decides whether the
++	 * remaining display work is about DSC packetisation or about
++	 * implementing Iris bring-up.
++	 */
++	if (ctx->iris_abyp_ready_gpio)
++		dev_info(&dsi->dev, "iris abyp-ready gpio = %d\n",
++			 gpiod_get_value_cansleep(ctx->iris_abyp_ready_gpio));
++
 +	ret = ana6706_init_sequence(ctx);
 +	if (ret) {
 +		dev_err(&dsi->dev, "failed to init panel: %d\n", ret);
@@ -622,23 +761,38 @@ Signed-off-by: SteamOS for alioth port
 +	 */
 +	drm_dsc_pps_payload_pack(&pps, &ana6706_dsc_cfg);
 +
++	/*
++	 * Neither of these is allowed to fail enable().
++	 *
++	 * The init sequence has already written the PPS into the panel via
++	 * DCS 0x9e, so the panel's decoder is configured before this point.
++	 * These two calls are the vendor's belt-and-braces repeat.
++	 *
++	 * Returning an error here is actively harmful: drm_panel_enable()
++	 * failing makes DRM unwind the whole commit and call
++	 * drm_panel_disable(), which sends 0x28 (display off) and 0x10
++	 * (sleep in) -- the panel shows its one frame and then goes dark for
++	 * good. That is exactly the "flashes once, then black forever"
++	 * behaviour observed on hardware, and it started the moment the DSI
++	 * readback began timing out (-110) at this point in enable().
++	 *
++	 * A failed repeat is worth a warning, not a dark screen.
++	 */
 +	ret = mipi_dsi_picture_parameter_set(dsi, &pps);
-+	if (ret < 0) {
-+		dev_err(&dsi->dev, "failed to transmit PPS: %d\n", ret);
-+		return ret;
-+	}
++	if (ret < 0)
++		dev_warn(&dsi->dev, "PPS repeat failed: %d (0x9e already sent it)\n", ret);
 +
 +	ret = mipi_dsi_compression_mode(dsi, true);
-+	if (ret < 0) {
-+		dev_err(&dsi->dev, "failed to enable compression mode: %d\n", ret);
-+		return ret;
-+	}
++	if (ret < 0)
++		dev_warn(&dsi->dev, "compression mode failed: %d\n", ret);
 +
 +	/* 28 ms, panel-samsung-ams667xx01.c */
 +	msleep(28);
 +
 +	/* 120 ms from vendor DT's qcom,mdss-dsi-init-delay-us */
 +	usleep_range(120000, 121000);
++
++	dev_info(&dsi->dev, "enable() done\n");
 +
 +	return 0;
 +}
@@ -647,6 +801,18 @@ Signed-off-by: SteamOS for alioth port
 +{
 +	struct ana6706 *ctx = to_ana6706(panel);
 +	struct mipi_dsi_multi_context dsi_ctx = { .dsi = ctx->dsi };
++
++	/*
++	 * Logged because this path is the prime suspect for the panel going
++	 * dark right after it lights: the init sequence ends with
++	 * power_mode = 0x98 (sleep-out set), and by the time enable() returns
++	 * and the driver reads it back it is 0x0c (sleep-out clear). Nothing
++	 * inside the sequence sends 0x10, so if this function runs between
++	 * those two reads it is what put the panel back to sleep -- and a
++	 * disable() straight after an enable() means DRM decided the commit
++	 * failed, not that the panel did anything wrong.
++	 */
++	dev_info(&ctx->dsi->dev, "disable() called\n");
 +
 +	mipi_dsi_dcs_set_display_off_multi(&dsi_ctx);
 +	mipi_dsi_usleep_range(&dsi_ctx, 12000, 13000);
@@ -658,6 +824,8 @@ Signed-off-by: SteamOS for alioth port
 +static int ana6706_unprepare(struct drm_panel *panel)
 +{
 +	struct ana6706 *ctx = to_ana6706(panel);
++
++	dev_info(&ctx->dsi->dev, "unprepare() called\n");
 +
 +	gpiod_set_value_cansleep(ctx->reset_gpio, 1);
 +	regulator_bulk_disable(ARRAY_SIZE(ana6706_supplies), ctx->supplies);
@@ -686,8 +854,16 @@ Signed-off-by: SteamOS for alioth port
 +	u16 brightness = backlight_get_brightness(bl);
 +	int ret;
 +
-+	/* bl_ctrl_dcs with a 0x7ff scale -> the "large" (16-bit) DCS write */
++	/*
++	 * Run the brightness write with LPM off, as panel-samsung-amb655x.c
++	 * and panel-samsung-ams667xx01.c both do. The panel's
++	 * qcom,mdss-dsi-bl-max-level is 0x7ff, i.e. 11 bits, so this has to
++	 * be the 16-bit ("large") DCS form rather than the 8-bit one.
++	 */
++	dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;	/* high-speed for this write */
 +	ret = mipi_dsi_dcs_set_display_brightness_large(dsi, brightness);
++	dsi->mode_flags |= MIPI_DSI_MODE_LPM;
++
 +	if (ret < 0)
 +		return ret;
 +
@@ -741,6 +917,17 @@ Signed-off-by: SteamOS for alioth port
 +		return dev_err_probe(dev, PTR_ERR(ctx->reset_gpio),
 +				     "failed to get reset gpio\n");
 +
++	/*
++	 * Iris ABYP-ready is purely diagnostic here: it is an input, and its
++	 * value answers whether the Pixelworks chip is transparent. Absent is
++	 * fine -- the driver just will not report it.
++	 */
++	ctx->iris_abyp_ready_gpio = devm_gpiod_get_optional(dev, "iris-abyp-ready",
++							    GPIOD_IN);
++	if (IS_ERR(ctx->iris_abyp_ready_gpio))
++		return dev_err_probe(dev, PTR_ERR(ctx->iris_abyp_ready_gpio),
++				     "failed to get iris abyp-ready gpio\n");
++
 +	ctx->dsi = dsi;
 +	mipi_dsi_set_drvdata(dsi, ctx);
 +
@@ -770,7 +957,34 @@ Signed-off-by: SteamOS for alioth port
 +	 * because the panel does not expect an EOT packet after the last
 +	 * data lane, per the same DT's lane configuration.
 +	 */
-+	dsi->mode_flags = MIPI_DSI_MODE_LPM | MIPI_DSI_MODE_NO_EOT_PACKET;
++	/*
++	 * Video mode, matching the only DSC panel in this tree that actually
++	 * lights up.
++	 *
++	 * panel-samsung-ams667xx01.c (the alioth panel, patches/0017) runs
++	 * MIPI_DSI_MODE_VIDEO_BURST with DSC. This one had been left in
++	 * command mode, and the vendor DT points the same way:
++	 *
++	 *     qcom,mdss-dsi-mdp-trigger = "none";
++	 *     qcom,mdss-dsi-dma-trigger = "trigger_sw";
++	 *
++	 * meaning the vendor drives frames through the DSI controller's own
++	 * command DMA, not through the MDP/DPU path. mainline's
++	 * dsi_timing_setup() programs REG_DSI_CMD_MDP_STREAM0_* for command
++	 * mode unconditionally, i.e. exactly the path the vendor switched
++	 * off. So command mode here means: panel says display-on, DSI reports
++	 * no errors, frames are consumed -- and nothing appears.
++	 *
++	 * An earlier attempt at video mode was abandoned because the init
++	 * sequence stopped running with it. That measurement was taken while
++	 * the reset line was still being left asserted by a GPIO_ACTIVE_LOW
++	 * polarity bug, so it proved nothing about video mode itself. With
++	 * reset, compression mode and slice_per_pkt now fixed, it gets a fair
++	 * test.
++	 */
++	dsi->mode_flags = MIPI_DSI_MODE_VIDEO_BURST |
++			  MIPI_DSI_MODE_LPM |
++			  MIPI_DSI_MODE_NO_EOT_PACKET;
 +
 +	ctx->panel.prepare_prev_first = true;
 +
