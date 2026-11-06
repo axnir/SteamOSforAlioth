@@ -34,6 +34,7 @@ FACTS="${PORT_ROOT}/work/raphael-facts"
 # 这两份是这个手机自己的分区备份，sha256 是 dd + adb pull 之后两边对过的。
 # 写成常量是为了让"备份还在不在"这个问题有一个可执行的答案，而不是靠记得。
 EXPECT_BOOT_SHA=b794c34b2d868cc81e694ecd01d732a4c286ef8bc6ecf541548e0fe38ed048ce
+EXPECT_DTBO_SHA=f921ddda9bc38bb4582287c0e2d6aafb5fc3b132680ab53774bdd9ae9fc6f540
 
 die() { echo "flash-raphael: $*" >&2; exit 1; }
 
@@ -95,15 +96,30 @@ fi
 
 cat <<'EOF'
 
---test：写 `boot` 分区，然后重启。
-  唯一被动到的分区是 boot。dtbo、abl、userdata 都不碰。
+--test：写 `boot`，清空 `dtbo`，然后重启。
+  动两个分区：boot（我们的镜像）和 dtbo（清空）。
+
+  为什么要清 dtbo：里面那些 overlay 是给厂商设备树的，ABL 会把它们叠到 boot 镜像
+  里的 DTB 上；我们的 DTB 是 mainline 板级文件，overlay 要改的节点不存在，叠加失败，
+  ABL 就不启动（表现是刷写 OKAY、重启 6 秒回 fastboot）。实测清掉之后同一个镜像
+  就被接受了。
+
+  想回 Android 且屏幕调校正常，两个都要回来：
+    fastboot flash boot work/raphael-facts/stock-boot.img
+    fastboot flash dtbo work/raphael-facts/stock-dtbo.img
 EOF
 read -r -p "继续？输入 BOOT 确认: " ans
 [[ "$ans" == BOOT ]] || die "已取消"
 
+# dtbo 的备份也要在，而且要是那份 —— 它是"回得去"的另一半。
+echo "${EXPECT_DTBO_SHA}  ${FACTS}/stock-dtbo.img" | sha256sum -c --quiet \
+  || die "${FACTS}/stock-dtbo.img 的 sha256 不是预期的那份 —— 别在没备份的 dtbo 上动手"
+
+echo "=> fastboot erase dtbo"
+fastboot erase dtbo
 echo "=> fastboot flash boot"
 fastboot flash boot "$IMAGE"
 echo "=> fastboot reboot"
 fastboot reboot
 echo
-echo "回退：fastboot flash boot ${FACTS}/stock-boot.img"
+echo "回退：fastboot flash boot ${FACTS}/stock-boot.img && fastboot flash dtbo ${FACTS}/stock-dtbo.img"

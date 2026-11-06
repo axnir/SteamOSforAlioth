@@ -271,9 +271,11 @@ rootfs。这条路：
    这里写坏就是纯黑屏，只能靠 fastboot 重刷。安全网是 §2.3 那两个备份：
    - 回退命令记住一条就够：`fastboot flash boot work/raphael-facts/stock-boot.img`
    - 刷机脚本里“两槽写同一份镜像”的逻辑整段作废，换成“先校验备份在，再写”
-2. **`dtbo` 不要乱清。** alioth 是 `erase dtbo` 再刷（防止厂商 overlay 叠上来）。  
-   raphael 的 `dtbo` 里是**面板/触摸的 overlay**，清掉会不会黑屏还没验证 ——  
-   本分支第一版**不写 `dtbo`**，保持原状。
+2. **`dtbo` 要清，而且这是 ABL 接受我们镜像的前提。** 这一点最初写反了（"第一版不写
+   dtbo"）：`dtbo` 里的 overlay 是给厂商设备树用的，叠到 mainline 板级文件上必然失败，
+   ABL 于是拒绝启动（§8.1）。`fastboot erase dtbo` 是阶段 1 的必要步骤，不是可选项。
+   清掉之后 Android 的屏幕调校也会没 —— 想回去就把备份 `adb push` 回
+   `/dev/block/sde45`（§8.1 有命令），所以它仍然是一条"可逆但要记得"的操作。
 3. **UFS 的运行时电源管理不能开。** 内核 DTS 注释写得很清楚：QMP UFS PHY 掉电后  
    只能靠 HCE-enable 重新编程，hibern8 退出会 PA fatal error，之后全部 `-EIO`。  
    启动参数和 overlay 都别去“优化”这一块。
@@ -343,42 +345,51 @@ rootfs。这条路：
 
 ## 8. 未验证清单（别当结论用）
 
-1. **ABL 为什么拒这份镜像 —— 阶段 1 卡在这里，五个回合还没解开。**
-   已经排除的：
+1. **ABL 已经接受我们的镜像了 —— 解药是清掉 `dtbo`。** 这一条是第五个回合才找到的，
+   而且推翻了我前面的判断：问题一直不在 Image，也不在头部，而在**设备树**。
 
-   - `fastboot boot`（RAM 启动）在这台机器上**整体不可用**：连原厂镜像都回
-     `Failed to load/authenticate boot image: Load Error`。所以 `--ramboot` 这条路是死的，
-     不是我们镜像的问题。
-   - 不是 AVB：`ro.boot.verifiedbootstate=orange`、`flash.locked=0`。
-   - 不是 gzip 的问题：换成原厂那种 `UNCOMPRESSED_IMG` 封装（§2.4）照样被拒。
-   - 不是头部版本：v0 和 v1 都试过，字段已经和原厂逐项一致。
-   - 不是我们的外壳：**保留原厂头部/ramdisk/AVB footer/128 MB 尺寸**、只把内核段换成
-     我们的 Image + DTB，一样被拒。
+   `dtbo`（32 MiB，7 条记录）里的每条都是带识别头的 overlay（`model` / `compatible` /
+   `qcom,board-id` + `fragment@0` / `__overlay__`）。ABL 按 board-id 选一条，叠到
+   boot 镜像里的 DTB 上 —— 而我们的 DTB 是 mainline 板级文件，`__overlay__` 要改的那些
+   节点（`dsi_panel_pwr_supply`、`i2c@884000/tfa98xx@34` 之类）一个都不存在。
+   叠加失败，ABL 就放弃启动，表现是刷写全 OKAY、重启 6 秒回 fastboot。
 
-   所以问题落在内核段的内容本身，但 ABL 不接受的理由还没找到。已知的差异只剩三处：
-   我们的 Image 是 51 255 808 B（原厂 41 963 536 B，我们多了一个 initramfs）、
-   `code0` 是 `fa405a4d`（原厂是 `147e0000`，一条 `b`）、以及 `image_size` 字段
-   52 101 120（原厂 48 844 800）。下一步要么把这三处分头消掉，要么换引导链（§5 的 B）。
-2. **BT 用 `wcn3990-bt` 还是 `wcn3998-bt`** —— 源码 DTS 写 3990，参考 DTB 写 3998，同一个
+   判据很干净：**同一个镜像，`fastboot erase dtbo` 之后 ABL 就收下了** ——
+   屏幕上的小米 logo 消失（说明跳转了），设备也不再回 fastboot。恢复同样干净：
+   把备份 `dd` 回 `dtbo`（`/dev/block/sde45`）即可。
+
+2. **内核跳过去了，但起不到能看见东西的程度。** 清掉 dtbo 之后：小米 logo 消失、
+   屏幕全黑、40 秒内不回 fastboot、USB 上没有任何新设备（gadget 没起来）。
+   logo 消失说明 ABL 跳了、内核拿到了显示；黑屏 + 无 USB 说明它死在 simpledrm
+   出字之前，或者 fbcon 没绑上。下一步要么给 ramoops 找一块可靠区域（原厂 4 份 DTB
+   里都**没有** ramoops 节点，所以地址得另找），要么把 `memory@80000000` 删掉让 ABL
+   自己填 —— 现在的 DTS 硬编码的是 UEFI 交接的那 3 段（≈6 GiB），而这台机器有 7.5 GiB。
+3. **BT 用 `wcn3990-bt` 还是 `wcn3998-bt`** —— 源码 DTS 写 3990，参考 DTB 写 3998，同一个
    驱动，两个都试得起，但只能试一次知道。
-3. **清 `dtbo` 的后果** —— 未测。原厂 `dtbo` 是面板/触摸的 overlay，清掉会不会黑屏不知道，
-   第一版不动它。
-4. **内存节点**：ABL 填的布局和内核 DTS 里那 3 段（UEFI 交接，≈6 GiB）对不上 ——
-   这台机器 `MemTotal` 7.5 GiB，说明那份映射本身就少给了一截。所以 append 里要把
-   `memory@80000000` 删掉，让 ABL 填（alioth 就是这么做的）。
+4. **内存节点** —— 见上，和 2 是同一件事的两个可能原因。
 5. **`userdata` 覆盖即丢 Android** —— 502.6 GB，f2fs + 加密，不可逆。
 6. **WCN3998 的 `board-2.bin` 与 MAC** —— 固件在 `vendor`/`persist` 里，得从 root 侧取；
    取不到 `wlan_mac.bin` 时 ath10k 会给随机 MAC（参考项目用 systemd 服务固定）。
 
-### 8.1 五个回合的代价，和一条被验证过的安全网
+### 8.1 六个回合的代价，和两条被验证过的安全网
 
-一共刷了五次 `boot`，五次都靠 `fastboot flash boot work/raphael-facts/stock-boot.img`
-在 40 秒内回到 Android。**这就是 A-only 没有备用槽时唯一的安全网，而且是可执行的**：
-备份的 sha256 写死在 `flash-raphael.sh` 里，对不上就拒绝写。
+一共刷了六次 `boot`，六次都回到 Android。两条路都实测过：
 
-每次失败的表现都一样：`fastboot flash` 全部 OKAY，重启后屏幕出现小米 logo（有一次是
-直接进 fastboot），约 6 秒回到 bootloader。6 秒这个数字本身是线索：它比一次内核启动
-短得多，比一次 ABL 拒绝长一点。
+- **fastboot**：`fastboot flash boot work/raphael-facts/stock-boot.img`，40 秒回 Android。
+  sha256 写死在 `flash-raphael.sh` 里，对不上就拒绝写。
+- **fastboot 进不去的时候**（第六次的后果：设备自己掉进 recovery，音量下 + 电源也没用）：
+  recovery 里的 `adb` 是 **root**，而且 `adb push <文件> /dev/block/<分区>` 能直接落到
+  块设备上 —— 这条路绕开了 `adb push` 到 `/cache` 时那个"报告成功但文件不存在"的
+  命名空间问题。两个分区写完都用 `sha256sum /dev/block/by-name/...` 对过：
+
+  ```bash
+  adb push work/raphael-facts/stock-boot.img /dev/block/sde49   # boot
+  adb push work/raphael-facts/stock-dtbo.img /dev/block/sde45   # dtbo
+  adb shell sha256sum /dev/block/by-name/boot /dev/block/by-name/dtbo
+  ```
+
+  这也是为什么 §2.3 的备份必须是**整分区**、且 sha256 两边对过：它救的不是"某次刷坏"，
+  而是"连 fastboot 都进不去"。
 
 ---
 
