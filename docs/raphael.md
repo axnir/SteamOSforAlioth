@@ -12,15 +12,21 @@
 
 ```
 main      73c85e1   SteamOS for alioth
-raphael   同上       本分支：只有本文 + 后续移植提交
+raphael   95a7d11   +6 个提交
+  c046198  docs: 移植起点（设备实测、内核来源、与 alioth 的六处结构差异）
+  97ee575  docs: boot/dtbo 整分区备份，board-id 与面板型号核实
+  8ba4fbc  feat: kernel-sm8150 配方与阶段 1 的三个脚本
+  c2e4882  feat: 阶段 1 的内核和 boot 镜像编出来了
+  0e2dbe4  feat: 解开原厂内核段的封装（ABL 仍然拒）
+  95a7d11  fix: ABL 拒的是设备树 —— 清掉 dtbo 就过了
 ```
 
-`main` 上的一切（`build-alioth-kernel.sh`、`make-steamos-alioth.sh`、  
-`flash-alioth.sh`、`scripts/assert-alioth-*`、`alioth-overlay/`）都是 alioth 的，  
-本分支**先不动它们**。移植走“新增一套 `raphael` 文件 + 共用 kernel-common”的路子，  
-等 raphael 真机跑起来再回头决定哪些 alioth 专属脚本该泛化。
+`main` 上的一切（`build-alioth-kernel.sh`、`make-steamos-alioth.sh`、
+`flash-alioth.sh`、`scripts/assert-alioth-*`、`alioth-overlay/`）都是 alioth 的，
+本分支没动它们。移植走的是"新增一套 `raphael` 文件 + 共用 kernel-common"的路子。
 
----
+`kernel-common/build.sh` 是为了这条路改的（`OWN_KERNEL_TREE`、`KCONFIG_FRAGMENT`），
+改法是加分支而不是改语义 —— 不设这两个变量的 alioth/sm8250 行为完全不变。
 
 ## 2. 设备实测（2026-11-06，adb 连在这台手机上）
 
@@ -74,57 +80,27 @@ kernel_size 43958697  kernel_addr 0x00008000
 ramdisk_size 927736   ramdisk_addr 0x00000000
 second_size 0         second_addr 0x00000000
 tags_addr 0x00000100  os_version 0x16000155
-recovery_dtbo_size 0  dtb_size 0          dtb_addr 0x0
 cmdline: console=ttyMSM0,115200n8 androidboot.hardware=qcom ...
 ```
 
-**这两个 0 是这份镜像最值得注意的地方**：头部是 v1（所以 `dtb_size` 字段存在），  
-但 `dtb_size` 和 `recovery_dtbo_size` 都是 0 —— **这份 boot 镜像里没有 DTB 段**。  
-而 `dtbo` 分区里那 7 条是带识别头的 overlay（`model` / `compatible` /  
-`qcom,board-id` 后面跟 `fragment@0` / `__overlay__`），也不是整棵板级树。
+这五个值和 `make-steamos-alioth.sh` 里那套几乎一样（`PAGESIZE=4096`、
+`KERNEL_ADDR=0x8000`、`TAGS_ADDR=0x100`），唯一不同的是 ramdisk 地址：
+raphael 是 `0x0`，alioth 用 `0x01000000`。打包逻辑可以整套搬过来，只需要把
+这一个值按 raphael 的来。
 
-也就是说：原厂镜像里 base DTB 既不在这两个分区的明面上，那它只能在内核 Image  
-自己里面（qcom 的 `Image` + 追加 DTB 的产物，`kernel_size` 里就包含它）。这条和  
-我们"把 DTB 追加在 gzip 流后面"的做法不冲突，但**ABL 到底按什么顺序找、认哪个  
-字段，还没验证过**（见 §8）。
-
-**这和 `make-steamos-alioth.sh` 里那四个值几乎一样**（`PAGESIZE=4096`、  
-`KERNEL_ADDR=0x8000`、`TAGS_ADDR=0x100`），唯一不同的是 ramdisk 地址：  
-raphael 是 `0x0`，alioth 用 `0x01000000`。也就是说打包逻辑可以整套搬过来，  
-只需要把这一个值按 raphael 的来。
-
-### 2.4 原厂 boot 的内核段：不是 gzip，是带标记的未压缩 Image
-
-这一条是四个刷写回合之后才解开的，写在前面，因为它是这台机器和 alioth 最大的  
-不同。原厂 `boot.img` 的内核段（页大小之后那 43 958 697 字节）是：
-
-```
-offset 0    "UNCOMPRESSED_IMG"        16 字节 ASCII
-offset 16   u32  dtb_offset           DTB 在 Image 内的偏移（41 963 536）
-offset 20   arm64 Image               裸镜像，不压缩
-+dtb_offset FDT(s)                    追加在 Image 后面的设备树（4 个）
-```
-
-四条独立证据：段首是那串 ASCII；段内 +20 处 `0x38` 是 `ARMd`（arm64 Image 魔数）；  
-段内 +20+417… 处正是 `d00dfeed`，后面跟着 4 个 FDT；头部 `kernel_size` 覆盖整段。
-
-**所以 alioth 那套 "gzip(Image) + 后面拼 DTB" 在这里不成立。** 我们按 alioth 打的  
-第一版镜像：`fastboot flash boot` 全部 OKAY，重启后屏幕出现 MIUI logo，6 秒回到  
-fastboot —— 加载期就被拒，没有任何内核日志。
-
-`external-and-mods/kernel-common/mkbootimg-v1.py` 就是照着这个格式写的：v1 头部  
-（header_size 1648，原厂就是 v1；v1 里没有 `dtb_size`，那是 v2 才有的）+ 那 20 字节  
-封装 + 窗口字段全部照抄原厂（4096 / 0x8000 / ramdisk 0x0 / tags 0x100 /  
-os_version 0x16000155）。
+头部是 **v1**（`header_size 1648`）。v1 里**没有** `dtb_size` / `dtb_addr` ——
+那是 v2 才加的字段；1648 之后那些字节是页内填充，不是字段。所以"这份镜像没有
+独立 DTB 段"这句话是对的，但原因不是值为 0，而是这一版头部根本没有这个字段。
+DTB 在哪儿？见 §2.4。
 
 ### 2.3 已经做出来的备份
 
-| 文件                                  | 大小                  | sha256                                                             |
-| ----------------------------------- | ------------------- | ------------------------------------------------------------------ |
+| 文件 | 大小 | sha256 |
+|---|---|---|
 | `work/raphael-facts/stock-boot.img` | 134 217 728 B（整个分区） | `b794c34b2d868cc81e694ecd01d732a4c286ef8bc6ecf541548e0fe38ed048ce` |
-| `work/raphael-facts/stock-dtbo.img` | 33 554 432 B（整个分区）  | `f921ddda9bc38bb4582287c0e2d6aafb5fc3b132680ab53774bdd9ae9fc6f540` |
+| `work/raphael-facts/stock-dtbo.img` | 33 554 432 B（整个分区） | `f921ddda9bc38bb4582287c0e2d6aafb5fc3b132680ab53774bdd9ae9fc6f540` |
 
-两个都在机内 `dd` 出来、`adb pull` 回来，两边的 `sha256sum` 一致。`work/` 是  
+两个都在机内 `dd` 出来、`adb pull` 回来，两边的 `sha256sum` 一致。`work/` 是
 `.gitignore` 的，不进仓库；丢了自己重做一遍即可：
 
 ```bash
@@ -132,17 +108,45 @@ adb shell su -c "dd if=/dev/block/by-name/boot of=/data/local/tmp/b.img bs=1M"
 MSYS_NO_PATHCONV=1 adb pull /data/local/tmp/b.img work/raphael-facts/stock-boot.img
 ```
 
-> 两个坑：`adb exec-out ... > file` 在 Windows/Git Bash 下会把 `0x0A` 换成  
-> `0x0D 0x0A`，128 MiB 的镜像会长出 319 638 字节，`sha256` 对不上而文件看着正常；  
-> `adb pull /data/...` 的绝对路径会被 MSYS 改写成 `C:/Program Files/...`，  
+> 两个坑：`adb exec-out ... > file` 在 Windows/Git Bash 下会把 `0x0A` 换成
+> `0x0D 0x0A`，128 MiB 的镜像会长出 319 638 字节，看起来一切正常但 `sha256` 对不上；
+> `adb pull /data/...` 的绝对路径会被 MSYS 改写成 `C:/Program Files/...`，
 > 要加 `MSYS_NO_PATHCONV=1`。
 
-回退：`fastboot flash boot work/raphael-facts/stock-boot.img` 就是现在这套  
-Android（Magisk 补丁版）原样回去。
+回退要用**两条**命令（boot 和 dtbo 都要回来，见 §8.1）：
 
-`/proc/cmdline`、`/proc/device-tree/*`、`/proc/bus/input/devices` 对 shell 全部  
-`Permission denied`（SELinux），所以 board-id 这类东西**不能**从运行中的 Android 读，  
-只能从 fastboot 侧或放行镜像里拿。
+```bash
+fastboot flash boot work/raphael-facts/stock-boot.img
+fastboot flash dtbo work/raphael-facts/stock-dtbo.img
+```
+
+`/proc/cmdline`、`/proc/device-tree/*`、`/proc/bus/input/devices` 对 shell 全部
+`Permission denied`（SELinux），所以 board-id 这类东西**不能**从运行中的 Android 读，
+得在 Magisk 里放行 `su` 之后读。
+
+### 2.4 原厂 boot 的内核段：不是 gzip，是带标记的未压缩 Image
+
+这一条是六个刷写回合之后才解开的，先写在前面，因为它是这台机器和 alioth 最大的
+不同。原厂 `boot.img` 的内核段（页大小之后那 43 958 697 字节）是：
+
+```
+offset 0      "UNCOMPRESSED_IMG"   16 字节 ASCII
+offset 16     u32  dtb_offset      DTB 在 Image 内的偏移（41 963 536）
+offset 20     arm64 Image          裸镜像，不压缩
++dtb_offset   FDT(s)               追加在 Image 后面的设备树（4 个）
+```
+
+四条独立证据：段首是那串 ASCII；段内 +20 处 `0x38` 是 `ARMd`（arm64 Image 魔数）；
+段内 +20+u32 处正是 `d00dfeed`，后面跟着 4 个 FDT；头部 `kernel_size` 覆盖整段。
+按这个格式重建原厂段，和原文件**逐字节相同** —— 这是"理解正确"最硬的证据。
+
+**所以 alioth 那套 "gzip(Image) + 后面拼 DTB" 在这里不成立。** 我们按 alioth 打的
+第一版镜像：`fastboot flash boot` 全部 OKAY，重启后 6 秒回到 fastboot ——
+加载期就被拒，没有任何内核日志。
+
+`external-and-mods/kernel-common/mkbootimg-v1.py` 就是照着这个格式写的：v1 头部
+（1648 字节）+ 那 20 字节封装 + 其余字段全部照抄原厂（4096 / 0x8000 / ramdisk 0x0 /
+tags 0x100 / os_version 0x16000155）。
 
 ---
 
@@ -239,28 +243,18 @@ qcom,board-id = <0x28 0>            /* 40  */
 
 ---
 
-## 5. 第一个决定：用哪条引导链
+## 5. 引导链：已定 A，而且已经过了一关
 
-**A. 沿用本仓库的 ABL + boot.img（推荐先试这个）**
+选的是 **A：沿用本仓库的 ABL + boot.img**（`boot` 放内核镜像，`userdata` 放 rootfs），
+不引入 U-Boot。
 
-`boot` 分区放一个带 DTB 的 `boot.img`（`Image.gz` + 追加 DTB），`userdata` 放 SteamOS  
-rootfs。这条路：
+这条路原本的风险写在这里是"DTS 必须补 msm-id/board-id，ABL 认不认一次刷写就知道"。
+现在的答案：**认了，但前提是先清 `dtbo`**（§8.1）。小米 ABL 会把 `dtbo` 里的 overlay
+叠到 boot 镜像的 DTB 上，叠不上就整个不启动 —— 那才是前五个回合失败的真正原因。
 
-- 复用已经写好的整套东西：`mkbootimg-v0.py`、`make-steamos-*.sh` 的打包逻辑、  
-  `scripts/assert-alioth-boot-image.sh` 的检查思路、`*-selfflash-boot.sh` 的机内刷写
-- 不用往 `boot` 里写 U-Boot（少一个会失效的引导器）
-- 代价：DTS 必须补 `msm-id`/`board-id`；内存节点要让 ABL 填而不是硬编码（alioth 就是没有 `memory` 节点）
-
-**B. 照抄参考项目：U-Boot → systemd-boot → 内核**
-
-- 好处：参考项目在真机上验证过整条链，`cache` 分区当 `/boot`，换内核不用刷机
-- 代价：`boot` 分区被 U-Boot 占掉；本仓库的 boot.img 打包/断言全部作废；  
-  多一层需要维护的引导器；U-Boot 的 `u-boot.img` 是别人编的二进制
-
-建议：**先按 A 做一次调试启动**（能进 USB 网络 shell 就算过），失败再切 B。  
-判据是 ABL 能不能认这个 DTB —— 一次刷写就能知道，代价可控。
-
----
+参考项目走的是 B（U-Boot → systemd-boot，`cache` 当 `/boot`）。它成立，但对这个仓库
+意味着：`boot` 被 U-Boot 占掉、boot.img 那套打包与断言全部作废、多一层别人编的
+二进制要维护。既然 A 的 ABL 关已经过了，没有理由再切过去。
 
 ## 6. 硬规则（在 alioth 之上新增的）
 
@@ -294,9 +288,11 @@ rootfs。这条路：
 - [x] 面板 / 触摸 / 功放型号用 dmesg 核实（§3.3）
 - [x] `fastboot getvar all` 与 boot 头部记下来（§2.1、§2.2）
 - [x] `boot` + `dtbo` 整分区备份，两边 sha256 对过（§2.3）
-- [ ] `work/ref/linux-raphael` 克隆完成后，确认 DTS 与 config 在树里的真实状态
+- [x] 内核源码：GitHub 直连只有 28 KB/s，浅克隆卡在 171 MB 不动；最后是人肉下
+      258 MB 的 tarball 放进 `work/cache/`，构建脚本从那里取（不再联网）。
+      `work/ref/linux-raphael` 那个半截克隆可以直接删掉
 
-### 阶段 1：能出画面、能进 shell（一次刷写）
+### 阶段 1：能出画面、能进 shell（ABL 已过关，内核还没起来）
 
 产出：`work/steamos-raphael/boot-debug.img`
 
@@ -321,8 +317,11 @@ rootfs。这条路：
       DTB 偏移 51 255 808 对上，头部字段与原厂逐项一致
 - [x] 加了面板控制台（`dts/*.append` 的 simpledrm framebuffer + `DRM_SIMPLEDRM=y`），
       因为这台机器没有可外接的串口，内核死在 USB 起来之前就完全没有观测通道
-- [ ] **ABL 仍然拒这份镜像**：刷写 OKAY，重启 6 秒回 fastboot，五轮都没过去。
-      已排除的项和剩下的三处差异见 §8.1
+- [x] **ABL 那关过了**：前提是先 `fastboot erase dtbo`（§8.1）。清掉之后同一个镜像
+      就被接受 —— 小米 logo 消失说明跳转了，设备也不再回 fastboot
+- [ ] **跳转成功但黑屏、USB 无设备**：内核死在 simpledrm 出字之前（或 fbcon 没绑上）。
+      下一步的怀疑对象是 DTS 里硬编码的 `memory@80000000`（UEFI 的 3 段约 6 GiB，
+      机器有 7.5 GiB）—— 删掉让 ABL 填；或者给 ramoops 找一块区域留崩溃日志
 - [ ] 验收：USB 网卡 + `172.16.42.1:23` 能进 shell
 
 ### 阶段 2：rootfs 起得来
@@ -345,8 +344,8 @@ rootfs。这条路：
 
 ## 8. 未验证清单（别当结论用）
 
-1. **ABL 已经接受我们的镜像了 —— 解药是清掉 `dtbo`。** 这一条是第五个回合才找到的，
-   而且推翻了我前面的判断：问题一直不在 Image，也不在头部，而在**设备树**。
+1. **ABL 已经接受我们的镜像了 —— 解药是清掉 `dtbo`。** 这是第六个回合才找到的，
+   而且推翻了前面五轮的判断：问题不在 Image，不在头部，而在**设备树**。
 
    `dtbo`（32 MiB，7 条记录）里的每条都是带识别头的 overlay（`model` / `compatible` /
    `qcom,board-id` + `fragment@0` / `__overlay__`）。ABL 按 board-id 选一条，叠到
@@ -398,19 +397,22 @@ rootfs。这条路：
 ```bash
 git checkout raphael
 
-# 1) 编译（Linux + docker/podman + aarch64 静态 busybox）
+# 1) 编译（Linux + 容器 + aarch64 静态 busybox；见下面的环境要求）
 ./build-raphael-kernel.sh
 
-# 2) 打 boot.img（Image + 单个 DTB，参数全来自原厂头部）
+# 2) 打 boot.img（内核段 = UNCOMPRESSED_IMG 封装，参数全来自原厂头部）
 ./make-steamos-raphael.sh --kernel-only
 
-# 3) 上真机。先 RAM 启动，不写任何分区
+# 3) 上真机：写 boot + 清 dtbo，两个分区都动，备份都在 work/raphael-facts/
 adb reboot bootloader
-./flash-raphael.sh --ramboot
+./flash-raphael.sh --test          # 提示符输入 BOOT
 
-# 4) 起得来再落盘
-./flash-raphael.sh --test
+# 4) 回 Android（两条都要）
+fastboot flash boot work/raphael-facts/stock-boot.img
+fastboot flash dtbo work/raphael-facts/stock-dtbo.img
 ```
+
+`--ramboot` 不要用了：这台机器的 ABL 连原厂镜像都拒绝 RAM 启动（§8.1）。
 
 第 1 步在写这份文档时是在这台 Windows 上跑的，用 WSL 的容器 CLI（`wslc`，
 镜像 `proxy.vvvv.ee/library/fedora:43`）。四件事值得记下来，因为每一件都让第一次
@@ -436,3 +438,17 @@ adb reboot bootloader
 `--install`（写 `userdata`、装 SteamOS rootfs）没有实现，也不该在阶段 1 之前实现：
 它需要机内签名固件、一份 raphael overlay、以及一个已经确认能启动的 boot.img，
 三样都还没有。
+
+## 10. 明天从这里开始
+
+两个实验，按顺序做，都不需要重新设计任何东西：
+
+1. **删掉 `memory@80000000`**，让 ABL 填。现在的 DTS 硬编码的是 UEFI 交接的 3 段
+   （≈6 GiB），而这台机器 `MemTotal` 是 7.5 GiB —— 说明那份映射本身就不是这台机器
+   的真实布局。alioth 的 DTS 里**没有** memory 节点，ABL 会填。改法是在
+   `kernel-sm8150/patches/` 加一个删节点的补丁（append 删不掉节点，只能打补丁）。
+2. 如果 1 之后还是黑屏，**把崩溃日志留下来**。原厂那 4 份 DTB 里都没有 ramoops 节点，
+   所以地址得自己挑一块不在内核使用范围内的 DRAM，加上 `reserved-memory/ramoops`
+   + `CONFIG_PSTORE_RAM/CONSOLE/PMSG`，崩完启 Android 从 `/sys/fs/pstore` 读。
+
+两个都要重新编（约 11 分钟，源码和工具链都缓存在 `raphael-work` 卷里，不会重下）。
