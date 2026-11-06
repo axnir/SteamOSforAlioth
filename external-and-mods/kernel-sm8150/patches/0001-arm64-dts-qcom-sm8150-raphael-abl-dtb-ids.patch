@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shouchen <TheOneovb@petlover.com>
+Date: Fri, 6 Nov 2026 23:20:00 +0800
+Subject: [PATCH] arm64: dts: qcom: sm8150-raphael: give the tree the IDs ABL
+ looks for
+
+Xiaomi's ABL picks the device tree out of the boot image by matching
+qcom,msm-id and qcom,board-id against the board it is running on. There is
+no fallback: a DTB without these tags is not a candidate, and what is left
+is a bootloader with nothing to boot.
+
+Upstream board files do not carry them because the boot paths upstream
+supports (U-Boot, UEFI) hand the tree over directly, so raphael's file was
+written without them. Booting through the stock ABL -- which is what this
+port does, to reuse the boot.img packing and the flash script it already
+has -- needs them back.
+
+Values read off this phone, not guessed:
+
+  /proc/device-tree/qcom,board-id = <0x28 0>      (40)
+  /proc/device-tree/qcom,msm-id   = <0x153 ...>   (339 = SM8150)
+
+msm-id's second cell is the SoC revision and is written as 0x20000
+(SM8150 v2.0), the revision this device's own boot image was built
+against. A mismatch there fails the match just as a missing tag does, so
+it is part of the same decision, not a detail.
+
+Signed-off-by: shouchen <TheOneovb@petlover.com>
+---
+ arch/arm64/boot/dts/qcom/sm8150-xiaomi-raphael.dts | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/qcom/sm8150-xiaomi-raphael.dts b/arch/arm64/boot/dts/qcom/sm8150-xiaomi-raphael.dts
+--- a/arch/arm64/boot/dts/qcom/sm8150-xiaomi-raphael.dts
++++ b/arch/arm64/boot/dts/qcom/sm8150-xiaomi-raphael.dts
+@@ -31,6 +31,13 @@
+ 	chassis-type = "handset";
+ 
+ 	/*
++	 * Xiaomi's ABL selects the DTB by these two tags; see the commit
++	 * message for where the values come from.
++	 */
++	qcom,msm-id = <339 0x20000>;	/* SM8150 v2.0 */
++	qcom,board-id = <40 0>;
++
++	/*
+ 	 * Memory map as programmed by the bootloader.  sm8150.dtsi leaves the
+ 	 * size at 0 ("we expect the bootloader to fill in the size") and relies
+ 	 * on the board file for the real layout, so this is not optional: with
+-- 
+2.43.0

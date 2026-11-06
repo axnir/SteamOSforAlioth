@@ -66,15 +66,27 @@ abl ablbak aop aopbak ... boot cache dtbo ... modem ... super system userdata vb
 
 ### 2.2 原厂 boot 镜像的头部（备份自己解析出来的）
 
-从 `stock-boot.img` 的前 1632 字节读出来：
+从 `stock-boot.img` 的前 1648 字节读出来：
 
 ```
-magic ANDROID!   header v0   pagesize 4096
-kernel_size 43958697   kernel_addr 0x00008000
-ramdisk_size 927736    ramdisk_addr 0x00000000
-second_size 0          tags_addr 0x00000100
-os_version 0x16000155
+magic ANDROID!        header_version 1   header_size 1648   pagesize 4096
+kernel_size 43958697  kernel_addr 0x00008000
+ramdisk_size 927736   ramdisk_addr 0x00000000
+second_size 0         second_addr 0x00000000
+tags_addr 0x00000100  os_version 0x16000155
+recovery_dtbo_size 0  dtb_size 0          dtb_addr 0x0
+cmdline: console=ttyMSM0,115200n8 androidboot.hardware=qcom ...
 ```
+
+**这两个 0 是这份镜像最值得注意的地方**：头部是 v1（所以 `dtb_size` 字段存在），
+但 `dtb_size` 和 `recovery_dtbo_size` 都是 0 —— **这份 boot 镜像里没有 DTB 段**。
+而 `dtbo` 分区里那 7 条是带识别头的 overlay（`model` / `compatible` /
+`qcom,board-id` 后面跟 `fragment@0` / `__overlay__`），也不是整棵板级树。
+
+也就是说：原厂镜像里 base DTB 既不在这两个分区的明面上，那它只能在内核 Image
+自己里面（qcom 的 `Image` + 追加 DTB 的产物，`kernel_size` 里就包含它）。这条和
+我们"把 DTB 追加在 gzip 流后面"的做法不冲突，但**ABL 到底按什么顺序找、认哪个
+字段，还没验证过**（见 §8）。
 
 **这和 `make-steamos-alioth.sh` 里那四个值几乎一样**（`PAGESIZE=4096`、
 `KERNEL_ADDR=0x8000`、`TAGS_ADDR=0x100`），唯一不同的是 ramdisk 地址：
@@ -260,18 +272,24 @@ rootfs。这条路：
 
 产出：`work/steamos-raphael/boot-debug.img`
 
-- 新建 `external-and-mods/kernel-sm8150/`
-  - `soc.env`：`SOC=sm8150`、`KNAME=raphael`、`KSRC_URL=<raphael-v7.3.0 tarball>`、
-    `SKIP_ROCKNIX_DTS=1`、`PATCH_DIRS=""`、`DTBS=sm8150-xiaomi-raphael`、
-    `EMBED_INITRAMFS=1`、`KEEP_IMAGE=1`、`CMDLINE_BUILTIN=1`、`FW_BUILTIN=0`
-  - `config-raphael`：`defconfig` + `sm8150-xiaomi-raphael.config` 合并后的完整 `.config`
-  - `dts/sm8150-xiaomi-raphael.dts.append`：补 `qcom,msm-id` / `qcom,board-id`，
-    删掉硬编码 `memory` 节点（让 ABL 填）
-- `build.sh` 目前只会 `cp $KCONFIG .config`，不认“defconfig + 增量”；要么先离线合并出一份
-  完整 config 提交进来（优先），要么给 `kernel-common/build.sh` 加一个 `KCONFIG_FRAGMENT`
-- 打包沿用 `make-steamos-alioth.sh` 的 `pack_boot()`（`Image.gz` + 追加 DTB），
-  只改 DTB 名和 cmdline
-- 验收：面板出现内核控制台，或 USB 网卡 + `172.16.42.1:23` 能进 shell
+脚手架已经写好了，**但还一次都没编译过**（见下面的环境要求）：
+
+- [x] `external-and-mods/kernel-sm8150/soc.env` —— `KSRC_URL` 按 commit 固定到
+      `raphael-v7.3.0`、`KCONFIG_FRAGMENT` 用树里自带的增量、`DTBS` 一个、
+      `CMDLINE_BUILTIN=1`、`FW_BUILTIN=0`、`OWN_KERNEL_TREE=1`
+- [x] `kernel-sm8150/patches/0001-...` —— 补 `qcom,msm-id` / `qcom,board-id`。
+      在真实那份 DTS 上 `patch -p1` 过了，零 fuzz，输出与预期逐字节一致
+- [x] `kernel-sm8150/steamos.config` —— USB ACM 控制台（阶段 1 唯一的日志通道）
+- [x] `kernel-common/build.sh` —— 加 `KCONFIG_FRAGMENT`（defconfig + 增量）和
+      `OWN_KERNEL_TREE=1` 的四道门（不校验 ROCKNIX、不取 extra-firmware、
+      不编 chipone_tddi、不复制 ROCKNIX 固件）
+- [x] `build-raphael-kernel.sh`、`make-steamos-raphael.sh`（`--kernel-only`）、
+      `flash-raphael.sh`（`--ramboot` / `--test`）
+- [ ] **编一次**。需要 Linux + docker/podman + 一个 aarch64 静态 busybox；
+      这台 Windows 上都没有（WSL 也被策略挡着），所以这步必须换机器
+- [ ] 真机：先 `--ramboot`，再 `--test`
+- [ ] 验收：USB 网卡 + `172.16.42.1:23` 能进 shell（面板控制台是加分项：
+      这台机器的 stdout-path 是测试点上的 UART，不是 USB）
 
 ### 阶段 2：rootfs 起得来
 
@@ -293,11 +311,14 @@ rootfs。这条路：
 
 ## 8. 未验证清单（别当结论用）
 
-1. **ABL 到底怎么挑 DTB —— 这是阶段 1 的真正未知。** 原厂 `boot.img` 里**没有** DTB 表：
-   我按 v0 头部算出来的 dtb 偏移是空的，全盘扫 `d00dfeed` 只有 4 处落在 kernel 数据里的
-   假阳性；`dtbo`（32 MiB）是 7 条 overlay，不是整棵板级树。所以小米这套原厂镜像的
-   DTB 选择路径还没弄清楚。我们的做法是照 alioth 把 DTB 追加在 `Image.gz` 后面再补
-   board-id —— **试一次才知道 ABL 认不认**，这也是 §5 里选 A 的主要风险。
+1. **ABL 到底怎么挑 DTB —— 这是阶段 1 的真正未知。** 原厂 `boot.img` 是 **v1 头部，
+   但 `dtb_size = 0`**：镜像里根本没有 DTB 段。`dtbo`（32 MiB）里那 7 条是带识别头的
+   overlay（`model` / `compatible` / `qcom,board-id` + `fragment@0` / `__overlay__`），
+   也不是整棵板级树。剩下的可能只有一种：base DTB 在内核 `Image` 自己里面（qcom 的
+   `Image` + 追加 DTB，`kernel_size` 把 4 段约 500 KB 的 FDT 也算在内）。
+   我们的做法是照 alioth 把 DTB 追加在 gzip 流后面、再补 `board-id`；
+   **ABL 会不会扫这段，试一次才知道**，这也是 §5 里选 A 的主要风险。
+   第一次先试 `--ramboot`（不写分区），失败也只是没启动。
 2. **BT 用 `wcn3990-bt` 还是 `wcn3998-bt`** —— 源码 DTS 写 3990，参考 DTB 写 3998，同一个
    驱动，两个都试得起，但只能试一次知道。
 3. **清 `dtbo` 的后果** —— 未测。原厂 `dtbo` 是面板/触摸的 overlay，清掉会不会黑屏不知道，
@@ -315,9 +336,25 @@ rootfs。这条路：
 
 ```bash
 git checkout raphael
-# 阶段 1 的前置：确认内核源码树
-ls work/ref/linux-raphael/arch/arm64/boot/dts/qcom/sm8150-xiaomi-raphael.dts
+
+# 1) 编译（Linux + docker/podman + aarch64 静态 busybox）
+./build-raphael-kernel.sh
+
+# 2) 打 boot.img（Image + 单个 DTB，参数全来自原厂头部）
+./make-steamos-raphael.sh --kernel-only
+
+# 3) 上真机。先 RAM 启动，不写任何分区
+adb reboot bootloader
+./flash-raphael.sh --ramboot
+
+# 4) 起得来再落盘
+./flash-raphael.sh --test
 ```
 
-下一步要拍的是 §5 的引导链选择。选 A 就直接写 `kernel-sm8150/`；选 B 就先把 U-Boot
-的 `boot` 刷写流程并进来，本仓库的 boot.img 那一层就不要再长。
+第 1 步在写这份文档的机器上做不了（Windows，没有 docker，WSL 被策略挡住）。
+换一台能跑 `docker info` 的 Linux 机器；`OWN_KERNEL_TREE=1` 已经让这条路不再需要
+ROCKNIX 检出，只要 busybox 和容器。
+
+`--install`（写 `userdata`、装 SteamOS rootfs）没有实现，也不该在阶段 1 之前实现：
+它需要机内签名固件、一份 raphael overlay、以及一个已经确认能启动的 boot.img，
+三样都还没有。

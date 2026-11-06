@@ -88,10 +88,17 @@ fetch() {
 rocknix_path() { echo "${ROCKNIX_DIR}/$1"; }
 
 prepare_source() {
-  if [[ -e "$ROCKNIX_DIR/.git" ]]; then  # a directory, or a file in a worktree
-    [[ "$(git -C "$ROCKNIX_DIR" rev-parse HEAD)" == "$(git -C "$ROCKNIX_DIR" rev-parse "${ROCKNIX_REF}^{commit}")" ]] || die "ROCKNIX checkout does not match pinned ${ROCKNIX_REF}"
-  else
-    die "ROCKNIX source needs Git metadata to verify the pinned revision"
+  # OWN_KERNEL_TREE=1 (soc.env): the device's own kernel tree, which takes
+  # nothing from ROCKNIX -- no patch dirs, no DTS, no base config, no
+  # extra-firmware (see the matching guards below). There is nothing to verify
+  # a checkout against, and demanding one would mean requiring a tree whose
+  # content this build never reads. Every other recipe still verifies it.
+  if [[ "${OWN_KERNEL_TREE:-0}" != 1 ]]; then
+    if [[ -e "$ROCKNIX_DIR/.git" ]]; then  # a directory, or a file in a worktree
+      [[ "$(git -C "$ROCKNIX_DIR" rev-parse HEAD)" == "$(git -C "$ROCKNIX_DIR" rev-parse "${ROCKNIX_REF}^{commit}")" ]] || die "ROCKNIX checkout does not match pinned ${ROCKNIX_REF}"
+    else
+      die "ROCKNIX source needs Git metadata to verify the pinned revision"
+    fi
   fi
   # KSRC_URL (soc.env): a kernel tree's source tarball instead of kernel.org's
   # release, for a device whose support isn't in mainline or ROCKNIX yet.
@@ -183,6 +190,16 @@ prepare_source() {
 }
 
 stage_builtin_firmware() {
+  # OWN_KERNEL_TREE=1: nothing is built into the image (soc.env sets
+  # FW_BUILTIN=0), and extra-firmware has no folder for a device ROCKNIX
+  # does not carry -- downloading it would produce a tree that install_output
+  # then cannot find. The directory still has to exist: install_output copies
+  # it unconditionally.
+  if [[ "${OWN_KERNEL_TREE:-0}" == 1 ]]; then
+    rm -rf "${SRC}/external-firmware"
+    mkdir -p "${SRC}/external-firmware"
+    return 0
+  fi
   # GPU microcode + zap and the regulatory db are needed before the rootfs
   # is mounted, so they go into the kernel image (like ROCKNIX does).
   local fwtar="${CACHE}/extra-firmware-${EXTRA_FW_REF}.tar.gz"
@@ -226,14 +243,29 @@ stage_builtin_firmware() {
 configure() {
   # KCONFIG (soc.env): the base config of a device's own source tree, a file
   # in kernel-<device>/, instead of ROCKNIX's for the SoC.
+  #
+  # KCONFIG_FRAGMENT (soc.env): the tree ships the fragment it is built with,
+  # as a delta against its own defconfig (arch/arm64/configs/<board>.config).
+  # Merging there, rather than committing a .config we generated once, is what
+  # keeps a kernel bump from silently carrying yesterday's options forward --
+  # the failure mode is a build that compiles and boots differently than the
+  # tree says it should.
   local cfg
-  if [[ -n "${KCONFIG:-}" ]]; then
-    cfg="${SOC_DIR}/${KCONFIG}"
+  if [[ -n "${KCONFIG_FRAGMENT:-}" ]]; then
+    [[ -f "${SRC}/${KCONFIG_FRAGMENT}" ]] || die "missing config fragment ${SRC}/${KCONFIG_FRAGMENT}"
+    log "defconfig + ${KCONFIG_FRAGMENT}"
+    make -C "$SRC" defconfig >/dev/null
+    "${SRC}/scripts/kconfig/merge_config.sh" -m -O "$SRC" \
+      "${SRC}/.config" "${SRC}/${KCONFIG_FRAGMENT}" >/dev/null
   else
-    cfg="$(rocknix_path "projects/ROCKNIX/devices/${ROCKNIX_DEVICE}/linux/linux.aarch64.conf")"
+    if [[ -n "${KCONFIG:-}" ]]; then
+      cfg="${SOC_DIR}/${KCONFIG}"
+    else
+      cfg="$(rocknix_path "projects/ROCKNIX/devices/${ROCKNIX_DEVICE}/linux/linux.aarch64.conf")"
+    fi
+    [[ -f "$cfg" ]] || die "missing base config $cfg"
+    cp "$cfg" "${SRC}/.config"
   fi
-  [[ -f "$cfg" ]] || die "missing base config $cfg"
-  cp "$cfg" "${SRC}/.config"
   # --keep-case: scripts/config upper-cases names otherwise, and options like
   # FONT_TER16x32 then never get set.
   local sc="${SRC}/scripts/config --file ${SRC}/.config --keep-case"
@@ -308,6 +340,10 @@ build_kernel() {
 }
 
 build_tddi() {
+  # chipone_tddi is the touchscreen of the ROCKNIX handhelds. A device with its
+  # own tree has its touchscreen in-tree (raphael: Goodix GT9886), and this
+  # module would be built for a panel it never sees.
+  [[ "${OWN_KERNEL_TREE:-0}" == 1 ]] && return 0
   local tar="${CACHE}/chipone_tddi-${TDDI_REF}.tar.gz" d="${WORK}/chipone_tddi"
   fetch "https://github.com/ROCKNIX/chipone_tddi/archive/${TDDI_REF}.tar.gz" "$tar"
   rm -rf "$d"; mkdir -p "$d"
@@ -363,15 +399,24 @@ install_output() {
   mkdir -p "$o/boot" "$o/modules" "$o/firmware" "$o/dtbs"
   log "modules_install"
   make -C "$SRC" INSTALL_MOD_PATH="$o/staging" INSTALL_MOD_STRIP=1 modules_install >/dev/null
-  make -C "$SRC" M="${WORK}/chipone_tddi" INSTALL_MOD_PATH="$o/staging" INSTALL_MOD_STRIP=1 \
-    INSTALL_MOD_DIR=extra modules_install >/dev/null
+  if [[ "${OWN_KERNEL_TREE:-0}" != 1 ]]; then
+    make -C "$SRC" M="${WORK}/chipone_tddi" INSTALL_MOD_PATH="$o/staging" INSTALL_MOD_STRIP=1 \
+      INSTALL_MOD_DIR=extra modules_install >/dev/null
+  fi
   depmod -b "$o/staging" "$KREL"
   mv "$o/staging/lib/modules/${KREL}" "$o/modules/${KREL}"
   rm -rf "$o/staging"
   rm -f "$o/modules/${KREL}/build" "$o/modules/${KREL}/source"
 
   log "firmware (rootfs part: remoteprocs, audio topology, Wi-Fi/BT)"
-  cp -a "${EXTRA_FW_SRC}/${ROCKNIX_DEVICE}/." "$o/firmware/"
+  if [[ "${OWN_KERNEL_TREE:-0}" == 1 ]]; then
+    # No ROCKNIX folder to copy from. The device's own firmware (GPU zap, ADSP,
+    # modem, WCN3998 board file) is extracted from the phone and installed by
+    # the image build -- it is device-signed and cannot live in this repo.
+    log "no ROCKNIX firmware for ${KNAME}: the image build supplies it"
+  else
+    cp -a "${EXTRA_FW_SRC}/${ROCKNIX_DEVICE}/." "$o/firmware/"
+  fi
   # Built-in copies are enough for the GPU; keep rootfs copies too for tooling.
   cp -a "${SRC}/external-firmware/." "$o/firmware/"
 
@@ -407,7 +452,9 @@ main() {
     return
   fi
   check_deps
-  [[ -d "$ROCKNIX_DIR/projects/ROCKNIX/devices/${ROCKNIX_DEVICE}" ]] \
+  # OWN_KERNEL_TREE=1 needs no ROCKNIX device folder: nothing under it is read.
+  [[ "${OWN_KERNEL_TREE:-0}" == 1 ]] \
+    || [[ -d "$ROCKNIX_DIR/projects/ROCKNIX/devices/${ROCKNIX_DEVICE}" ]] \
     || die "ROCKNIX tree not found at ${ROCKNIX_DIR} (sparse clone of ROCKNIX/distribution@${ROCKNIX_REF})"
   mkdir -p "$CACHE"
   prepare_source
