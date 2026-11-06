@@ -285,8 +285,12 @@ rootfs。这条路：
       不编 chipone_tddi、不复制 ROCKNIX 固件）
 - [x] `build-raphael-kernel.sh`、`make-steamos-raphael.sh`（`--kernel-only`）、
       `flash-raphael.sh`（`--ramboot` / `--test`）
-- [ ] **编一次**。需要 Linux + docker/podman + 一个 aarch64 静态 busybox；
-      这台 Windows 上都没有（WSL 也被策略挡着），所以这步必须换机器
+- [x] **编出来了**：`7.3.0-raphael-steamos`，`Image` 51 255 808 B，
+      `sm8150-xiaomi-raphael.dtb` 104 272 B，模块 133 MB
+- [x] DTB 里读回 `qcom,msm-id = <0x153 0x20000>` / `qcom,board-id = <0x28 0>` ——
+      补丁 0001 确实进了被编译的那棵 DTS，不是只改了一份没人用的副本
+- [x] `boot-debug.img` 18 038 784 B：`gzip(Image)` + 追加 DTB（偏移 17 923 080，
+      长度正好到 payload 末尾），头部 4096 / 0x8000 / ramdisk 0x0 / tags 0x100
 - [ ] 真机：先 `--ramboot`，再 `--test`
 - [ ] 验收：USB 网卡 + `172.16.42.1:23` 能进 shell（面板控制台是加分项：
       这台机器的 stdout-path 是测试点上的 UART，不是 USB）
@@ -351,9 +355,26 @@ adb reboot bootloader
 ./flash-raphael.sh --test
 ```
 
-第 1 步在写这份文档的机器上做不了（Windows，没有 docker，WSL 被策略挡住）。
-换一台能跑 `docker info` 的 Linux 机器；`OWN_KERNEL_TREE=1` 已经让这条路不再需要
-ROCKNIX 检出，只要 busybox 和容器。
+第 1 步在写这份文档时是在这台 Windows 上跑的，用 WSL 的容器 CLI（`wslc`，
+镜像 `proxy.vvvv.ee/library/fedora:43`）。四件事值得记下来，因为每一件都让第一次
+构建停在离原因很远的地方：
+
+1. **仓库在 Windows 上检出是 CRLF**。`set -euo pipefail\r` 在 Linux 里报
+   `pipefail: invalid option name`。容器里先把 `external-and-mods/` 与三个顶层脚本
+   拷过去、`sed 's/\r$//'`，不改仓库本身。
+2. **`build.sh` 的 `build_initramfs()` 读死 `/bin/busybox`**（ROCKNIX 上游的路径），
+   平时由 `build-gcc15.sh` 用 `-v` 挂进去。绕开那层包装就得自己放一份，否则报
+   "need a static busybox"。
+3. **`set -u` 会撞 `ROCKNIX_REF`**：`ROCKNIX_DIR` 的默认值里展开它，而 raphael 的
+   配方按设计不定义它。`build.sh` 里给了 `unused` 兜底。
+4. **GitHub 直连 ~28 KB/s，还被 429 限流**；`ghfast.top` 也就 135 KB/s。
+   258 MB 的源码树最后是人在外面下好丢进 `work/cache/`。构建脚本会把它放进
+   `$WORK/cache/linux-raphael-<sha>.tar.gz`，`fetch()` 见到就不下了 —— 重跑不再联网。
+
+另外记一个**看起来像 bug 但并不是**的：`Image` 前 4 字节是 `4d 5a`（"MZ"），
+很像 `CONFIG_EFI_ZBOOT` 产出的 PE 包装。它不是 —— offset `0x38` 是 `ARMd`，
+这是带 `CONFIG_EFI=y` 的裸 arm64 Image 的正常头部（前两字节刻意做成 "MZ" 让 PE
+加载器认）。判断该看 `0x38`，别看头 4 字节，否则会把一个好内核丢掉。
 
 `--install`（写 `userdata`、装 SteamOS rootfs）没有实现，也不该在阶段 1 之前实现：
 它需要机内签名固件、一份 raphael overlay、以及一个已经确认能启动的 boot.img，

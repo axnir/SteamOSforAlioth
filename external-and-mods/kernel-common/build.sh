@@ -44,6 +44,10 @@ read -ra PORT_DIRS_A <<<"${PORT_DIRS:-kernel-${SOC_ARG}}"
 port_dir() { echo "${PORT_ROOT}/external-and-mods/$1"; }
 
 LOCALVERSION="${LOCALVERSION:--${KNAME}-steamos}"
+# OWN_KERNEL_TREE=1 reads nothing from ROCKNIX, so its recipe has no tag to
+# name -- but the default below expands ROCKNIX_REF unconditionally, and set -u
+# turns that into a failure fifteen lines before anything useful happens.
+ROCKNIX_REF="${ROCKNIX_REF:-unused}"
 ROCKNIX_DIR="${ROCKNIX_DIR:-${PORT_ROOT}/../rocknix-${ROCKNIX_REF}}"
 TDDI_REF="${TDDI_REF:-af27029fa2b27c4a77d16809298ed5d03c9da5a6}"
 DTBS="${DTBS_OVERRIDE:-$DTBS}"
