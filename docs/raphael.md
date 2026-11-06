@@ -35,8 +35,8 @@ raphael   同上       本分支：只有本文 + 后续移植提交
 | 音频 | `sm8150-tavil-snd-card`（WCD9340 SLIMbus + TFA9874 功放） | `dumpsys input` 里的声卡 jack 设备 |
 | Wi-Fi | `ro.wlan.chip=39xx`，vendor 节点是 `wcn3998-wifi` | `getprop`，参考 DTB |
 | Android | MIUI 12.5，`RKQ1.200826.002` / `21.11.24`，内核 4.14.180 | `getprop ro.build.fingerprint`、`uname -a` |
-| adb root | **不行**：`adbd cannot run as root in production builds` | `adb root` |
-| 分区槽位 | **没有 A/B**：`getprop ro.boot.slot_suffix` 为空 | 见下 |
+| root | **有**：Magisk 27（`/system/bin/su -> ./magisk`），shell 需在 Magisk 里放行 | `su -c id` → `uid=0(root) … u:r:magisk:s0` |
+| 分区槽位 | **没有 A/B**：`ro.boot.slot_suffix` 为空，`fastboot getvar all` 里**一个 slot 变量都没有** | 两处独立确认 |
 
 分区表（`/dev/block/by-name/`，全部列出，注意没有 `_a`/`_b` 后缀）：
 
@@ -48,6 +48,61 @@ abl ablbak aop aopbak ... boot cache dtbo ... modem ... super system userdata vb
 不是 A/B 槽。这台机器是 **A-only**：一个 `boot`、一个 `dtbo`、没有 `set_active`。
 
 > 这一条对刷机脚本的影响比看上去大，见 §6。
+
+### 2.1 bootloader 侧的数字（`fastboot getvar all`）
+
+| 项 | 值 |
+|---|---|
+| `boot` | `0x8000000` = 128 MiB |
+| `dtbo` | `0x2000000` = 32 MiB（`/dev/block/sde45`） |
+| `cache` | `0x10000000` = 256 MiB |
+| `vbmeta` | `0x20000` = 128 KiB |
+| `modem` | `0x14000000` = 320 MiB |
+| `userdata` | `0x752A7FB000` ≈ 502.6 GB |
+| `unlocked` / `variant` / `hw-revision` | `yes` / `SDM UFS` / `20002`，`board_version: 4.9.2` |
+| `fastboot fetch` | **不支持**（"Device does not support fetch command"） |
+
+`fetch` 被关掉这一条决定了备份怎么做：**分区备份只能走 root**，`fastboot` 这条路没有。
+
+### 2.2 原厂 boot 镜像的头部（备份自己解析出来的）
+
+从 `stock-boot.img` 的前 1632 字节读出来：
+
+```
+magic ANDROID!   header v0   pagesize 4096
+kernel_size 43958697   kernel_addr 0x00008000
+ramdisk_size 927736    ramdisk_addr 0x00000000
+second_size 0          tags_addr 0x00000100
+os_version 0x16000155
+```
+
+**这和 `make-steamos-alioth.sh` 里那四个值几乎一样**（`PAGESIZE=4096`、
+`KERNEL_ADDR=0x8000`、`TAGS_ADDR=0x100`），唯一不同的是 ramdisk 地址：
+raphael 是 `0x0`，alioth 用 `0x01000000`。也就是说打包逻辑可以整套搬过来，
+只需要把这一个值按 raphael 的来。
+
+### 2.3 已经做出来的备份
+
+| 文件 | 大小 | sha256 |
+|---|---|---|
+| `work/raphael-facts/stock-boot.img` | 134 217 728 B（整个分区） | `b794c34b2d868cc81e694ecd01d732a4c286ef8bc6ecf541548e0fe38ed048ce` |
+| `work/raphael-facts/stock-dtbo.img` | 33 554 432 B（整个分区） | `f921ddda9bc38bb4582287c0e2d6aafb5fc3b132680ab53774bdd9ae9fc6f540` |
+
+两个都在机内 `dd` 出来、`adb pull` 回来，两边的 `sha256sum` 一致。`work/` 是
+`.gitignore` 的，不进仓库；丢了自己重做一遍即可：
+
+```bash
+adb shell su -c "dd if=/dev/block/by-name/boot of=/data/local/tmp/b.img bs=1M"
+MSYS_NO_PATHCONV=1 adb pull /data/local/tmp/b.img work/raphael-facts/stock-boot.img
+```
+
+> 两个坑：`adb exec-out ... > file` 在 Windows/Git Bash 下会把 `0x0A` 换成
+> `0x0D 0x0A`，128 MiB 的镜像会长出 319 638 字节，`sha256` 对不上而文件看着正常；
+> `adb pull /data/...` 的绝对路径会被 MSYS 改写成 `C:/Program Files/...`，
+> 要加 `MSYS_NO_PATHCONV=1`。
+
+回退：`fastboot flash boot work/raphael-facts/stock-boot.img` 就是现在这套
+Android（Magisk 补丁版）原样回去。
 
 `/proc/cmdline`、`/proc/device-tree/*`、`/proc/bus/input/devices` 对 shell 全部
 `Permission denied`（SELinux），所以 board-id 这类东西**不能**从运行中的 Android 读，
@@ -107,26 +162,30 @@ qcom,board-id = <44 0>;
 ABL 的 DTB 选择就是拿这两个值做匹配（`docs/alioth.md` 里 ABL 日志的
 `Best match DTB tags 356/0000002C`，`0x2C`=44 就是 board-id）。
 
-**raphael 的两个值已经从参考仓库的 DTB 里解出来了**（`dtb/raphael-redmi-k20pro.dtb`，
-从跑着 U-Boot 的真机导出）：
+**raphael 的两个值：**
 
 ```
 qcom,msm-id   = <0x153 0x20000>     /* SM8150 v2.0 */
 qcom,board-id = <0x28 0>            /* 40  */
 ```
 
-这是本分支第一个**可复核的实测值**，但还没在 fastboot 侧验证过（见 §7）。
+`board-id` 已经在这台机器上**直接读到了**（root 下 `od /proc/device-tree/qcom,board-id`
+→ `00 00 00 28 00 00 00 00`），和参考项目那份从 U-Boot 机器导出的 DTB 完全一致。
+`msm-id` 那个文件被 SELinux 挡着读不到（`Permission denied`），但它是 SoC 级常量，
+不是板级的，按 SM8150 取 `0x153`。
 
-同一份 DTB 和源码 DTS 有几处不一致，说明它是另一个修订：
+### 3.3 参考 DTB 和源码 DTS 的差异，逐条核实过了
 
-| 项 | 源码 DTS | 真机导出的 DTB |
-|---|---|---|
-| 面板 | `samsung,ea8076` | `samsung,ams639rq08` |
-| BT | `qcom,wcn3990-bt` | `qcom,wcn3998-bt` |
-| Wi-Fi 供电 | 分散在 regulator 里 | 有独立的 `wcn3998-pmu` 节点 |
-| 内存节点 | 硬编码 3 段（约 6 GiB，来自 UEFI 交接） | **没有** `memory` 节点 |
+| 项 | 源码 DTS | 参考 DTB | 这台机器上的实际值 |
+|---|---|---|---|
+| 面板 | `samsung,ea8076` | `samsung,ams639rq08` | **ea8076**：dmesg 里 `panel name is dsi_ss_fhd_ea8076_cmd_display`、`[samsung ea8076 fhd cmd dsi panel]` |
+| BT | `qcom,wcn3990-bt` | `qcom,wcn3998-bt` | 未定，两个都试得起（同一个驱动） |
+| Wi-Fi 供电 | 分散在 regulator | 独立 `wcn3998-pmu` 节点 | 未测，起不来先怀疑这里 |
+| 内存节点 | 硬编码 3 段（≈6 GiB，UEFI 交接） | 没有 | ABL 会填，见 §8 |
 
-这两点都必须在第一次上真机时定下来，不能猜（面板选错=黑屏，PMU 节点缺=Wi-Fi 起不来）。
+所以**源码树那份 DTS 是准的**，参考项目那份是另一个修订（或另一块板子）。
+触摸也核实了：`[GTP9886-INF] goodix9886 Core layer init`，和 DTS 的 `goodix,gt9886` 对得上；
+功放 `tfa98xx_i2c_probe(): addr=0x34`，和 DTS 的 `amplifier@34` 对得上。
 
 ---
 
@@ -173,10 +232,9 @@ rootfs。这条路：
 原样有效。raphael 额外三条：
 
 1. **`boot` 只有一个，没有备用槽。** alioth 写坏 a 槽还能靠 b 槽的 Android 找回来，
-   这里写坏就是纯黑屏，只能靠 fastboot 重刷。所以：
-   - 第一次写之前，必须先把**官方线刷包对应版本的 `boot.img`** 留在手里
-     （`adb` 读不到 block device，没有 root 也 dump 不出来）
-   - 刷机脚本里“两槽写同一份镜像”的逻辑整段作废，安全网换成“备份 + 明示”
+   这里写坏就是纯黑屏，只能靠 fastboot 重刷。安全网是 §2.3 那两个备份：
+   - 回退命令记住一条就够：`fastboot flash boot work/raphael-facts/stock-boot.img`
+   - 刷机脚本里“两槽写同一份镜像”的逻辑整段作废，换成“先校验备份在，再写”
 2. **`dtbo` 不要乱清。** alioth 是 `erase dtbo` 再刷（防止厂商 overlay 叠上来）。
    raphael 的 `dtbo` 里是**面板/触摸的 overlay**，清掉会不会黑屏还没验证 ——
    本分支第一版**不写 `dtbo`**，保持原状。
@@ -192,11 +250,11 @@ rootfs。这条路：
 
 - [x] 分支与设备型号确认（本文 §2）
 - [x] 内核源码定位：`linux@raphael-v7.3.0`
-- [x] board-id / msm-id 从参考 DTB 解出
+- [x] board-id / msm-id 确认（`board-id` 在真机上直读得到，§3.2）
+- [x] 面板 / 触摸 / 功放型号用 dmesg 核实（§3.3）
+- [x] `fastboot getvar all` 与 boot 头部记下来（§2.1、§2.2）
+- [x] `boot` + `dtbo` 整分区备份，两边 sha256 对过（§2.3）
 - [ ] `work/ref/linux-raphael` 克隆完成后，确认 DTS 与 config 在树里的真实状态
-- [ ] fastboot 侧核对：`fastboot getvar all` 记下 `current-slot`(应无)、`partition-size:boot`、
-      `product`、`secure`、`unlocked`
-- [ ] 拿到官方线刷包里的 `boot.img`，作为唯一回退物
 
 ### 阶段 1：能出画面、能进 shell（一次刷写）
 
@@ -235,14 +293,21 @@ rootfs。这条路：
 
 ## 8. 未验证清单（别当结论用）
 
-1. **ABL 是否接受没有 board-id 的 DTB** —— 未测。补上是低风险做法。
-2. **`qcom,board-id = <0x28 0>` 是否就是这台 Premium Edition 的值** —— 来自参考项目的
-   非尊享版导出，同一代号通常一致，但要在 fastboot/放行镜像里核一次。
-3. **面板到底是 `ea8076` 还是 `ams639rq08`** —— 两份 DTS 各说一套，选错是黑屏。
-4. **清 `dtbo` 的后果** —— 未测，第一版不动。
-5. **内存节点**：ABL 填的内存布局与内核 DTS 里那 3 段（UEFI 交接的 ~6 GiB）是否一致 ——
-   设备有 7.5 GiB，说明 UEFI 那份映射本身就少给了一截。
-6. **`userdata` 的实际分区大小与 f2fs 加密** —— 覆盖即丢 Android，不可逆。
+1. **ABL 到底怎么挑 DTB —— 这是阶段 1 的真正未知。** 原厂 `boot.img` 里**没有** DTB 表：
+   我按 v0 头部算出来的 dtb 偏移是空的，全盘扫 `d00dfeed` 只有 4 处落在 kernel 数据里的
+   假阳性；`dtbo`（32 MiB）是 7 条 overlay，不是整棵板级树。所以小米这套原厂镜像的
+   DTB 选择路径还没弄清楚。我们的做法是照 alioth 把 DTB 追加在 `Image.gz` 后面再补
+   board-id —— **试一次才知道 ABL 认不认**，这也是 §5 里选 A 的主要风险。
+2. **BT 用 `wcn3990-bt` 还是 `wcn3998-bt`** —— 源码 DTS 写 3990，参考 DTB 写 3998，同一个
+   驱动，两个都试得起，但只能试一次知道。
+3. **清 `dtbo` 的后果** —— 未测。原厂 `dtbo` 是面板/触摸的 overlay，清掉会不会黑屏不知道，
+   第一版不动它。
+4. **内存节点**：ABL 填的布局和内核 DTS 里那 3 段（UEFI 交接，≈6 GiB）对不上 ——
+   这台机器 `MemTotal` 7.5 GiB，说明那份映射本身就少给了一截。所以 append 里要把
+   `memory@80000000` 删掉，让 ABL 填（alioth 就是这么做的）。
+5. **`userdata` 覆盖即丢 Android** —— 502.6 GB，f2fs + 加密，不可逆。
+6. **WCN3998 的 `board-2.bin` 与 MAC** —— 固件在 `vendor`/`persist` 里，得从 root 侧取；
+   取不到 `wlan_mac.bin` 时 ath10k 会给随机 MAC（参考项目用 systemd 服务固定）。
 
 ---
 
