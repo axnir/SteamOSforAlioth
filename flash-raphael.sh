@@ -16,15 +16,15 @@
 #
 # 两个模式：
 #
-#   --ramboot   把镜像交给 bootloader 直接启动，**不写任何分区**。阶段 1 最
-#               应该先试这个：起来就说明 DTB 被认了、内核能跑到 initramfs，
-#               起不来就按电源键重启，什么都没有变。
-#               注意：alioth 上 `fastboot boot` 出过事（bootloader 卡住不跳转，
-#               还顺手把槽位标记搞乱）。那是有槽位带来的副作用；这台没有槽位，
-#               失败的表现应该只是"没启动"。仍然是唯一一个会调用它的模式。
+#   --ramboot   把镜像交给 bootloader 直接启动，**不写任何分区**。
+#               2026-11-07 实测：**这台机器的 ABL 整体不支持 RAM 启动** ——
+#               连原厂 boot.img 都回 `Failed to load/authenticate boot image:
+#               Load Error`。所以这个模式在这里没有用；留着是因为它不写东西，
+#               换一台机或者哪天 ABL 放开，它仍然是最便宜的试法。
 #
 #   --test      写 `boot` 再重启。回退一条命令：
 #                 fastboot flash boot work/raphael-facts/stock-boot.img
+#               五次失败都是这么回来的，40 秒。
 set -euo pipefail
 
 PORT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

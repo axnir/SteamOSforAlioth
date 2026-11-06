@@ -48,6 +48,12 @@ KERNEL_ADDR=0x00008000
 RAMDISK_ADDR=0x00000000
 TAGS_ADDR=0x00000100
 SECOND_ADDR=0x00000000
+# 原厂头部的 os_version。显式写死而不是按日期算：这个字段可能被 ABL 比较，
+# 而"今天是哪一天"不是能对表的东西。
+OS_VERSION=0x16000155
+# 原厂 Image 头里的 text_offset。我们的内核编出来是 0（7.x 可重定位内核的默认），
+# 原厂是 0x80000。ABL 很可能拿它算加载位置 —— 0 会让内核落在 kernel_addr 本身。
+TEXT_OFFSET=0x80000
 
 img="${KOUT}/boot/Image"
 dtb="${KOUT}/dtbs/${DTB}.dtb"
@@ -57,19 +63,18 @@ dtb="${KOUT}/dtbs/${DTB}.dtb"
 
 mkdir -p "$OUT"
 
-# ABL 拿到的东西：gzip 流 + 追加在后面的 DTB。
+# ABL 拿到的东西：v1 头部 + 小米的"未压缩内核"封装。
 #
-# gzip(Image) 而不是 Image.gz：这个 config 有 CONFIG_EFI_ZBOOT，Image.gz 是
-# 一个 EFI PE 包装而不是 gzip 流，没有 EFI 的引导器解不开（pmaports 的
-# README 把这叫 "THE IMPOSTOR"）。
+# 原厂 boot.img 的内核段不是 gzip，也不是裸 Image，而是：
+#     "UNCOMPRESSED_IMG" + u32(DTB 在 Image 内的偏移) + Image + DTB
+# （每个字段都在原厂镜像里对上过：段内 +20 是 Image，+20+u32 处是 d00dfeed）
+#
+# 所以这里没有 gzip 那一步 —— 第一次刷写用的就是 gzip，`flash boot` 成功但设备
+# 6 秒回到 fastboot、无内核日志，加载期被拒。alioth 的 ABL 收 gzip，这台不收。
 #
 # 只放 raphael 一个 DTB。补丁 0001 给这棵树补了 qcom,msm-id / qcom,board-id
-# —— 没有它们，ABL 眼里这份镜像根本不是候选。这一步是否足够，就是阶段 1
-# 第一次刷写要回答的问题（docs/raphael.md §8）。
+# —— 没有它们，ABL 眼里这份镜像根本不是候选。
 pack_boot() {   # pack_boot <输出文件名>
-payload="${OUT}/payload.gz"
-gzip -9 -n -c "$img" >"$payload"
-cat "$dtb" >>"$payload"
 
 # cmdline 里的每一条都不是默认值：
 #
@@ -96,16 +101,18 @@ cmdline="$(
 
 export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(stat -c %Y "$img")}"
 
-python3 "${KCOMMON}/mkbootimg-v0.py" \
-  --kernel "$payload" \
+python3 "${KCOMMON}/mkbootimg-v1.py" \
+  --image "$img" \
+  --dtb "$dtb" \
+  --image-text-offset "$TEXT_OFFSET" \
   --cmdline "$cmdline" \
   --pagesize "$PAGESIZE" \
   --kernel-addr "$KERNEL_ADDR" \
   --ramdisk-addr "$RAMDISK_ADDR" \
   --tags-addr "$TAGS_ADDR" \
   --second-addr "$SECOND_ADDR" \
+  --os-version "$OS_VERSION" \
   --out "${OUT}/$1"
-rm -f "$payload"
 echo "cmdline: $cmdline"
 }
 
@@ -119,10 +126,11 @@ echo "kernel:  $(basename "$KOUT") ($(readlink -f "$KOUT"))"
 ls -l "${OUT}/boot-debug.img"
 echo
 cat <<'EOF'
-下一步（第一次上真机，二选一）：
+下一步：
 
-  ./flash-raphael.sh --ramboot   # 只往内存里放，不写任何分区（推荐先试）
   ./flash-raphael.sh --test      # 写 boot 分区；回退物在 work/raphael-facts/
 
-两个都只碰 boot。dtbo 不写：那边是面板/触摸的 overlay，清掉会不会黑屏没验证过。
+（--ramboot 在这台机器上没用：ABL 连原厂镜像都拒绝 RAM 启动，见 flash-raphael.sh）
+
+两个模式都只碰 boot。dtbo 不写：那边是面板/触摸的 overlay，清掉会不会黑屏没验证过。
 EOF
