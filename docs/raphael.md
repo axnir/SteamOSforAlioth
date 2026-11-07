@@ -722,37 +722,87 @@ fastboot boot work/steamos-raphael/boot-v2-2mb.img
 不可能）。等能动 `boot` 分区之后，把 U-Boot 本体 + 一个能自动选 fastboot 的环境
 写进去就能免掉。
 
-## 13. 下一步：存储，然后是 rootfs
+## 13. 存储通了：UFS 走模块 + initramfs，quota 打开之后 userdata 能挂
 
-### 13.1 存储：UFS 必须作为模块加载，不能编进内核（已实测）
+### 13.1 UFS 必须是模块，而且要随 initramfs 走
 
-`/proc/partitions` 为空的原因找到了：`CONFIG_SCSI_UFS_QCOM` 和
-`CONFIG_PHY_QCOM_QMP_UFS` 在树里那份 defconfig 里是 `=m`，而 boot 镜像只带内核。
+`/proc/partitions` 为空的原因：`CONFIG_SCSI_UFS_QCOM` 和 `CONFIG_PHY_QCOM_QMP_UFS`
+在树里那份 defconfig 里是 `=m`，而 boot 镜像只带内核。
 
-**但是改成 `=y` 会让内核在显示初始化之前直接死掉**：屏幕全黑、USB 上什么都不出现、
-连 gadget 都来不及起——固件/时钟/PHY 的时序在 early probe 里炸，而那一刻还没有任何
-控制台可以说话（`console=tty0` 要等 simpledrm 起来）。
+**改成 `=y` 会让内核在显示初始化之前死掉**：屏幕全黑、USB 上什么都不出现、连 gadget
+都来不及起——固件/时钟/PHY 的时序在 early probe 里炸，而那一刻还没有任何控制台
+（`console=tty0` 要等 simpledrm）。
 
-所以正确做法是「**模块 + initramfs 里 insmod**」：先让控制台和 USB 立起来，再加载
-UFS，出问题能看见。改动点在 `kernel-common/build.sh` 的 `build_initramfs()` ——
-它现在只打 busybox 和三个脚本，需要在 `modules_install` 之后把
-`phy-qcom-qmp-ufs.ko`、`ufs_qcom.ko`（按依赖顺序）塞进 initramfs 的
-`/lib/modules/<release>/`，并在 `initramfs/init` 里 insmod。
+解法是让它们**以模块形式随 initramfs 一起走**，在 `init` 里按依赖顺序 insmod：
+控制台和 USB 先立起来，probe 出问题看得见。三处改动：
 
-注意构建顺序：`build_initramfs` 在编内核之前调用，所以要二次嵌入
-（modules_install → 重打 cpio → 再 make 一次 Image）。
+| 位置 | 内容 |
+|---|---|
+| `kernel-sm8150/soc.env` | `INITRAMFS_MODULES="phy-qcom-qmp-ufs qcom_ice ufs-qcom"`（顺序即依赖） |
+| `kernel-common/build.sh` | `embed_initramfs_modules()`：`modules_install` 之后把 `.ko` 塞进 initramfs、重打 cpio、再 `make` 一次让 Image 重新嵌入 |
+| `kernel-common/initramfs/init` | 挂 root 之前按顺序 `insmod`，失败打印而不是静默 |
 
-### 13.2 rootfs
+两个细节值得记：
 
-存储通了之后才是阶段 2：把 SteamOS rootfs 写进 `userdata`（ext4），
-`init` 已经会按 `steamos.root=PARTLABEL=userdata` 去挂。这一步会**覆盖 Android 的
-/data**，不可逆，必须让本人确认。
+- **模块文件名是 `ufs-qcom.ko`（连字符）**，不是 `ufs_qcom`。第一次写错，构建直接
+  报 `initramfs module ufs_qcom not found`——这个失败方式是好的那种。
+- **`ufs-qcom.ko` 依赖 `qcom_ice.ko`**（内联加密引擎），`modules.dep` 里写着。
+  漏了它，insmod 会报未知符号。
 
-### 13.3 现在能复现的状态
+结果：
 
-- `work/steamos-raphael/boot-v2-2mb.img`（56 623 104 B）：内核 51 255 808 B
-  + DTB 104 670 B，v2 头、page_size 2 MB
+```
+[    2.503078] scsi 0:0:0:0: Direct-Access SAMSUNG KLUFG8R1EM-B0C1
+[    2.543457] sd 0:0:0:0: [sda] Attached SCSI disk
+major minor  #blocks  name
+  8        0  493461504 sda
+  8       29     262144 sda29      ← cache，256 MiB，LABEL="STEAMBOOT"（我们刷的启动盘）
+259       15  491429868 sda31      ← userdata
+```
+
+31 个分区全在，和 4K-LBA 那份 GPT 一一对应。
+
+### 13.2 root mount 失败的第二个原因：quota
+
+存储通了之后 `mount -t ext4 /dev/sda31` 仍然是 `EINVAL`：
+
+```
+EXT4-fs (sda31): The kernel was not built with CONFIG_QUOTA and CONFIG_QFMT_V2
+```
+
+Android 的 `userdata`（`LABEL="data"`）是开了 quota 的 ext4。补上
+
+```
+CONFIG_QUOTA=y
+CONFIG_QFMT_V2=y
+```
+
+之后，从 initramfs 里直接挂只读：
+
+```
+~ # mount -t ext4 -o ro /dev/sda31 /newroot
+~ # mount | grep newroot
+/dev/sda31 on /newroot type ext4 (ro,relatime,resgid=1065)
+~ # df -h /newroot
+/dev/sda31   461.2G   188.7G   272.3G   41% /newroot
+```
+
+**这台手机的存储现在对我们是可读的**：461 GB、用了 188.7 GB。把 Android 的
+`/data` 挂起来是阶段 2 提取机内固件（GPU zap、ADSP、modem、WCN3998 board file）
+最直接的一条路——那些文件不可再分发，只能从本人手机上取。
+
+### 13.3 下一步：rootfs
+
+`userdata` 现在是 Android 的 `/data`，要换成 SteamOS rootfs 就得**覆盖它**——
+不可逆，动手前必须本人确认。`init` 已经会按 `steamos.root=PARTLABEL=userdata`
+去找、`switch_root` 过去，缺的只是把 rootfs 写进去。
+
+### 13.4 现在能复现的状态
+
+- `work/steamos-raphael/boot-v2-2mb.img`（56 623 104 B）：内核 51 452 416 B
+  （含三个 UFS 模块）+ DTB 104 670 B，v2 头、page_size 2 MB
 - 刷法：U-Boot 菜单选 `Enable fastboot mode`，然后
   `fastboot boot work/steamos-raphael/boot-v2-2mb.img`
-- 起来之后 COM4 是 root shell，`/proc/partitions` 仍然是空的（预期）
+- 起来之后 COM4 是 root shell；`/proc/partitions` 有 31 个分区；
+  `mount -t ext4 -o ro /dev/sda31 /newroot` 能读 Android 的 /data
 - 回 Android：`fastboot flash boot stock-boot.img` + `fastboot flash dtbo stock-dtbo.img`
