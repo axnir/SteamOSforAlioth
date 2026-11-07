@@ -1,0 +1,14 @@
+[Unit]
+Description=Give usb0 a link-local address so the host can reach this device (debug)
+After=raphael-usb-gadget.service sys-subsystem-net-devices-usb0.device
+Wants=raphael-usb-gadget.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# 调试用：Windows 侧 NCM 网卡拿到的是 169.254.x/16，手机也进同一段就能互相连。
+# 有了它才能从 PC 推文件 / 跑代理；WiFi 通了之后这个 unit 可以直接不装。
+ExecStart=/bin/sh -c 'ip addr add 169.254.240.121/16 dev usb0 2>/dev/null || true; ip link set usb0 up'
+
+[Install]
+WantedBy=multi-user.target

@@ -204,7 +204,7 @@ if [ -d "$REPO/scripts/raphael-overlay" ]; then
     mkdir -p "$TREE/usr/lib"
     cp -f "$TREE/opt/raphael/qcom/lib/libqrtr.so.1" "$TREE/usr/lib/" 2>/dev/null || true
     mkdir -p "$TREE/etc/systemd/system/multi-user.target.wants"
-    for u in raphael-qrtr-ns raphael-rmtfs raphael-tqftpserv raphael-modem; do
+    for u in raphael-qrtr-ns raphael-rmtfs raphael-tqftpserv raphael-modem raphael-usb-net; do
       [ -f "$TREE/usr/lib/systemd/system/$u.service" ] &&
         ln -sf "/etc/systemd/system/$u.service" \
           "$TREE/etc/systemd/system/multi-user.target.wants/$u.service"

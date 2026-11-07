@@ -7,8 +7,11 @@ Requires=raphael-qrtr-ns.service
 
 [Service]
 Type=simple
-# modem 起来后会通过 TFTP 向 AP 要自己的运行时文件（mba/qdsp6sw 等），
-# 没有这个服务它拿不到就崩；文件相对 firmware-name 的目录解析
+# modem 通过 TFTP 向 AP 要自己的运行时文件；tqftpserv 把请求映射到
+# /readonly/firmware/image 与 /readwrite 两个根（Android 里是 vendor 分区和 data）。
+# 实测它要的是 wlanmdsp.mbn 和 modem_pr/mcfg/configs/mcfg_{hw,sw}/mbn_*.dig，
+# 少一个 modem 就每 0.5 秒 fatal error 崩一次（crash #352 之前一直这样）。
+ExecStartPre=/bin/sh -c 'mkdir -p /readonly/firmware /readwrite; ln -sfn /lib/firmware/qcom/sm8150/Xiaomi/raphael /readonly/firmware/image'
 ExecStart=/opt/raphael/qcom/bin/tqftpserv
 Restart=always
 RestartSec=3

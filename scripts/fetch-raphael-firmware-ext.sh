@@ -53,6 +53,10 @@ vendor=(
   "qca/crnv21.bin:4000"
   "goodix_gt9886_cfg_f11.bin:1000"
   "ath10k/WCN3990/hw1.0/board.bin:20000"
+  # modem 起来后通过 TFTP 向 AP 要的三样；缺任何一个 modem 就每 0.5s fatal error
+  "qcom/sm8150/Xiaomi/raphael/wlanmdsp.mbn:4000000"
+  "qcom/sm8150/Xiaomi/raphael/modem_pr/mcfg/configs/mcfg_hw/mbn_hw.dig:20"
+  "qcom/sm8150/Xiaomi/raphael/modem_pr/mcfg/configs/mcfg_sw/mbn_sw.dig:20"
 )
 for entry in "${vendor[@]}"; do
   rel="${entry%:*}"
