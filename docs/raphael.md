@@ -1231,3 +1231,96 @@ Valve 的 rootfs 里，需要交叉编译。
 - `scripts/build-raphael-reference.sh` 4/7：把 adsp/modem/slpi/ipa 按
   `qcom/sm8150/Xiaomi/raphael/` 布局装进 rootfs，并合入 `work/fw-ext/`
 - `scripts/raphael-push-net.ps1`：NCM 传文件（30 MB/s，替代串口 base64）
+
+## 20. 触摸也起来了：固件在 `firmware-xiaomi-raphael` 那个仓库里
+
+### 20.1 关键发现
+
+DTS 注释里提到 k20pro-linux 的配套件，顺着找到 `GengWei1997/firmware-xiaomi-raphael`，
+里面就是我们缺的那一整套：
+
+```
+lib/firmware/goodix_gt9886_cfg_f11.bin        ← 触摸校准（DTS 点名的那个）
+lib/firmware/goodix_gt9886_fw_f11.bin         ← 触摸固件（见 20.3，先不用）
+lib/firmware/ath10k/WCN3990/hw1.0/board.bin   ← board data（DTS 说 board_id 0xff 用普通文件名）
+lib/firmware/qca/{crbtfw21.tlv,crnv21.bin}    ← 蓝牙（厂商版，比 linux-firmware 大）
+lib/firmware/qcom/sm8150/Xiaomi/raphael/      ← adsp/modem/ipa/zap + jsn
+  └ modem_pr/mcfg/…                            ← 运营商配置（做蜂窝数据时才要）
+```
+
+### 20.2 触摸：只差一个 cfg bin
+
+之前：
+
+```
+[GTP-ERR][goodix_later_init_thread:535] no config bin, continuing with the controller's factory config
+[GTP-ERR][goodix_send_config:1042] invalid config data
+[GTP-ERR][goodix_read_version:705] reg is NULL, pid:0x0000
+```
+
+补上 `goodix_gt9886_cfg_f11.bin` 之后：
+
+```
+[GTP-INF][goodix_later_init_thread:523] success get cfg bin
+[GTP-INF][goodix_later_init_thread:553] success parse config bin
+[GTP-INF][goodix_read_version:809] PID:9886,SensorID:1, VID:03 04 02 29
+[GTP-INF][goodix_ts_stage2_init:1864] success register irq
+[GTP-INF][goodix_later_init_thread:564] stage2 init success
+```
+
+设备节点：
+
+```
+N: Name="goodix_ts"   H: Handlers=kbd event5
+B: PROP=2                       ← INPUT_PROP_DIRECT，是触摸屏
+B: ABS=261800000000003          ← ABS_X/Y + ABS_MT_SLOT/MT_POSITION_X/Y/MT_TRACKING_ID
+```
+
+`pid:0x0000 → 9886` 是判断「驱动真的和控制器说上话」的关键指标，比有没有 event 节点可靠。
+
+### 20.3 一个坑：别装 `goodix_gt9886_fw_f11.bin`
+
+运行时重绑驱动时走了固件升级路径，直接空指针：
+
+```
+goodix_fw_update_thread+0x204/0x1420 [goodix_gtx8]
+goodix_do_fw_update → goodix_later_init_thread
+```
+
+出厂固件本来就匹配（PID/VID 都对），cfg 到位就够了。启动时不 oops（`dmesg | grep -c
+'Call trace'` = 0），`fw update failed, -2 [ignore]` 是无害的。
+
+### 20.4 旋转校准还没做
+
+面板是 1080×2340 竖屏，gamescope 用 `--force-composition-rotation` 转成横屏，
+但**触摸坐标不会跟着转**（alioth 踩过同样的坑）。需要按实际方向加 udev 规则：
+
+```
+# alioth 是 90°：0 1 0 -1 0 1；raphael 的方向要实测确认
+ENV{LIBINPUT_CALIBRATION_MATRIX}="0 1 0 -1 0 1"
+```
+
+验证方法：modetest 或 evtest 看 ABS_X/ABS_Y 范围（DTS 写的是 `panel-max-x=1079`,
+`panel-max-y=2339`），手指从左到右划，看 X 是否真的递增。
+
+### 20.5 固件来源与固化
+
+`scripts/fetch-raphael-firmware-ext.sh` 现在跑两批：
+- kernel.org（linux-firmware）：`firmware-5.bin`、`board-2.bin`
+- `firmware-xiaomi-raphael`（GitHub，镜像 `ghfast.top`，失败退回直连）：
+  `goodix_gt9886_cfg_f11.bin`、`board.bin`、厂商版 `crbtfw21.tlv`/`crnv21.bin`
+
+全部落到 `work/fw-ext/`，`build-raphael-reference.sh` 4/7 整棵装进 rootfs 的
+`/usr/lib/firmware/`。下次重刷 userdata，音频/蓝牙/触摸就是开箱可用。
+
+### 20.6 重启后的实测基线（2026-11-08 00:40）
+
+```
+uptime 67s  PID1=systemd
+card 0 [Pro]: sm8150 - Xiaomi Redmi K20 Pro
+remoteproc2 (adsp) = running
+[6.6s] QCA Downloading qca/crbtfw21.tlv → [7.6s] QCA setup on UART is completed
+goodix_ts: stage2 init success, PID 9886
+sddm: Session started true；gamescope --backend drm（user unit active）
+modem 保持 offline（我们不主动 start，避免它 40s 一次的 crash loop）
+```
