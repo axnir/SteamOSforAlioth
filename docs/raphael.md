@@ -1322,5 +1322,183 @@ remoteproc2 (adsp) = running
 [6.6s] QCA Downloading qca/crbtfw21.tlv → [7.6s] QCA setup on UART is completed
 goodix_ts: stage2 init success, PID 9886
 sddm: Session started true；gamescope --backend drm（user unit active）
-modem 保持 offline（我们不主动 start，避免它 40s 一次的 crash loop）
+modem 此时仍 offline（当时还没补 wlanmdsp/mcfg，主动 start 会每 0.4s 崩一次）
 ```
+
+（modem 后来已修好，见 §21.3。）
+
+## 21. 黑屏的第二个原因、WiFi 的正解，以及两个运维坑
+
+时间：2026-11-08 凌晨。设备已关机，本节是当时为止的实测记录与定位。
+
+### 21.1 能力现状（谁能用、谁不能用）
+
+| 项 | 状态 | 判据 |
+|---|---|---|
+| 引导链 | ✅ | `U-Boot → bootefi bootmgr → ESP(sda29) → systemd-boot → linux.efi + initramfs` |
+| 根文件系统 | ✅ | `/dev/loop0 on / type ext4 (rw)`，p2 在线扩到 458G |
+| 图形合成 | ✅ | `gamescope --backend drm --prefer-output DSI-1`，`sddm Session started true` |
+| 音频 | ✅ | `card 0 [Pro]: sm8150 - Xiaomi Redmi K20 Pro`，PipeWire 认到 Built-in Audio |
+| 蓝牙 | ✅ | `QCA setup on UART is completed` |
+| 触摸 | ✅ | `PID:9886`、`stage2 init success`、`PROP=2` + `ABS_MT` |
+| modem | ✅ | `remoteproc1 running`，崩溃计数停住 |
+| **WiFi** | ❌ | `ath10k_snoc` 绑上但 probe 停在 regulator 一行，`qrtr-lookup` 无 `0x45`（WLFW） |
+| **Steam UI** | ❌ | bootstrap 卡在 `Steam needs to be online to update` |
+
+### 21.2 黑屏不是显示问题 —— 是 Steam 的 bootstrapper
+
+现象：屏幕全黑，但面板和合成器都正常。
+
+```
+DSI-1: connected / enabled      背光 1535/2047（bl_power=0）
+gamescope-wl / 2×Xwayland / steam -gamepadui / steamwebhelper 全部在跑
+```
+
+Steam 的 bootstrap 日志：
+
+```
+Error: Steam needs to be online to update. Please confirm your network connection.
+Downloading manifest: https://client-update.steamstatic.com/...
+Download failed: http error 0
+Failed to load manifest
+```
+
+Steam 客户端**在完成一次联网更新之前不会绘制 gamepadui**，于是 gamescope 拿着一个
+空客户端 → 全黑。这不是内核、驱动或 gamescope 的问题。
+
+同时还有一个放大器：`RTC` 是假的（`RTC time: Mon 2029-03-19`），每次开机时钟回到
+2029，没网时 NTP 同步不了。时间错会让 TLS 直接失败。**开机后必须校时**：
+
+```sh
+timedatectl set-timezone Asia/Shanghai
+date -s "2026-11-08 01:05:00"        # 有网之后交给 timedatectl set-ntp true
+```
+
+> 教训：判断「图形会话是否可用」不能只数进程（`systemctl is-active`、
+> `ps | grep gamescope` 一直是对的），必须看 Steam 的 bootstrap 日志 ——
+> 进程存在 ≠ 有画面。§18 当时的「Game Mode 跑通」结论就下早了。
+
+### 21.3 WiFi 的正解在 `Winter21c/archlinux-xiaomi-raphael`
+
+本地副本：`work/ref/archlinux-xiaomi-raphael`（git remote 就是那个仓库）。
+它把 Qualcomm 用户态当成一个构建阶段来做 —— `scripts/05-qcom.sh`，注释直接写明：
+
+```
+rmtfs      — 把调制解调器的 EFS/共享内存分区通过 QMI 提供给 MSS；
+             没有它调制解调器固件无法启动
+pd-mapper  — 回答 ADSP 的 protection-domain 查询（音频、Wi-Fi WLAN PD 需要）
+tqftpserv  — 通过 QRTR 给 ADSP/CDSP 传固件
+qrtr       — 上面三个都依赖的 IPC Router 用户态库
+```
+
+四个都是**从源码交叉编译**（`clang --target=aarch64-linux-gnu` + rootfs sysroot），
+因为 ALARM 仓库里没有。
+
+`notes/qcom-userspace.md` §0.3 给了最关键的一条：sm8150 的内核自带
+`qcom_pd_mapper.ko`，它的域表**硬编码包含 `mpss_wlan_pd`**：
+
+```
+drivers/soc/qcom/qcom_pd_mapper.c: of_machine_get_match(qcom_pdm_domains)
+   "qcom,sm8150" 在表里
+   → qmi_add_server(..., QMI_SERVICE_ID_SERVREG_LOC /* 0x40 */, ...)
+```
+
+**结论：WLAN protection domain 要有东西应答，modem 的 WLFW（QRTR 服务 0x45）
+才会注册；没有它 ath10k_snoc 就永远停在 probe。**
+
+对照我们的内核配置，三处都要补：
+
+```
+CONFIG_QCOM_PD_MAPPER=m     → qcom_pd_mapper.ko 存在，但运行时从未 modprobe
+CONFIG_QCOM_RMTFS_MEM=m     → /dev/qcom_rmtfs_mem*，rmtfs 依赖，同样没确认加载
+CONFIG_QRTR=m / QRTR_SMD=m  → 已加载（lsmod 里有）
+```
+
+还有一处固件布局差异 —— 参考仓库的 `porting-checklist.md:648` 写的是：
+
+```
+usr/lib/firmware/ath10k/WCN3990/hw1.0/{board-2.bin, firmware-5.bin, wlanmdsp.mbn}
+```
+
+即 `wlanmdsp.mbn` 放在 **ath10k 目录**下，不只是 `qcom/sm8150/Xiaomi/raphael/`。
+我们目前只放后者，满足了 tqftpserv 的请求，但 ath10k 自己的 `request_firmware`
+路径可能仍会落空。
+
+**下一步验证（待本人确认后执行）**：
+
+```sh
+modprobe qcom_pd_mapper qcom_rmtfs_mem
+ln -sf /lib/firmware/qcom/sm8150/Xiaomi/raphael/wlanmdsp.mbn \
+       /lib/firmware/ath10k/WCN3990/hw1.0/wlanmdsp.mbn
+/opt/raphael/qcom-setup.sh                       # qrtr-ns/rmtfs/tqftpserv + modem
+setsid sh -c 'echo 18800000.wifi > /sys/bus/platform/drivers/ath10k_snoc/bind' &
+qrtr-lookup | grep '^ *69 ' && ls /sys/class/net/wlan0
+```
+
+判据：`qrtr-lookup` 出现 0x45、`/sys/class/net/wlan0` 出现。
+
+### 21.4 modem：已经稳定（补了 wlanmdsp + mcfg 摘要）
+
+之前 modem 每 0.4 秒 `fatal error` 一次，重启了 300 多次。从 tqftpserv 日志里读到
+它到底在要什么：
+
+```
+unable to open /readonly/firmware/image/wlanmdsp.mbn
+unable to open /readonly/firmware/image/modem_pr/mcfg/configs/mcfg_hw/mbn_hw.dig
+unable to open /readonly/firmware/image/modem_pr/mcfg/configs/mcfg_sw/mbn_sw.dig
+```
+
+补齐后崩溃计数停在 `crash #352`，`remoteproc1` 稳定 `running`。要点：
+
+- tqftpserv 把请求映射到 `/readonly/firmware/image` 与 `/readwrite`（Android 里
+  这两个分别是 vendor 分区和 data），unit 的 `ExecStartPre` 负责建目录和软链
+- `rmtfs` 这个 Debian 版本把存储目录写死在 `/boot`（`-r`/`-s` 都不生效），需要在
+  `/boot` 下先有 `modem_fs1/2/fsc/fsg` 等文件（`truncate -s 8M` 即可）
+- `ota_firewall/ruleset` 也建议先建个空文件，省得一直 reject
+
+### 21.5 两个运维坑（都不是代码错）
+
+**a) `multi-user.target.wants` 里的 unit 会开机静默跳过**
+
+`systemctl is-enabled` 是 enabled，`systemctl cat` 能看到文件，但开机后
+`ActiveEnterTimestamp` 为空、journal 一条记录都没有、`ConditionResult=no`。
+在 Valve 的 rootfs 上不可靠。已验证可靠的钩子是 **`raphael-usb-gadget.service`**
+（`sysinit.target.wants`），用它的 `ExecStartPost` 调 `/opt/raphael/qcom-setup.sh`。
+
+**b) 往 `ath10k_snoc/bind` 写 sysfs 会阻塞整个 shell**
+
+probe 在等 QMI 时 write 不返回，串口命令全部排队、看起来像「shell 死了」。必须
+`setsid sh -c '...' &` 放后台，或者干脆重启让 deferred probe 自己重试。
+
+**c) 重启 `sddm` 也会带走串口**
+
+`systemctl restart sddm` 会卡住（等用户会话退出），期间 ttyGS0 上的调试 shell 一起
+消失。用 `--no-block`，并且不要在排查中途随便重启会话。
+
+### 21.6 调试通道：串口太慢，用 USB NCM
+
+串口 115200 只有 ~8 KB/s（7.8 MB 要 27 分钟）。`usb0` 走 NCM 实测 **30 MB/s**：
+
+```
+Windows NCM 网卡自动 169.254.x.y/16（不需要管理员权限）
+手机：ip addr add 169.254.240.121/16 dev usb0
+手机：busybox nc -l -p 9999 > /tmp/f
+Windows：scripts/raphael-push-net.ps1 -LocalFile <文件> -RemotePath <路径>
+```
+
+74 MB 的 `modem.mbn` 用了 3 秒。Windows 防火墙默认挡 ICMP，`ping` 不通不代表链路不通。
+
+更进一步还能借电脑上网：`work/proxy.js`（Node，HTTP CONNECT）监听
+`169.254.240.120:3128`，手机侧 `curl` 走它拿到 `http=403`（TLS 握手成功、根路径
+本来就是 403）——证明链路可用。Steam 要吃到这个代理，环境变量得进 PAM 会话
+（`/etc/environment`），`~/.config/environment.d/` 那一套在 sddm 会话里不生效。
+
+### 21.7 待办（按依赖排序）
+
+1. 阶段 0 验证 `qcom_pd_mapper` + `wlanmdsp.mbn` 位置 → 是否出现 WLFW / wlan0
+2. 若通：连 WiFi、NTP 校时、让 Steam 完成更新 → 屏幕出现 UI
+3. 若不通：走 USB 代理让 Steam 先能用（链路已验证）
+4. 固化：`modules-load.d` 加 `qcom_pd_mapper`/`qcom_rmtfs_mem`；
+   `qcom-setup.sh` 补 modprobe 与 ath10k 固件路径；修好 `ExecStartPost` 未生效的问题；
+   重刷一次 `userdata`
+5. 之后：蓝牙 MAC（`bdaddr` 从 modem NV 取）、待机掉电、装游戏跑 Proton
