@@ -355,6 +355,22 @@ if [ -n "$rootdev" ] && [ ! -e /newroot/sbin/init ] && [ ! -e /newroot/init ]; t
   fi
 fi
 
+# 找不到 init 就别 switch_root —— 那会把 initramfs 删掉然后死在半路（实测）。
+# 把 btrfs 顶层和默认子卷的内容打到控制台，落进应急 shell 人工查。
+if [ -n "$root_mounted" ] && [ ! -e /newroot/sbin/init ] && [ ! -e /newroot/init ] \
+   && [ ! -e /newroot/usr/lib/systemd/systemd ]; then
+  echo "rootfs mounted but no init inside -- inspecting instead of switch_root"
+  mkdir -p /mnt2 2>/dev/null
+  mount -t btrfs -o subvolid=5 "$rootdev" /mnt2 2>/dev/null \
+    && { echo "== btrfs 顶层 =="; ls /mnt2 2>/dev/null;
+         for sv in /mnt2/*/; do echo "  目录: ${sv#/mnt2/}"; done; }
+  echo "== /newroot（默认子卷）=="; ls /newroot 2>/dev/null
+  umount /newroot 2>/dev/null
+  usb_shell 2>/dev/null || true
+  echo "应急 shell 已就绪（COM4），人工查明子卷后手动 mount + switch_root"
+  exec sh
+fi
+
 if [ -n "$root_mounted" ]; then
   if [ -z "$logdir" ]; then
     logdir=/newroot/var/log/steamos-arm-boot
