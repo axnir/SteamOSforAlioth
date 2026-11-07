@@ -164,7 +164,14 @@ cp -a "$KOUT/modules/7.3.0-raphael-steamos" "$TREE/usr/lib/modules/"
 # 会被 dev-zram0.device 之类的 job 拖住，挂在那边的服务永远不会执行，系统起来
 # 之后电脑上就一个串口都看不到。
 if [ -d "$REPO/scripts/raphael-overlay" ]; then
-  cp -a "$REPO/scripts/raphael-overlay/." "$TREE"/
+  # git 在 Windows 上会把这些文件 checkout 成 CRLF；unit 里的 CR 会让 systemd
+  # 解析失败，gadget.sh 的 shebang 带 CR 更是直接起不来。逐文件去 CR。
+  OV="$REPO/scripts/raphael-overlay"
+  (cd "$OV" && find . -type f | while read -r rel; do
+     mkdir -p "$TREE/$(dirname "$rel")"
+     tr -d '\r' < "$OV/$rel" > "$TREE/$rel"
+   done)
+  chmod 755 "$TREE/opt/raphael/gadget.sh" 2>/dev/null || true
   mkdir -p "$TREE/etc/systemd/system/sysinit.target.wants"
   ln -sf /etc/systemd/system/raphael-usb-gadget.service \
     "$TREE/etc/systemd/system/sysinit.target.wants/raphael-usb-gadget.service"
