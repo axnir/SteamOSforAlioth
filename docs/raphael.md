@@ -901,3 +901,54 @@ fastboot flash boot work/uboot/u-boot-fastboot.img
 
 刷完之后每次开机都是一个等着 `fastboot boot` 的设备，不再需要按任何键。想换回
 原版就刷 `work/uboot/u-boot.img`（671 744 B，sha256 `ba6548b5…b992`）。
+
+## 15. 阶段 2 第一步：SteamOS 的 systemd 跑起来了，但还进不了图形会话
+
+### 15.1 做了什么
+
+1. `scripts/extract-raphael-firmware.sh` 从 Android（root adb）取出机内固件 →
+   `work/raphael-fw/`（185 MB，`a640_zap/gmu`、adsp 全套、modem 镜像、persist）
+2. `scripts/fetch-steamos-rootfs.sh` 按 casync 分块重组 Valve 的
+   `deckard-20261002.6232440-0.5.3` → `rootfs.img`（10 GiB，sha256 与 RAUC
+   manifest 一致）
+3. `img2simg` 转 sparse（4.2 GiB）→ `fastboot flash userdata`（6 个分块，2m16s）
+
+### 15.2 一路踩过来的四层坑（全是「看起来像别的问题」那一类）
+
+| 现象 | 真因 |
+|---|---|
+| `root mount failed`、init 进应急 shell | Valve 的 rootfs 是 **btrfs**，不是 ext4（ext4 是 alioth 那份）；init 写死了 `-t ext4` |
+| `mount -t btrfs` 返回 `No such device` | `CONFIG_BTRFS_FS=m`，btrfs.ko 得随 initramfs 走；而且 `INITRAMFS_MODULES` 和 init 里的 insmod glob 是**两处独立维护的列表** |
+| `insmod btrfs.ko: unknown symbol` | 它还依赖 `xor` / `libblake2b` / `raid6_pq` / `zstd_compress`（`modules.dep` 里写着） |
+| switch_root 之后 `ls`/`mount` 全部 not found、根是空的 | btrfs 的**默认子卷是空的**，根在子卷里；switch_root 已经把 initramfs 删了却找不到 `/sbin/init` |
+
+### 15.3 当前实测状态（2026-11-07 晚）
+
+- 面板：信标噪点 + 8 只 Tux + 内核日志 + 一大片红绿方块（systemd 的
+  `[ OK ]` / `[FAILED]` 服务状态）
+- 串口内建命令读到：**`PID1=systemd`**，uptime 533 s —— 进 SteamOS userspace 了
+- COM4 上那个 `~ #` 是 initramfs 留下的**旧应急 shell**（它的根已被 switch_root
+  剥空：`/bin /boot /dbg /dev /lib /newroot /proc /sys`），不是新系统的 shell。
+  用 `read x < /proc/1/comm; echo $x` 这种纯内建命令才能问到真相 —— 它连 `cat`
+  都没有，之前的探测结论都被它误导过。
+
+### 15.4 为什么「进不去」
+
+Valve 这份 rootfs 是给 Steam Frame（VR 头显）做的，图形会话依赖：
+
+- **7.3.0 的内核模块**还没装进 rootfs 的 `/lib/modules`（一半驱动是 `=m`）
+- **机内签名固件**已提取到 PC，但还没放进 rootfs 的 `/lib/firmware` ——
+  GPU zap / ADSP / WCN3998 缺了就是黑屏、没声音、没 WiFi
+- **raphael overlay**（显示配置、用户、gamescope/sddm 的一套）还没做
+- 部分服务还会因为 rootfs 里写着 Frame 的挂载/设备而 `[FAILED]`
+
+这些是阶段 2.2 的活，不是启动链的问题了。
+
+### 15.5 顺带的两条结论
+
+- **`fastboot boot` 全程没写 `boot` 分区**：rootfs 在 `userdata`、内核在 DRAM，
+  失败长按电源就回原样。Android 那次「又进安卓了」是因为 `boot` 分区当时还是
+  原厂镜像。
+- `work/uboot/u-boot-fastboot.img`（§14，开机自动进 fastboot）**刷过一次，已换回
+  原版 `u-boot.img`**：它让每次开机都停在 fastboot 等设备，日常不可用，只适合
+  密集迭代时临时刷，完事必须换回带菜单的原版。
