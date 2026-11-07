@@ -189,6 +189,7 @@ if [ -d "$REPO/scripts/raphael-overlay" ]; then
      tr -d '\r' < "$OV/$rel" > "$TREE/$rel"
    done)
   chmod 755 "$TREE/opt/raphael/gadget.sh" 2>/dev/null || true
+  chmod 755 "$TREE/opt/raphael/qcom-setup.sh" 2>/dev/null || true
   mkdir -p "$TREE/etc/systemd/system/sysinit.target.wants"
   ln -sf /etc/systemd/system/raphael-usb-gadget.service \
     "$TREE/etc/systemd/system/sysinit.target.wants/raphael-usb-gadget.service"
