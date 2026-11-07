@@ -12,13 +12,20 @@
 
 ```
 main      73c85e1   SteamOS for alioth
-raphael   95a7d11   +6 个提交
+raphael   5b9ed73   +15 个提交，阶段 1 已验收（§7/§12/§13）
   c046198  docs: 移植起点（设备实测、内核来源、与 alioth 的六处结构差异）
   97ee575  docs: boot/dtbo 整分区备份，board-id 与面板型号核实
   8ba4fbc  feat: kernel-sm8150 配方与阶段 1 的三个脚本
   c2e4882  feat: 阶段 1 的内核和 boot 镜像编出来了
   0e2dbe4  feat: 解开原厂内核段的封装（ABL 仍然拒）
   95a7d11  fix: ABL 拒的是设备树 —— 清掉 dtbo 就过了
+  5fa8403  fix: 内存映射按 ABL 实测值；splash framebuffer 加 no-map
+  747f52c  feat: ramoops 按原厂地址接上，initramfs 加屏幕信标
+  aac81e0  feat: U-Boot 接管 boot，面板控制台成立
+  ba4a14b  feat: 阶段 1 通了 —— fastboot boot + 2MB 对齐，root shell 在 COM4
+  aef9a1b  feat: 存储通了 —— UFS 三模块随 initramfs 走，init 里 insmod
+  afd6084  feat: quota 打开，Android 的 461 GB /data 只读可挂
+  5b9ed73  feat: U-Boot 开机直接进 fastboot（改 .rodata 默认环境，未刷）
 ```
 
 `main` 上的一切（`build-alioth-kernel.sh`、`make-steamos-alioth.sh`、
@@ -243,18 +250,24 @@ qcom,board-id = <0x28 0>            /* 40  */
 
 ---
 
-## 5. 引导链：已定 A，而且已经过了一关
+## 5. 引导链：两代方案，现在走的是 U-Boot 的 `fastboot boot`
 
-选的是 **A：沿用本仓库的 ABL + boot.img**（`boot` 放内核镜像，`userdata` 放 rootfs），
-不引入 U-Boot。
+最初选 A：沿用小米 ABL + boot.img。ABL 那一关确实过了（`msm-id`/`board-id` 补上、
+先 `erase dtbo`，它就接受镜像并跳转，§8.1），但内核**始终没到 userspace**：
+黑屏、无 USB、无输出。ABL 这条路死于「看不见」—— 没有串口、USB 还没起、
+pstore 又读不回来（§8.2），盲改八次之后停手。
 
-这条路原本的风险写在这里是"DTS 必须补 msm-id/board-id，ABL 认不认一次刷写就知道"。
-现在的答案：**认了，但前提是先清 `dtbo`**（§8.1）。小米 ABL 会把 `dtbo` 里的 overlay
-叠到 boot 镜像的 DTB 上，叠不上就整个不启动 —— 那才是前五个回合失败的真正原因。
+所以阶段 1 实际走的是：**U-Boot（参考项目编的那份）接管 `boot`，用它的
+`fastboot boot` 把内核下到 DRAM 里直接跑**。这条路不写任何分区，失败长按电源
+就回原样，而且迭代只需重打镜像。§12 是它的完整记录。
 
-参考项目走的是 B（U-Boot → systemd-boot，`cache` 当 `/boot`）。它成立，但对这个仓库
-意味着：`boot` 被 U-Boot 占掉、boot.img 那套打包与断言全部作废、多一层别人编的
-二进制要维护。既然 A 的 ABL 关已经过了，没有理由再切过去。
+最终生产方案还没定。候选：
+
+- **继续 U-Boot**：要维护一个别人的二进制，且这版不认 GPT 分区（§10.4），
+  rootfs 阶段得靠 `fastboot flash`（ABL 的）写好分区再交给它。
+- **回到 ABL**：现在内核本体已经验证没问题（U-Boot 能把它带进 userspace），
+  ABL 拒的只是 DTB 形态。值得再试：用 U-Boot 验证过的 DTB（`uboot.dtb`，107 KB）
+  按 §2.4 的封装打一版给 ABL —— 如果它能起，生产链路就不需要 U-Boot。
 
 ## 6. 硬规则（在 alioth 之上新增的）
 
@@ -292,11 +305,10 @@ qcom,board-id = <0x28 0>            /* 40  */
       258 MB 的 tarball 放进 `work/cache/`，构建脚本从那里取（不再联网）。
       `work/ref/linux-raphael` 那个半截克隆可以直接删掉
 
-### 阶段 1：能出画面、能进 shell（已验收，§12）
+### 阶段 1：能出画面、能进 shell（已验收，§12；存储见 §13）
 
-产出：`work/steamos-raphael/boot-debug.img`
+产出（现行）：`work/steamos-raphael/boot-v2-2mb.img`（v2 头 + 2 MB 页，§12.6）
 
-脚手架已经写好了，**但还一次都没编译过**（见下面的环境要求）：
 
 - [x] `external-and-mods/kernel-sm8150/soc.env` —— `KSRC_URL` 按 commit 固定到
       `raphael-v7.3.0`、`KCONFIG_FRAGMENT` 用树里自带的增量、`DTBS` 一个、
@@ -328,10 +340,16 @@ qcom,board-id = <0x28 0>            /* 40  */
       之后一个字都没有」）。面板上 8 只 Tux、DPU/DSI/Adreno 依次 probe
 - [x] 验收：**root shell 在 COM4 上**（`ttyGS1`），`id` = uid=0，`uname -a` =
       7.3.0-raphael-steamos，`free -m` = 7462 MB，`/proc/cpuinfo` 8 核
-- [ ] 存储：`/proc/partitions` 空 —— `SCSI_UFS_QCOM` / `PHY_QCOM_QMP_UFS` 是 `=m`，
-      boot 镜像不带模块。已改成 `=y`，重编中
+- [x] **存储通了**（§13）：UFS 三个模块（`phy-qcom-qmp-ufs`、`qcom_ice`、`ufs-qcom`）
+      随 initramfs 走、在 init 里按依赖顺序 insmod —— 编进内核反而会死（§13.1）。
+      `/proc/partitions` 31 个分区，`sda29`=cache、`sda31`=userdata
+- [x] **Android 的 userdata 能挂**（§13.2）：它是开了 quota 的 ext4，补
+      `CONFIG_QUOTA/QFMT_V2` 后 `mount -t ext4 -o ro /dev/sda31` 成功，
+      461.2 GB / 已用 188.7 GB —— 机内固件提取的入口
+- [ ] rootfs：`userdata` 还是 Android 的 `/data`（ext4），写 SteamOS 要覆盖它，
+      不可逆，待本人确认
 
-### 阶段 1.5：把观测通道建起来（当前卡在这里，§10）
+### 阶段 1.5：把观测通道建起来（已完成，方法出乎意料 —— 见 §10→§12）
 
 ABL 直接跳 mainline 这条路，卡点不是镜像格式也不是设备树内容，而是**看不见**：
 没有串口、USB 还没起来、pstore 读不回来。所以换 U-Boot 接管 `boot`。
@@ -340,8 +358,10 @@ ABL 直接跳 mainline 这条路，卡点不是镜像格式也不是设备树内
 - [x] 确认这版 U-Boot 的 USB 侧是空的（无 fastboot、无 adb），面板只能看不能敲
 - [x] 解出这台机器的 GPT（4K LBA，头部在 4096，31 个分区）
 - [x] 做好 256 MiB FAT32 启动盘（`Image` + DTB + `extlinux.conf`），`flash cache` 写入成功
-- [ ] **U-Boot 没把 `cache` 当启动候选**：只试了 `scsi 0..5` 和 `blkmap 0`（§10.4）
-- [ ] 下一步：USB 键盘直接问 U-Boot，或把 `cache` 的 GPT 类型改成 ESP（§10.5）
+- [x] **U-Boot 没把 `cache` 当启动候选**：只试了 `scsi 0..5` 和 `blkmap 0`（§10.4）。
+      这条路后来**没有继续走** —— 从 `u-boot.bin` 里读出默认环境后发现它有 bootmenu，
+      第 4 项就是 `run fastboot`，比键盘或改 GPT 都省事（§12.1）。`cache` 上那块 FAT
+      留着，rootfs 阶段可以直接当 `/boot` 用
 
 ### 阶段 2：rootfs 起得来
 
@@ -376,16 +396,20 @@ ABL 直接跳 mainline 这条路，卡点不是镜像格式也不是设备树内
    屏幕上的小米 logo 消失（说明跳转了），设备也不再回 fastboot。恢复同样干净：
    把备份 `dd` 回 `dtbo`（`/dev/block/sde45`）即可。
 
-2. **内核跳过去了，但起不到能看见东西的程度。** 清掉 dtbo 之后：小米 logo 消失、
-   屏幕全黑、40 秒内不回 fastboot、USB 上没有任何新设备（gadget 没起来）。
-   logo 消失说明 ABL 跳了、内核拿到了显示；黑屏 + 无 USB 说明它死在 simpledrm
-   出字之前，或者 fbcon 没绑上。下一步要么给 ramoops 找一块可靠区域（原厂 4 份 DTB
-   里都**没有** ramoops 节点，所以地址得另找），要么把 `memory@80000000` 删掉让 ABL
-   自己填 —— 现在的 DTS 硬编码的是 UEFI 交接的那 3 段（≈6 GiB），而这台机器有 7.5 GiB。
+2. **内核黑屏无输出 —— 后来在 U-Boot 通道下解开（§12/§13）。** 清掉 dtbo 之后：
+   小米 logo 消失、屏幕全黑、40 秒内不回 fastboot、USB 上没有任何新设备。
+   一层一层剥下来：内存映射错（UEFI 那份 reg 的高内存在 0x100000000，ABL 实际给
+   0x180000000，内核第一次写就死）→ 改成 ABL 实测值后花屏消失；splash framebuffer
+   没做 `no-map` 预留 → 补上；`quiet loglevel=0` + `CMDLINE_FORCE=y` 把输出全吞了
+   → 换成 `console=tty0 loglevel=7 ignore_loglevel` 并关 FORCE（注意 CMDLINE 三选一
+   是 Kconfig choice，§12.3）。**在 ABL 下这些修正仍然没让它起来** —— 问题最后
+   归结为 ABL 这条通道本身不可观测，切到 U-Boot 才看到每一步。
 3. **BT 用 `wcn3990-bt` 还是 `wcn3998-bt`** —— 源码 DTS 写 3990，参考 DTB 写 3998，同一个
    驱动，两个都试得起，但只能试一次知道。
 4. **内存节点** —— 见上，和 2 是同一件事的两个可能原因。
-5. **`userdata` 覆盖即丢 Android** —— 502.6 GB，f2fs + 加密，不可逆。
+5. **`userdata` 覆盖即丢 Android** —— 不可逆。实测参数（§13.2）：`LABEL="data"`、
+   ext4、461.2 GiB（已用 188.7 GB）、开了 quota，**没有**整盘加密 —— 用
+   `mount -t ext4 -o ro` 就能读。写 SteamOS rootfs 会覆盖它，动手前必须本人确认。
 6. **WCN3998 的 `board-2.bin` 与 MAC** —— 固件在 `vendor`/`persist` 里，得从 root 侧取；
    取不到 `wlan_mac.bin` 时 ath10k 会给随机 MAC（参考项目用 systemd 服务固定）。
 
@@ -413,25 +437,37 @@ ABL 直接跳 mainline 这条路，卡点不是镜像格式也不是设备树内
 
 ## 9. 怎么继续
 
+现行工作流（详见 §12.6，这里是最短路径）：
+
 ```bash
 git checkout raphael
 
-# 1) 编译（Linux + 容器 + aarch64 静态 busybox；见下面的环境要求）
+# 1) 编译（容器；源码与工具链缓存在 wslc 卷 raphael-work 里，重跑约 1-2 分钟）
 ./build-raphael-kernel.sh
 
-# 2) 打 boot.img（内核段 = UNCOMPRESSED_IMG 封装，参数全来自原厂头部）
-./make-steamos-raphael.sh --kernel-only
+# 2) 打镜像：v2 头 + page_size 0x200000（2MB 对齐是硬要求，§12.3）
+python3 external-and-mods/kernel-common/mkbootimg-v2.py \
+  --kernel work/kernel-raphael/output/7.3.0-raphael-steamos/boot/Image \
+  --dtb    work/kernel-raphael/output/7.3.0-raphael-steamos/dtbs/sm8150-xiaomi-raphael.dtb \
+  --cmdline "console=tty0 loglevel=7 ignore_loglevel steamos.usbshell=1" \
+  --pagesize 0x200000 --out work/steamos-raphael/boot-v2-2mb.img
 
-# 3) 上真机：写 boot + 清 dtbo，两个分区都动，备份都在 work/raphael-facts/
-adb reboot bootloader
-./flash-raphael.sh --test          # 提示符输入 BOOT
+# 3) boot 分区刷 U-Boot（清 dtbo；之后每次开机自动进它的 fastboot，
+#    或刷 §14 那个改过环境的版本连菜单都不用按）
+fastboot flash boot work/uboot/u-boot.img
+fastboot erase dtbo
 
-# 4) 回 Android（两条都要）
-fastboot flash boot work/raphael-facts/stock-boot.img
-fastboot flash dtbo work/raphael-facts/stock-dtbo.img
+# 4) 迭代：U-Boot 的 fastboot 里直接 boot，不写任何分区
+fastboot boot work/steamos-raphael/boot-v2-2mb.img
+
+# 5) 电脑上开 COM4（ttyGS1，root shell）；COM3 是内核 console
 ```
 
-`--ramboot` 不要用了：这台机器的 ABL 连原厂镜像都拒绝 RAM 启动（§8.1）。
+**老的 ABL 刷写流程（`flash-raphael.sh --test`、`make-steamos-raphael.sh
+--kernel-only`、v1 + UNCOMPRESSED_IMG 封装）全部过时** —— 它们打出来的镜像 ABL
+能收，但内核到不了 userspace，而且失败时什么都看不见。`--ramboot` 在两台引导器上
+都是死路：ABL 拒绝一切 RAM 启动（§8.1），U-Boot 的 `fastboot boot` 走的是 bootm。
+
 
 第 1 步在写这份文档时是在这台 Windows 上跑的，用 WSL 的容器 CLI（`wslc`，
 镜像 `proxy.vvvv.ee/library/fedora:43`）。四件事值得记下来，因为每一件都让第一次
@@ -448,15 +484,21 @@ fastboot flash dtbo work/raphael-facts/stock-dtbo.img
 4. **GitHub 直连 ~28 KB/s，还被 429 限流**；`ghfast.top` 也就 135 KB/s。
    258 MB 的源码树最后是人在外面下好丢进 `work/cache/`。构建脚本会把它放进
    `$WORK/cache/linux-raphael-<sha>.tar.gz`，`fetch()` 见到就不下了 —— 重跑不再联网。
+5. **容器里的 `dnf` 会无限期挂住**：撞到抽风的镜像时负载 0.0、进程 S 状态、
+   十分钟不动，而且容器每次从镜像重起、依赖都要现装。`work/wslc-build.sh`
+   固定成清华源、dnf 套 `timeout 300` 并重试 —— 没有这个硬超时，一次卡住就
+   白等一晚上。
 
 另外记一个**看起来像 bug 但并不是**的：`Image` 前 4 字节是 `4d 5a`（"MZ"），
 很像 `CONFIG_EFI_ZBOOT` 产出的 PE 包装。它不是 —— offset `0x38` 是 `ARMd`，
 这是带 `CONFIG_EFI=y` 的裸 arm64 Image 的正常头部（前两字节刻意做成 "MZ" 让 PE
 加载器认）。判断该看 `0x38`，别看头 4 字节，否则会把一个好内核丢掉。
 
-`--install`（写 `userdata`、装 SteamOS rootfs）没有实现，也不该在阶段 1 之前实现：
-它需要机内签名固件、一份 raphael overlay、以及一个已经确认能启动的 boot.img，
-三样都还没有。
+`--install`（写 `userdata`、装 SteamOS rootfs）没有实现。前置条件比当初写的宽松了：
+boot.img 已确认能启动（§12）、存储已通（§13）、Android 的 `/data` 只读可挂。
+真正还缺的是机内签名固件（GPU zap、ADSP、modem、WCN3998 board-2.bin —— 在
+`vendor`/`modem` 分区里，阶段 2 从挂载的分区提取）和一份 raphael overlay。
+**写 `userdata` 覆盖 Android `/data` 不可逆，动手前必须本人确认。**
 
 ## 10. 换到 U-Boot：面板控制台成立，启动介质还没解决
 
