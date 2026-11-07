@@ -213,6 +213,14 @@ done
 mkdir -p "$TREE/boot"
 grep -q 'PARTLABEL=cache' "$TREE/etc/fstab" 2>/dev/null || \
   echo 'PARTLABEL=cache /boot vfat umask=0077,nofail,noatime,x-systemd.device-timeout=10 0 0' >> "$TREE/etc/fstab"
+
+# ===== 4.6/7 去 VR 化（照 alioth，2026-11-07 在 raphael 真机跑通 Game Mode）=====
+# Frame 是 VR 头显：gamescope 默认 --backend openvr --vr-session-manager，
+# SteamVR 不在就立刻退，sddm 无限重登 → 全程黑屏。详见 apply-raphael-devr.sh。
+# 脚本自身也会被 git checkout 成 CRLF，先去 CR；RAPHAEL_REPO 让它仍找得到
+# 仓库里的 steamos-overlay/（脚本被放到容器卷里执行）。
+tr -d '\r' < "$REPO/scripts/apply-raphael-devr.sh" > "$W/apply-raphael-devr.lf.sh"
+RAPHAEL_REPO="$REPO" bash "$W/apply-raphael-devr.lf.sh" "$TREE"
 echo "   $(du -sh "$TREE" | cut -f1)"
 
 echo "===== 5/7 mkfs.ext4 -d（可写根，固定 UUID）====="

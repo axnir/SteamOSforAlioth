@@ -1091,3 +1091,61 @@ cache 的 FAT 是按 512 字节/扇区格式化的，直接 `mount -t vfat /dev/
   `work/raphael-fw/`
 - `cache` 的 FAT 是 512 字节扇区，Linux 侧要 `losetup -b 512` 才能挂
 
+## 18. 阶段 2.2：Game Mode 跑通，去 VR 化照 alioth 落地并固化
+
+### 18.1 最终状态（2026-11-07 晚，真机）
+
+```
+gamescope-session.service  active (running) 1min48s，Main PID 1178 (gamescope-wl)
+gamescope --backend drm --prefer-output DSI-1 --scaler fit --filter linear --steam
+  --xwayland-count 2 --output-width 2340 --output-height 1080
+  --nested-refresh 60 --force-composition-rotation --force-composition --mangoapp
+Xwayland :0 / :1、gamescopereaper、mangoapp 存活
+Steam 客户端 steam -gamepadui -steamdeck -steamos3 + steamwebhelper 已起
+背光 1023 → 1535（合成器接管并调亮），sddm-helper --id 1（无重登循环）
+journal 只剩非致命项：seatd 权限、Immediate flips not supported、xkbcomp 警告
+```
+
+对应 `docs/alioth.md` 阶段 2 验收表的「开机直接进 Game Mode」一项。
+
+### 18.2 从「登录界面」到 Game Mode：六层，按踩到的顺序
+
+| # | 现象 | 真因 | 修法（照 alioth） |
+|---|---|---|---|
+| 1 | 全黑、`sddm-helper --id 3` | `gamescope-wayland.desktop` 是 **Gamescope VR Session**，`--backend openvr --vr-session-manager`，SteamVR 不在就退；`steam-health-check` 判 `SESSION_DURATION: 0` 并拆会话，sddm `Relogin=true` 无限重登 | 装 `steamos-overlay` 的去 VR 化会话脚本（换成 `--backend drm`）；`zz-raphael.conf` 设 `Relogin=false` 止损 |
+| 2 | `Failed with result 'timeout'` | Frame 原版 `TimeoutStartSec=5`，起两个 Xwayland 要十几秒 | `99-odin.conf` 的 45 秒 |
+| 3 | **sddm-helper exited with 126**，会话脚本一次都没跑 | git 在 Windows 把 `steamos-overlay/*.sh` checkout 成 **CRLF**，shebang 变成 `/bin/sh\r`；tar 原样带进手机 → 找不到解释器 | 打包和装机**逐文件 `tr -d '\r'`**；断言里专门查这条 |
+| 4 | `Activating special unit Exit the Session`（8 秒） | `gamescope-session.service` 写着 `PartOf=steamvr.service`，mask 用户级 `steamvr.*` 后耦合对象变死 unit | `/etc/systemd/user/gamescope-session.service.d/99-raphael.conf` 用空 `PartOf=` 清空，再 mask |
+| 5 | 13 个用户级 job 全 waiting | `steamos-manager.service` 是 `Type=notify-reload`，raphael 上不发 READY → 90 秒超时 + `Restart=on-failure` 无限重启，堵住 `graphical-session.target` | `/etc/systemd/user/steamos-manager.service.d/99-raphael.conf` 改 `Type=simple` + 15 秒；另装 alioth 的 cleanup 8 秒超时 drop-in |
+| 6 | `/home` 幻影挂载 | 见 §17.3，已用删静态 mount + udev 规则解决 | 同前 |
+
+### 18.3 固化位置（重刷 userdata 不会丢）
+
+| 文件 | 作用 |
+|---|---|
+| `scripts/apply-raphael-devr.sh` | 照 `apply-alioth-devr.sh`：装 10 个去 VR 化文件（全部去 CR、`qcom,sm8150` 补 zink 判断、保留可执行位）、备份 Frame 原件到 `/var/lib/steamos-arm-stock`、mask 5 个用户态 + 17 个系统态 unit |
+| `scripts/build-raphael-reference.sh` 4.6/7 | 合并 overlay 后调用上面的脚本，指向 `$TREE` |
+| `scripts/raphael-overlay/etc/sddm.conf.d/zz-raphael.conf` | `Relogin=false`（zz 前缀保证排在 `steamos.conf` 之后） |
+| `.../etc/systemd/user/gamescope-session.service.d/99-raphael.conf` | 清 `PartOf` + `TimeoutStartSec=45` |
+| `.../etc/systemd/user/steamos-manager.service.d/99-raphael.conf` | `Type=simple` + `TimeoutStartSec=15s` |
+| `scripts/assert-raphael-devr.sh` | 假 rootfs 断言 15 条（含「全部去 CR」「调试通道未被 mask」），`bash scripts/assert-raphael-devr.sh` 全绿 |
+
+**刻意不 mask** `raphael-usb-gadget.service` / `raphael-debug-shell.service` / Valve 的 `usb-gadget*`：
+COM3 的 root shell 与 USB NCM 是这台手机唯一的观测通道（alioth 注释里同样警告过）。
+
+### 18.4 使用前提与局限
+
+- 会话文件来自 `steamos-overlay/`，其中的 `gamescope-session` 硬编码 `PANEL_W/PANEL_H` 兜底值，但运行时会从 `/sys/class/drm/card*-DSI-*/modes` 自动探测；raphael 实测探到 `1080x2340`，输出 2340x1080 ✅ 无需改。
+- `sm8550-fixpad` 不装（raphael 没有 rsinput sticks，脚本有 `-x` 判断会跳过）。
+- raphael 根是普通可写 ext4，**不做** alioth 那套 `/etc` overlayfs upper 双写。
+- `gamepadui` 起来了，但蓝牙 `hci0 QCA error -2`、`syspersist` nofail 超时、`deckard-*` 残留失败仍在；都是 Frame 专属硬件，不影响 Game Mode 出画面。
+- 回退：Frame 原件在 `/var/lib/steamos-arm-stock/`；最坏重刷 `userdata-nested-sparse.img`。
+
+### 18.5 验收要点（下次重建镜像后照这个核对）
+
+- `systemctl --user status gamescope-session.service` = `active (running)`，Main PID 是 `gamescope-wl`。
+- `sddm-helper --id 1`，journal 无 `exited with 126` / `Exit the Session` / `Gamescope Session Ended`。
+- `ps` 有 `gamescope` + 两个 `Xwayland` + `steam -gamepadui`。
+- 背光从 1023 升到 1535，`card0-DSI-1/status=connected`。
+
+
