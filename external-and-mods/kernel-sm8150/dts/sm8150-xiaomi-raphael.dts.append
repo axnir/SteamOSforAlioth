@@ -34,3 +34,29 @@
 		no-map;
 	};
 };
+
+/*
+ * 崩溃日志的落点。
+ *
+ * 地址和分区大小不是挑的，是抄 Android 的：原厂内核的 cmdline 带
+ * `ramoops_memreserve=4M`，ramoops 模块实际绑在
+ *
+ *     mem_address 0xB0000000   mem_size 4 MiB
+ *     console_size 2 MiB       pmsg_size 2 MiB   ecc 0   dump_oops 1
+ *
+ * 照抄的好处是闭环：我们的内核崩了以后，这块 DRAM 里的内容不会被动，
+ * 重启进 Android 时原厂内核的 ramoops 会按同样的布局把它读成
+ * /sys/fs/pstore/console-ramoops-0 —— 那台机器上唯一一条能读到我们内核
+ * 崩溃原因的路径（没有串口，USB 又还没起来）。
+ *
+ * 必须 no-map 预留：这段在我们 DTS 的低内存区间里，不预留内核会拿去用。
+ */
+&{/reserved-memory} {
+	ramoops@b0000000 {
+		compatible = "ramoops";
+		reg = <0x0 0xb0000000 0x0 0x400000>;
+		console-size = <0x200000>;
+		pmsg-size = <0x200000>;
+		no-map;
+	};
+};
