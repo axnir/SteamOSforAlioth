@@ -258,8 +258,11 @@ rootdev=""
 if [ -d /lib/modules ]; then
   # 顺序（依赖）：PHY → qcom_ice → ufs-qcom。glob 展开是按名的字典序，
   # 所以这里显式按顺序遍历，而不是靠 glob 的巧合。
+  # 与 soc.env 的 INITRAMFS_MODULES 同步维护；顺序 = 依赖顺序（先叶子后使用者）
   for m in /lib/modules/*/phy-qcom-qmp-ufs.ko* /lib/modules/*/qcom_ice.ko* \
-           /lib/modules/*/ufs-qcom.ko* /lib/modules/*/btrfs.ko*; do
+           /lib/modules/*/ufs-qcom.ko* /lib/modules/*/xor.ko* \
+           /lib/modules/*/libblake2b.ko* /lib/modules/*/raid6_pq.ko* \
+           /lib/modules/*/zstd_compress.ko* /lib/modules/*/btrfs.ko*; do
     [ -f "$m" ] || continue
     insmod "$m" && echo "insmod ${m##*/}" || echo "insmod FAILED ${m##*/}"
   done
