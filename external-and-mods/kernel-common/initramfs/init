@@ -251,6 +251,19 @@ usb_image_boot() {
 
 bootdev=""
 rootdev=""
+
+# 存储控制器是模块（见 soc.env 的 INITRAMFS_MODULES）：没有 rootfs 就没有 modprobe，
+# 所以它随 initramfs 一起进来，在这里按依赖顺序加载。控制台和 USB 此时已经在跑了，
+# probe 失败能看见，而不是像编进内核那样换来一块黑屏。
+if [ -d /lib/modules ]; then
+  # 顺序（依赖）：PHY → qcom_ice → ufs-qcom。glob 展开是按名的字典序，
+  # 所以这里显式按顺序遍历，而不是靠 glob 的巧合。
+  for m in /lib/modules/*/phy-qcom-qmp-ufs.ko* /lib/modules/*/qcom_ice.ko* \
+           /lib/modules/*/ufs-qcom.ko*; do
+    [ -f "$m" ] || continue
+    insmod "$m" && echo "insmod ${m##*/}" || echo "insmod FAILED ${m##*/}"
+  done
+fi
 case "$rootarg" in
   PARTLABEL=*)
     # UFS comes up a few seconds into boot. steamos.usbimage=1 (the tablets,

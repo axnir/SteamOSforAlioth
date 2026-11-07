@@ -377,6 +377,38 @@ build_initramfs() {
   INITRD_CPIO="$d/initrd.cpio"
 }
 
+embed_initramfs_modules() {
+  # INITRAMFS_MODULES (soc.env): modules that must be loadable before the root
+  # filesystem exists. Without a rootfs there is no modprobe and no /lib/modules,
+  # so they have to travel inside the initramfs.
+  #
+  # Why not just build them in: on raphael, CONFIG_SCSI_UFS_QCOM=y kills the
+  # kernel before the display initialises -- black screen, not even a USB gadget,
+  # and no console yet to say why. As modules loaded from userspace the probe
+  # happens with the panel console already up.
+  #
+  # Runs after modules_install and re-links Image, because CONFIG_INITRAMFS_SOURCE
+  # points at the cpio produced by build_initramfs(), which ran before this.
+  [[ -n "${INITRAMFS_MODULES:-}" ]] || return 0
+  local o="${OUT_BASE}/${KREL}" root="${WORK}/initramfs/root"
+  local moddir="${root}/lib/modules/${KREL}" m f found
+  mkdir -p "$moddir"
+  found=0
+  for m in $INITRAMFS_MODULES; do
+    # modules_install may compress; match any suffix rather than assuming .ko.
+    f="$(find "${o}/modules/${KREL}" -name "${m}.ko*" 2>/dev/null | head -n1)"
+    [[ -n "$f" ]] || die "initramfs module ${m} not found in ${o}/modules/${KREL}"
+    cp "$f" "$moddir/"
+    log "initramfs: ${f##*/}"
+    found=$((found + 1))
+  done
+  ((found)) || return 0
+  (cd "$root" && find . | cpio -o -H newc --owner=0:0 2>/dev/null) >"${WORK}/initramfs/initrd.cpio"
+  gzip -9 -n -c "${WORK}/initramfs/initrd.cpio" >"${WORK}/initramfs/initrd.gz"
+  log "re-linking Image with the modules inside the initramfs"
+  make -C "$SRC" -j"${JOBS}" Image >/dev/null
+}
+
 pack_kernel_img() {
   local out="$1" img="${SRC}/arch/arm64/boot/Image" payload dtb f
   payload="$(mktemp)"
@@ -423,6 +455,10 @@ install_output() {
   fi
   # Built-in copies are enough for the GPU; keep rootfs copies too for tooling.
   cp -a "${SRC}/external-firmware/." "$o/firmware/"
+
+  # Boot-critical modules (soc.env: INITRAMFS_MODULES) go into the initramfs and
+  # Image is re-linked so they are actually inside the kernel we ship.
+  embed_initramfs_modules
 
   local dtb
   for dtb in $DTBS; do cp "${SRC}/arch/arm64/boot/dts/qcom/${dtb}.dtb" "$o/dtbs/"; done
