@@ -323,7 +323,16 @@ if [ -n "$bootdev" ] && { mount -t vfat "$bootdev" /boot 2>/dev/null ||
   while [ "$n" -lt "$extra" ]; do snap "snapshot $n"; sleep 4; n=$((n + 1)); done
 fi
 
-if [ -n "$rootdev" ] && mount -t ext4 -o rw "$rootdev" /newroot; then
+# 文件系统不能写死：alioth 的 userdata 是 ext4，而 Valve 给 raphael 用的
+# rootfs.img 是 btrfs（blkid: TYPE="btrfs"）。按顺序试，谁挂上用谁。
+root_mounted=""
+for _t in ext4 btrfs; do
+  if [ -n "$rootdev" ] && mount -t "$_t" -o rw "$rootdev" /newroot; then
+    root_mounted="$_t"
+    break
+  fi
+done
+if [ -n "$root_mounted" ]; then
   if [ -z "$logdir" ]; then
     logdir=/newroot/var/log/steamos-arm-boot
     mkdir -p "$logdir"
