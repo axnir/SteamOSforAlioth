@@ -721,3 +721,38 @@ fastboot boot work/steamos-raphael/boot-v2-2mb.img
 第 3 步每次都要人按菜单——这是当前唯一的低效点（`bootdelay=0`，靠按键打断 autoboot
 不可能）。等能动 `boot` 分区之后，把 U-Boot 本体 + 一个能自动选 fastboot 的环境
 写进去就能免掉。
+
+## 13. 下一步：存储，然后是 rootfs
+
+### 13.1 存储：UFS 必须作为模块加载，不能编进内核（已实测）
+
+`/proc/partitions` 为空的原因找到了：`CONFIG_SCSI_UFS_QCOM` 和
+`CONFIG_PHY_QCOM_QMP_UFS` 在树里那份 defconfig 里是 `=m`，而 boot 镜像只带内核。
+
+**但是改成 `=y` 会让内核在显示初始化之前直接死掉**：屏幕全黑、USB 上什么都不出现、
+连 gadget 都来不及起——固件/时钟/PHY 的时序在 early probe 里炸，而那一刻还没有任何
+控制台可以说话（`console=tty0` 要等 simpledrm 起来）。
+
+所以正确做法是「**模块 + initramfs 里 insmod**」：先让控制台和 USB 立起来，再加载
+UFS，出问题能看见。改动点在 `kernel-common/build.sh` 的 `build_initramfs()` ——
+它现在只打 busybox 和三个脚本，需要在 `modules_install` 之后把
+`phy-qcom-qmp-ufs.ko`、`ufs_qcom.ko`（按依赖顺序）塞进 initramfs 的
+`/lib/modules/<release>/`，并在 `initramfs/init` 里 insmod。
+
+注意构建顺序：`build_initramfs` 在编内核之前调用，所以要二次嵌入
+（modules_install → 重打 cpio → 再 make 一次 Image）。
+
+### 13.2 rootfs
+
+存储通了之后才是阶段 2：把 SteamOS rootfs 写进 `userdata`（ext4），
+`init` 已经会按 `steamos.root=PARTLABEL=userdata` 去挂。这一步会**覆盖 Android 的
+/data**，不可逆，必须让本人确认。
+
+### 13.3 现在能复现的状态
+
+- `work/steamos-raphael/boot-v2-2mb.img`（56 623 104 B）：内核 51 255 808 B
+  + DTB 104 670 B，v2 头、page_size 2 MB
+- 刷法：U-Boot 菜单选 `Enable fastboot mode`，然后
+  `fastboot boot work/steamos-raphael/boot-v2-2mb.img`
+- 起来之后 COM4 是 root shell，`/proc/partitions` 仍然是空的（预期）
+- 回 Android：`fastboot flash boot stock-boot.img` + `fastboot flash dtbo stock-dtbo.img`
