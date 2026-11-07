@@ -211,12 +211,54 @@ rm -f "$TREE/usr/lib/systemd/system/efi.mount" \
       "$TREE/usr/lib/systemd/system/home.mount"
 
 # 同样的 GPU 固件在 rootfs 里也放一份（systemd 起来后重新 probe / 用户态查询用）。
-mkdir -p "$TREE/usr/lib/firmware/qcom/sm8150/Xiaomi/raphael"
-cp -a "$TREE/usr/lib/firmware/qcom"/a640_zap.* \
-      "$TREE/usr/lib/firmware/qcom/sm8150/Xiaomi/raphael/" 2>/dev/null || true
+FWDIR="$TREE/usr/lib/firmware/qcom/sm8150/Xiaomi/raphael"
+mkdir -p "$FWDIR"
+cp -a "$TREE/usr/lib/firmware/qcom"/a640_zap.* "$FWDIR/" 2>/dev/null || true
 for f in a630_sqe.fw a640_gmu.bin; do
   [ -f "$FWSRC/$f" ] && cp "$FWSRC/$f" "$TREE/usr/lib/firmware/qcom/"
 done
+
+# --- 机内签名固件：ADSP / modem / SLPI / IPA --------------------------------
+# DTB 把 remoteproc 的 firmware-name 写死成 qcom/<soc>/<vendor>/<model>/xxx.mbn，
+# 少一级目录就是 request_firmware -2（GPU zap 和 ADSP 都这么踩过：文件其实在
+# qcom/adsp.mbn，内核却去 qcom/sm8150/Xiaomi/raphael/ 找）。
+#
+# ADSP 是音频的前置：它不起来，q6asm-dai 不注册，声卡就卡在
+#   sound: deferred probe pending: msm-snd-sm8150: MultiMedia1: error getting cpu dai name
+# 把 adsp.mbn 放到正确路径后，ADSP 自动起来、声卡注册成
+#   card 0: sm8150 - Xiaomi Redmi K20 Pro（真机实测，2026-11-08）。
+#
+# modem.mbn 是 WiFi 的前置（ath10k_snoc 通过 QMI WLFW 找 modem 的 wlan 服务）；
+# SLPI 管传感器、IPA 管移动数据，都按同一套布局装。
+SQUASH="$REPO/scripts/squash-raphael-mdt.py"
+squash_into() { # $1=源目录 $2=分段名 $3=目标名
+  local src="$PAY_FW/$1" out="$FWDIR/$3"
+  [ -f "$src.mdt" ] || return 0
+  [ -f "$out" ] && return 0
+  python3 "$SQUASH" "$src.mdt" "$out" >/dev/null 2>&1 &&
+    echo "   $(basename "$out") $(( $(stat -c%s "$out") / 1048576 )) MiB" ||
+    echo "   警告: 拼装 $3 失败"
+}
+PAY_FW="$REPO/work/raphael-fw"
+[ -f "$PAY/usr/lib/firmware/qcom/adsp.mbn" ] && cp "$PAY/usr/lib/firmware/qcom/adsp.mbn" "$FWDIR/"
+squash_into modem-image/modem   x modem.mbn
+squash_into modem-image/slpi_rp x slpi_rp.mbn
+squash_into vendor-firmware/ipa_fws x ipa_fws.mbn
+# ADSP/SLPI 运行时要的校准注册文件，和镜像放一起（内核按 firmware-name 的目录解析）
+for j in adspr.jsn adspua.jsn slpir.jsn slpius.jsn; do
+  [ -f "$PAY_FW/modem-image/$j" ] && cp "$PAY_FW/modem-image/$j" "$FWDIR/"
+done
+
+# --- 无线固件（linux-firmware，可再分发）-----------------------------------
+# WCN3990 的 BT 走 qca/，WiFi 走 ath10k/WCN3990/hw1.0/。这两个不在机内分区里
+# （Android 是让 modem 通过 tqftpserv 从 vendor 分区取的），所以用通用版本。
+# 由 scripts/fetch-raphael-firmware-ext.sh 下到 work/fw-ext/。
+if [ -d "$REPO/work/fw-ext" ]; then
+  cp -a "$REPO/work/fw-ext/." "$TREE/usr/lib/firmware/"
+  echo "   无线固件: $(find "$REPO/work/fw-ext" -type f | wc -l) 个"
+else
+  echo "   警告: work/fw-ext 不存在，蓝牙/WiFi 固件不会装（跑 fetch-raphael-firmware-ext.sh）"
+fi
 # /boot 挂 cache（与参考仓库同一条），nofail 避免挂不上拖进 emergency
 mkdir -p "$TREE/boot"
 grep -q 'PARTLABEL=cache' "$TREE/etc/fstab" 2>/dev/null || \

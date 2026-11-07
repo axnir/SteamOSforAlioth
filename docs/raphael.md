@@ -1149,3 +1149,85 @@ COM3 的 root shell 与 USB NCM 是这台手机唯一的观测通道（alioth �
 - 背光从 1023 升到 1535，`card0-DSI-1/status=connected`。
 
 
+## 19. 音频与蓝牙通了：内核 repo 早就写全了，缺的是固件路径
+
+### 19.1 先回答一个问题
+
+`GengWei1997/linux` @ `raphael-v7.3.0` 这份树**一直在用**，`sm8150-xiaomi-raphael.dts`
+里音频、触摸、WiFi、蓝牙节点全都写好了（`&sound` 的 dai-link、`goodix,gt9886`、
+`&wifi`、`uart13` 上的 `qcom,wcn3990-bt`）。所以「内核里没有」这个判断是错的。
+
+真正的问题是 **DTB 里 `firmware-name` 是写死的绝对路径**，而 Linux 内核树从不带
+二进制固件。少一级目录就是 `request_firmware` 返回 -2：
+
+```
+remoteproc2: Direct firmware load for
+  qcom/sm8150/Xiaomi/raphael/adsp.mbn failed with error -2
+```
+
+文件其实就在 `/lib/firmware/qcom/adsp.mbn`。这和之前 GPU zap 是**同一个坑**：
+`qcom/<soc>/<vendor>/<model>/` 四层目录，少一层就找不到。
+
+### 19.2 音频：ADSP 起来，声卡自己就注册了
+
+```
+sound: deferred probe pending: msm-snd-sm8150: MultiMedia1: error getting cpu dai name
+```
+
+不是 DTS 的 dai-link 写错，也不是缺 UCM —— 是 **ADSP 没起来**，`q6asm-dai` 没注册，
+`msm-snd-sm8150` 拿不到 cpu dai 就一直 deferred。把 `adsp.mbn` 放到内核要的路径后：
+
+```
+echo start > /sys/class/remoteproc/remoteproc2/state
+state=running
+PDR: Indication received from msm/adsp/audio_pd
+input: Xiaomi Redmi K20 Pro Headset Jack
+0 [Pro]: sm8150 - Xiaomi Redmi K20 Pro
+/dev/snd: controlC0 pcmC0D0p pcmC0D0c … pcmC0D3p
+```
+
+`wpctl status` 里 PipeWire 也认到了 `Built-in Audio`，Steam 客户端接到同一个 sink。
+`tfa9874` 扬声器功放在 I2S 上本来就 probe 成功（`TFA9874 detected, revision 0x0c74`）。
+
+### 19.3 蓝牙：`qca/` 两个文件
+
+```
+Bluetooth: hci0: QCA Downloading qca/crbtfw21.tlv
+Bluetooth: hci0: QCA Downloading qca/crnv21.bin
+Bluetooth: hci0: QCA setup on UART is completed
+```
+
+btqca 在 9.7s 就 probe 了，那时固件不在 → `-2`。补上文件后 `rmmod hci_uart &&
+modprobe hci_uart` 重新绑定 serdev 即可（不用重启）。这两个文件**不在**我们提取的
+机内固件里，用 linux-firmware 的通用版本；射频校准是通用的。
+
+### 19.4 WiFi：还差三个用户态守护进程
+
+`modem.mbn` 能加载（`remote processor modem is now up`），但每 40 秒
+`qcom_q6v5_pas: fatal error without message` 崩一次，ath10k_snoc 只打出
+`supply vdd-3.3-ch1 not found, using dummy regulator` 就一直在等。
+
+原因是 SteamOS 没有 `rmtfs` / `tqftpserv` / `pd-mapper`：modem 要靠 rmtfs 访问
+EFS（modemst1/2、fsg），靠 tqftpserv 从 AP 取自己运行时要的文件。这三个不在
+Valve 的 rootfs 里，需要交叉编译。
+
+**下一步**：编 `qrtr`/`rmtfs`/`tqftpserv`（linux-msm 那套），做成 systemd unit
+在 modem remoteproc 之前起；modem 稳定后 ath10k 的 QMI WLFW 才可能握上手。
+
+### 19.5 传输通道：别再走串口
+
+串口 115200 只有 ~8 KB/s（7.8 MB 要 27 分钟）。USB NCM（`usb0`）实测 **30 MB/s**：
+
+- Windows 侧 NCM 网卡自动拿到 `169.254.x.y/16`（不需要管理员）
+- 手机侧加同网段地址：`ip addr add 169.254.240.121/16 dev usb0`
+- 手机 `busybox nc -l -p 9999 > /tmp/f`，Windows 主动连过去发字节
+- `scripts/raphael-push-net.ps1 -LocalFile <文件> -RemotePath <路径>`（带 md5 校验）
+
+74 MB 的 `modem.mbn` 用了 3 秒。Windows 防火墙默认挡 ICMP，`ping` 不通不代表链路不通。
+
+### 19.6 已固化
+
+- `scripts/fetch-raphael-firmware-ext.sh`：从 kernel.org 下 4 个无线固件到 `work/fw-ext/`
+- `scripts/build-raphael-reference.sh` 4/7：把 adsp/modem/slpi/ipa 按
+  `qcom/sm8150/Xiaomi/raphael/` 布局装进 rootfs，并合入 `work/fw-ext/`
+- `scripts/raphael-push-net.ps1`：NCM 传文件（30 MB/s，替代串口 base64）
