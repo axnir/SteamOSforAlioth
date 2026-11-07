@@ -806,3 +806,56 @@ CONFIG_QFMT_V2=y
 - 起来之后 COM4 是 root shell；`/proc/partitions` 有 31 个分区；
   `mount -t ext4 -o ro /dev/sda31 /newroot` 能读 Android 的 /data
 - 回 Android：`fastboot flash boot stock-boot.img` + `fastboot flash dtbo stock-dtbo.img`
+
+## 14. 顺手活：让 U-Boot 开机直接进 fastboot
+
+现在每次迭代都要有人按菜单选第 4 项。这件事可以彻底免掉，做法是改 U-Boot
+**编译进去的默认环境**。
+
+### 14.1 为什么能改
+
+`saveenv` 没有落点（镜像里找不到 `uboot.env` 之类的字符串，多半是 `ENV_IS_NOWHERE`），
+但默认环境本身就是 `.rodata` 里一段纯字符串数组：
+
+```
+bootcmd=bootefi bootmgr; pause; run menucmd
+menucmd=setenv bootcmd run menucmd; bootmenu -1
+...
+bootmenu_0..bootmenu_10 ...
+button_cmd_0_name=Volume Down
+button_cmd_0=run menucmd
+```
+
+`work/uboot/u-boot.bin` 里这段在偏移 1 156 440，长 726 字节，15 条，两个 NUL 收尾 ——
+原地改就行，只要新值不比旧值长。
+
+`make-raphael-uboot-fastboot.py` 做的事：把第一条换成 `bootcmd=run fastboot`、
+尾部补 NUL 保持长度、重新 gzip、按原 v0 头（page 4096 / kernel_addr 0x8000）重打包、
+原样追加 107 KB 的 DTB。
+
+### 14.2 为什么是安全的
+
+环境里自带 `button_cmd_0_name=Volume Down` / `button_cmd_0=run menucmd`：**按住音量下
+开机会直接进菜单**。所以 bootcmd 改成 fastboot 之后，菜单、`Enable serial console
+gadget`、`Enable USB mass storage` 全都还在，只是默认路径变了。
+
+退路仍然是那一条：音量下 + 电源进 ABL 的 fastboot，然后
+`fastboot flash boot work/raphael-facts/stock-boot.img`。
+
+### 14.3 现状
+
+镜像**已经做好但还没刷**：
+
+```
+work/uboot/u-boot-fastboot.img   671 744 B（和原镜像同尺寸）
+work/uboot/u-boot-fastboot.bin   1 458 240 B（改过环境的主体）
+```
+
+刷法（ABL fastboot，不是 U-Boot 的）：
+
+```bash
+fastboot flash boot work/uboot/u-boot-fastboot.img
+```
+
+刷完之后每次开机都是一个等着 `fastboot boot` 的设备，不再需要按任何键。想换回
+原版就刷 `work/uboot/u-boot.img`（671 744 B，sha256 `ba6548b5…b992`）。
