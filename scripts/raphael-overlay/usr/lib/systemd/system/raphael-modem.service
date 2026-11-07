@@ -1,0 +1,15 @@
+[Unit]
+Description=Start the Qualcomm modem remoteproc (needed by ath10k_snoc for WiFi)
+# modem 起来之后它的 wlan 子系统才会注册 QMI WLFW 服务，ath10k_snoc 才握手成功。
+# 顺序很关键：rmtfs/tqftpserv 没起来就启动 modem，它会 40 秒崩一次（实测 crash #N）。
+After=raphael-rmtfs.service raphael-tqftpserv.service
+Requires=raphael-rmtfs.service raphael-tqftpserv.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'echo start > /sys/class/remoteproc/remoteproc1/state'
+RemainAfterExit=yes
+TimeoutStartSec=60
+
+[Install]
+WantedBy=multi-user.target

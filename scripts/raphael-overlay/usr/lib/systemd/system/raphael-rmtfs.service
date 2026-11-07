@@ -1,0 +1,18 @@
+[Unit]
+Description=Qualcomm remotefs daemon (EFS: modemst1/modemst2/fsg/fsc)
+Documentation=man:rmtfs(1)
+After=raphael-qrtr-ns.service
+Before=raphael-modem.service
+# modem 一启动就要通过 rmtfs 读 EFS；缺它 modem 每 40s 自己 fatal error 重启一次
+# （实测：qcom_q6v5_pas: fatal error without message，一直 crash #N）
+Requires=raphael-qrtr-ns.service
+
+[Service]
+Type=simple
+ExecStartPre=/bin/mkdir -p /var/lib/rmtfs
+ExecStart=/opt/raphael/qcom/bin/rmtfs -s /var/lib/rmtfs
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

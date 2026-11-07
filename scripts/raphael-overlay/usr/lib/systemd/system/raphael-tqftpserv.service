@@ -1,0 +1,17 @@
+[Unit]
+Description=Qualcomm TFTP service (serves modem firmware requests to the AP)
+Documentation=man:tqftpserv(1)
+After=raphael-qrtr-ns.service
+Before=raphael-modem.service
+Requires=raphael-qrtr-ns.service
+
+[Service]
+Type=simple
+# modem 起来后会通过 TFTP 向 AP 要自己的运行时文件（mba/qdsp6sw 等），
+# 没有这个服务它拿不到就崩；文件相对 firmware-name 的目录解析
+ExecStart=/opt/raphael/qcom/bin/tqftpserv
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

@@ -193,6 +193,27 @@ if [ -d "$REPO/scripts/raphael-overlay" ]; then
   ln -sf /etc/systemd/system/raphael-usb-gadget.service \
     "$TREE/etc/systemd/system/sysinit.target.wants/raphael-usb-gadget.service"
 
+  # Qualcomm 用户态三件套（qrtr-ns / rmtfs / tqftpserv）+ 启动 modem。
+  # 没有它们 modem 每 40s 崩一次、ath10k 的 QMI WLFW 永远等不到，WiFi 起不来。
+  # 二进制来自 Debian arm64 包（scripts/fetch-raphael-qcom-tools.sh 下到
+  # work/qcom-tools/stage），这里只负责摆位、给执行位、建 enable 链接。
+  if [ -d "$REPO/work/qcom-tools/stage" ]; then
+    mkdir -p "$TREE/opt/raphael/qcom"
+    cp -a "$REPO/work/qcom-tools/stage/." "$TREE/opt/raphael/qcom/"
+    chmod 755 "$TREE/opt/raphael/qcom/bin/"* 2>/dev/null || true
+    mkdir -p "$TREE/usr/lib"
+    cp -f "$TREE/opt/raphael/qcom/lib/libqrtr.so.1" "$TREE/usr/lib/" 2>/dev/null || true
+    mkdir -p "$TREE/etc/systemd/system/multi-user.target.wants"
+    for u in raphael-qrtr-ns raphael-rmtfs raphael-tqftpserv raphael-modem; do
+      [ -f "$TREE/usr/lib/systemd/system/$u.service" ] &&
+        ln -sf "/etc/systemd/system/$u.service" \
+          "$TREE/etc/systemd/system/multi-user.target.wants/$u.service"
+    done
+    echo "   qcom tools: $(ls "$TREE/opt/raphael/qcom/bin" | tr '\n' ' ')"
+  else
+    echo "   提示: work/qcom-tools/stage 不存在，WiFi 依赖的三个守护进程不会装"
+  fi
+
   # 首次开机扩根（照 alioth-firstboot）。哨兵必须由镜像带进来 ——
   # 脚本只删不建，没有它 resize2fs 永远不会跑，Steam 会撞上一个 12 GiB 的根。
   chmod 755 "$TREE/usr/lib/steamos-arm/raphael-firstboot" 2>/dev/null || true
