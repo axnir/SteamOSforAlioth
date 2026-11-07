@@ -1,0 +1,67 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shouchen <TheOneovb@petlover.com>
+Date: Sat, 7 Nov 2026 10:20:00 +0800
+Subject: [PATCH] arm64: dts: qcom: sm8150-raphael: use the memory map ABL
+ actually hands over
+
+The board file carries a fixed /memory because sm8150.dtsi leaves the size
+at 0 and expects the bootloader to fill it in. The ranges it carries are the
+ones a UEFI image hands over, and under the stock ABL they are wrong: high
+DRAM sits at 0x180000000, not 0x100000000.
+
+Wrong here is not a matter of less RAM. The kernel is told about 3 GiB that
+is not where it thinks, and not told about the 4 GiB that is -- its first
+write into the phantom range faults, with no console up yet and no pstore to
+catch it. What that looks like from outside: the bootloader shows its splash,
+jumps, the screen goes black and the device comes back to fastboot a few
+seconds later.
+
+The replacement values are not derived or copied from another board. They are
+read off this phone: /proc/device-tree/memory/reg under Android with root,
+which is the tree ABL built.
+
+Signed-off-by: shouchen <TheOneovb@petlover.com>
+---
+ arch/arm64/boot/dts/qcom/sm8150-xiaomi-raphael.dts | 31 +++++++++++++---------
+ 1 file changed, 18 insertions(+), 13 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/qcom/sm8150-xiaomi-raphael.dts b/arch/arm64/boot/dts/qcom/sm8150-xiaomi-raphael.dts
+--- a/arch/arm64/boot/dts/qcom/sm8150-xiaomi-raphael.dts
++++ b/arch/arm64/boot/dts/qcom/sm8150-xiaomi-raphael.dts
+@@ -38,22 +38,24 @@
+ 	qcom,board-id = <40 0>;
+ 
+ 	/*
+-	 * Memory map as programmed by the bootloader.  sm8150.dtsi leaves the
+-	 * size at 0 ("we expect the bootloader to fill in the size") and relies
+-	 * on the board file for the real layout, so this is not optional: with
+-	 * the placeholder reg the kernel gets zero bytes of RAM and dies before
+-	 * it can even bring up USB.
++	 * Memory map as the ABL hands it over.
+ 	 *
+-	 * The ranges are the ones the UEFI image hands over:
+-	 *   0x80000000 + 0x3cc00000  low DRAM  (972 MiB)
+-	 *   0x100000000 + 0xc0000000  high DRAM (3 GiB)
+-	 *   0xc0000000 + 0x80000000   high DRAM (2 GiB)
++	 * These values are read off this phone under Android
++	 * (/proc/device-tree/memory/reg, root), so they are what ABL itself
++	 * puts there -- not what the UEFI image hands over, and that
++	 * difference is the whole point: UEFI puts high DRAM at 0x100000000,
++	 * ABL puts it at 0x180000000. A kernel told about memory that is not
++	 * there dies on its first write, with nothing on any console.
++	 *
++	 *   0x80000000  + 0x3bb00000   954 MiB
++	 *   0xc0000000  + 0xc0000000   3 GiB
++	 *   0x180000000 + 0x100000000  4 GiB
+ 	 */
+ 	memory@80000000 {
+ 		device_type = "memory";
+-		reg = <0x00 0x80000000 0x00 0x3cc00000>,
+-		      <0x01 0x40000000 0x00 0xc0000000>,
+-		      <0x00 0xc0000000 0x00 0x80000000>;
++		reg = <0x00 0x80000000 0x00 0x3bb00000>,
++		      <0x00 0xc0000000 0x00 0xc0000000>,
++		      <0x01 0x80000000 0x01 0x00000000>;
+ 	};
+ 
+ 	aliases {

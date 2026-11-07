@@ -4,11 +4,15 @@
  * 为什么需要它：这台机器没有能从外面接的调试串口（DTS 的 stdout-path 是测试点
  * 上的 uart2），USB gadget 要等内核跑到 initramfs 才有，而内核如果死在更早的
  * 地方，两边都是"什么都没有"—— 分不清是没跳转、跳了但崩了、还是崩在了哪一步。
- * alioth 阶段 1 也是靠这个 framebuffer 才有第一行日志的。
  *
- * 地址和规格不是猜的：从参考项目在真机上导出的 DTB 里读出来的（那台机器跑
- * U-Boot，splash 用的就是这块内存）。1080×2340、stride 4320 = 1080×4，
- * 所以是 32 位像素。
+ * 地址和规格不是猜的：framebuffer 是原厂设备树里的 `cont_splash_region@9c000000`，
+ * 1080×2340、stride 4320 = 1080×4，所以是 32 位像素。区域大小 0x2400000 也是从
+ * 原厂 DTB 里读出来的（我们需要的 0x9a3f80 装得下）。
+ *
+ * **那块内存必须 `no-map` 预留**。alioth 那边踩过：不预留，内核会把同一段内存
+ * 分给别人，而 simplefb 直接往里写 —— 表现是随机内存损坏，屏幕上先花屏再黑屏，
+ * 和"没输出"完全不像同一个 bug。预留但不 no-map 也不行：那段内存同时在
+ * cacheable 线性映射里，而 simplefb 自己 ioremap_wc()，arm64 上属性不匹配。
  *
  * simpledrm 抢到 framebuffer 之后 msm 的显示驱动就绑不上了 —— 阶段 1 不需要它：
  * 判据是"能不能出字"和"能不能进 shell"，不是"能不能跑 Steam"。
@@ -21,5 +25,12 @@
 		height = <2340>;
 		stride = <4320>;
 		format = "a8r8g8b8";
+	};
+};
+
+&{/reserved-memory} {
+	splash_region: splash@9c000000 {
+		reg = <0x0 0x9c000000 0x0 0x2400000>;
+		no-map;
 	};
 };
