@@ -88,6 +88,10 @@ $lines = @(
   "TOTAL_SECS=$TOTAL_SECS"
 )
 [IO.File]::WriteAllLines((Join-Path $outDir 'layout.env'), [string[]]$lines)
-if ($P2_SECS -ne 3145728 -or $LAST_USABLE -lt 3000000) { throw "布局变量异常: P2_SECS=$P2_SECS LAST_USABLE=$LAST_USABLE" }
+# 自检：p2 必须覆盖绝大部分 userdata，但绝不能越过它 —— userdata 实测
+# 122,857,467 个 4K 扇区（491,429,868 KiB），越过就刷不进去。
+if ($P2_SECS -lt 100000000 -or $LAST_USABLE -ge 122857467) {
+  throw "布局变量异常: P2_SECS=$P2_SECS LAST_USABLE=$LAST_USABLE"
+}
 "GPT 结构已生成 -> $outDir"
 $lines
