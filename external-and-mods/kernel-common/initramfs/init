@@ -40,6 +40,7 @@ rootarg=""
 debug=0
 usbshell=0
 usbimage=0
+payload=0
 steamosroot=""
 bootlabel=ROCKNIX
 session=""
@@ -48,6 +49,7 @@ for arg in $(cat /proc/cmdline); do
     konkr.bootlog_wait=*) extra="${arg#*=}" ;;
     steamos.debug=1) debug=1 ;;
     steamos.usbshell=1) usbshell=1 ;;
+    steamos.payload=1) payload=1 ;;
     steamos.usbimage=1) usbimage=1 ;;
     steamos.root=*) steamosroot="${arg#steamos.root=}" ;;
     # Debug boot images: log straight into Desktop Mode for this boot.
@@ -98,8 +100,12 @@ usb_shell() {
   # get a copyable boot log off a phone with no UART and no root yet.
   # Written before the UDC bind, because gserial rejects it once the port
   # is open. Not fatal: a kernel without the option has no such file.
-  echo 1 >"$g/functions/acm.usb0/console" 2>/dev/null ||
-    echo "usbshell: no acm console attribute (CONFIG_U_SERIAL_CONSOLE=n?)"
+  # steamos.payload=1 时 ttyGS0 要留给新系统的调试 shell（COM3），
+  # 所以别把内核 console 接上去；内核日志仍然走面板 tty0。
+  if [ "$payload" != 1 ]; then
+    echo 1 >"$g/functions/acm.usb0/console" 2>/dev/null ||
+      echo "usbshell: no acm console attribute (CONFIG_U_SERIAL_CONSOLE=n?)"
+  fi
   ln -s "$g/functions/acm.usb0" "$g/configs/c.1/"
   ln -s "$g/functions/acm.usb1" "$g/configs/c.1/"
   ln -s "$g/functions/ncm.usb0" "$g/configs/c.1/"
@@ -446,7 +452,16 @@ if [ -n "$root_mounted" ]; then
   else
     umount /boot 2>/dev/null
   fi
-  # SteamOS 的 /sbin/init 可能是指向 /usr 的链接、或 systemd 的真实路径，
+  # steamos.payload=1：把 initramfs 里的 /payload（模块、机内固件、调试服务、
+# 静态 busybox）复制进真正的新根。没有网络、没有可用 rootfs 时，这是唯一能把
+# 东西送进去的路。复制发生在 switch_root 之前 —— 之后 initramfs 会被清空。
+if [ "$payload" = 1 ] && [ -d /payload ]; then
+  echo "payload: 注入 $(du -sh /payload 2>/dev/null | cut -f1) 到新根"
+  cp -a /payload/. /newroot/ 2>/dev/null || echo "payload: cp 失败"
+  sync
+fi
+
+# SteamOS 的 /sbin/init 可能是指向 /usr 的链接、或 systemd 的真实路径，
 # 别写死：按顺序找一个存在的。
 _init_bin=""
 for c in /sbin/init /init /usr/lib/systemd/systemd /usr/sbin/init /bin/sh; do

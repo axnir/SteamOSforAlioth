@@ -278,7 +278,15 @@ configure() {
   # for ABL anyway, and konkr-update can then find the recovery hook in it).
   if [[ "${EMBED_INITRAMFS:-0}" == 1 ]]; then
     $sc --set-str INITRAMFS_SOURCE "$INITRD_CPIO"
-    $sc --enable INITRAMFS_COMPRESSION_NONE
+    # INITRAMFS_COMPRESS=1 (soc.env): gzip the embedded cpio. Ports that ship
+    # a big initramfs need it -- raphael's payload pushed an uncompressed Image
+    # to 182 MiB, past U-Boot fastboot's 112 MiB max-download-size.
+    if [[ "${INITRAMFS_COMPRESS:-0}" == 1 ]]; then
+      $sc --disable INITRAMFS_COMPRESSION_NONE
+      $sc --enable INITRAMFS_COMPRESSION_GZIP
+    else
+      $sc --enable INITRAMFS_COMPRESSION_NONE
+    fi
   else
     $sc --set-str INITRAMFS_SOURCE ""
   fi
@@ -389,12 +397,15 @@ embed_initramfs_modules() {
   #
   # Runs after modules_install and re-links Image, because CONFIG_INITRAMFS_SOURCE
   # points at the cpio produced by build_initramfs(), which ran before this.
-  [[ -n "${INITRAMFS_MODULES:-}" ]] || return 0
+  # 两者都没有就什么都不用做（也就不用重链 Image）。
+  if [[ -z "${INITRAMFS_MODULES:-}" && -z "${INITRAMFS_PAYLOAD_DIR:-}" ]]; then
+    return 0
+  fi
   local o="${OUT_BASE}/${KREL}" root="${WORK}/initramfs/root"
   local moddir="${root}/lib/modules/${KREL}" m f found
   mkdir -p "$moddir"
   found=0
-  for m in $INITRAMFS_MODULES; do
+  for m in ${INITRAMFS_MODULES:-}; do
     # modules_install may compress; match any suffix rather than assuming .ko.
     f="$(find "${o}/modules/${KREL}" -name "${m}.ko*" 2>/dev/null | head -n1)"
     [[ -n "$f" ]] || die "initramfs module ${m} not found in ${o}/modules/${KREL}"
@@ -402,10 +413,19 @@ embed_initramfs_modules() {
     log "initramfs: ${f##*/}"
     found=$((found + 1))
   done
-  ((found)) || return 0
+  # INITRAMFS_PAYLOAD_DIR: a directory tree to ship in the initramfs at
+  # /payload. Used by ports that still have no rootfs (or no network) and need
+  # to drop modules, signed firmware and a debug systemd unit into the real
+  # root before switch_root. Symlinks survive cpio -H newc.
+  if [[ -n "${INITRAMFS_PAYLOAD_DIR:-}" ]]; then
+    [[ -d "${INITRAMFS_PAYLOAD_DIR}" ]] || die "INITRAMFS_PAYLOAD_DIR 不存在: ${INITRAMFS_PAYLOAD_DIR}"
+    mkdir -p "${WORK}/initramfs/root/payload"
+    cp -a "${INITRAMFS_PAYLOAD_DIR}/." "${WORK}/initramfs/root/payload/"
+    log "initramfs payload: $(du -sh "${WORK}/initramfs/root/payload" | cut -f1)"
+  fi
   (cd "$root" && find . | cpio -o -H newc --owner=0:0 2>/dev/null) >"${WORK}/initramfs/initrd.cpio"
   gzip -9 -n -c "${WORK}/initramfs/initrd.cpio" >"${WORK}/initramfs/initrd.gz"
-  log "re-linking Image with the modules inside the initramfs"
+  log "re-linking Image with the modules/payload inside the initramfs"
   make -C "$SRC" -j"${JOBS}" Image >/dev/null
 }
 
