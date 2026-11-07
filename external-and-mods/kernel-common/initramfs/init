@@ -456,9 +456,27 @@ if [ -n "$root_mounted" ]; then
 # 静态 busybox）复制进真正的新根。没有网络、没有可用 rootfs 时，这是唯一能把
 # 东西送进去的路。复制发生在 switch_root 之前 —— 之后 initramfs 会被清空。
 if [ "$payload" = 1 ] && [ -d /payload ]; then
-  echo "payload: 注入 $(du -sh /payload 2>/dev/null | cut -f1) 到新根"
-  cp -a /payload/. /newroot/ 2>/dev/null || echo "payload: cp 失败"
+  echo "payload: 源 $(du -sh /payload 2>/dev/null | cut -f1)，目标 /newroot"
+  echo "payload: 目标挂载=$(grep ' /newroot ' /proc/mounts)"
+  # 不吞错误：上一轮把 2>/dev/null 写上去之后，cp 到底成没成只能靠猜。
+  cp -a /payload/. /newroot/ || echo "payload: cp 失败 rc=$?"
   sync
+  echo "payload: 复制后 /newroot/opt = $(ls /newroot/opt 2>&1)"
+  mkdir -p /newroot/opt/raphael 2>/dev/null
+  echo "injected $(date 2>/dev/null || echo ok)" >/newroot/opt/raphael/INJECTED 2>/dev/null ||
+    echo "payload: 标记文件写不进去（目标只读？）"
+fi
+
+# 不等 systemd 的 unit：直接在 ttyGS0(COM3) 上开一个 chroot 到新根的 root shell。
+# fd 由本 shell 在 chroot 之前打开，所以新根里就算没有 /dev 也能用；用 payload
+# 自带的静态 busybox，不依赖可能还没挂好的 /usr。switch_root 只动 PID 1，
+# 这个后台进程的根已经是 /newroot，切根之后照样活着。
+if [ "$payload" = 1 ] && [ -x /newroot/opt/raphael/bin/busybox ]; then
+  echo "payload: 在 ttyGS0 起 chroot root shell"
+  /bin/busybox setsid /bin/busybox sh -c \
+    'while :; do /newroot/opt/raphael/bin/busybox chroot /newroot \
+       /opt/raphael/bin/busybox sh; /bin/sleep 1; done' \
+    </dev/ttyGS0 >/dev/ttyGS0 2>&1 &
 fi
 
 # SteamOS 的 /sbin/init 可能是指向 /usr 的链接、或 systemd 的真实路径，
