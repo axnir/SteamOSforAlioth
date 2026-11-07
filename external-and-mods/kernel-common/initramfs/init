@@ -389,8 +389,11 @@ if [ -n "$rootdev" ] && mount -t ext4 -o rw "$rootdev" /newroot; then
 fi
 snap "FAILED to mount root ($rootdev)"
 echo "root mount failed; see bootlog.txt on the FAT partition"
-# Only the REDMAGIC 6 has no other way in (no SD slot, no UART).
-if grep -qa "REDMAGIC 6" /sys/firmware/devicetree/base/model 2>/dev/null; then
+# None of these phones has another way in (no SD slot, no UART). When the
+# boot image carried steamos.usbshell=1, the emergency shell IS the point of
+# the boot -- raphael reached this path on its first userspace boot and
+# panicked as PID 1 until this condition let it in.
+if [ "$usbshell" = 1 ] || grep -qa "REDMAGIC 6" /sys/firmware/devicetree/base/model 2>/dev/null; then
   usb_shell && echo "USB debug shell: serial gadget, or ncat 172.16.42.1 23"
 fi
 exec sh

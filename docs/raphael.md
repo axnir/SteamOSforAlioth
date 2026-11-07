@@ -292,7 +292,7 @@ qcom,board-id = <0x28 0>            /* 40  */
       258 MB 的 tarball 放进 `work/cache/`，构建脚本从那里取（不再联网）。
       `work/ref/linux-raphael` 那个半截克隆可以直接删掉
 
-### 阶段 1：能出画面、能进 shell（ABL 已过关，内核还没到 userspace）
+### 阶段 1：能出画面、能进 shell（已验收，§12）
 
 产出：`work/steamos-raphael/boot-debug.img`
 
@@ -323,11 +323,13 @@ qcom,board-id = <0x28 0>            /* 40  */
       高内存在 `0x180000000` 而不是 UEFI 那份的 `0x100000000`），花屏消失
 - [x] splash framebuffer 补 `no-map` 预留（`0x9c000000` + `0x2400000`，从原厂 DTB 读的）
 - [x] ramoops 按原厂地址接上（`0xB0000000` / 4 MiB / console 2 + pmsg 2），DTS 里 no-map
-- [ ] **内核仍然没到 userspace**：全黑、initramfs 的信标没有出现、USB 无设备。
-      `pstore` 闭环也走不通 —— Android 的 4.14 ramoops 解析不了 7.3 写的记录，
-      Android 11 又没有 `/dev/mem`。所以「下次启动读上一次日志」这条路，
-      前提（我们的内核能跑到 userspace）不成立
-- [ ] 验收：USB 网卡 + `172.16.42.1:23` 能进 shell
+- [x] **内核进 userspace 了**（§12）：U-Boot 的 `fastboot boot` + header v2 +
+      `page_size=0x200000`（2MB 对齐是 arm64 的硬要求，不对齐就是「Starting kernel
+      之后一个字都没有」）。面板上 8 只 Tux、DPU/DSI/Adreno 依次 probe
+- [x] 验收：**root shell 在 COM4 上**（`ttyGS1`），`id` = uid=0，`uname -a` =
+      7.3.0-raphael-steamos，`free -m` = 7462 MB，`/proc/cpuinfo` 8 核
+- [ ] 存储：`/proc/partitions` 空 —— `SCSI_UFS_QCOM` / `PHY_QCOM_QMP_UFS` 是 `=m`，
+      boot 镜像不带模块。已改成 `=y`，重编中
 
 ### 阶段 1.5：把观测通道建起来（当前卡在这里，§10）
 
@@ -535,6 +537,10 @@ Loading Boot0006 'blkmap 0' failed
 分区当成候选；唯一会按 GUID 去找的是 ESP。`cache` 两条都不满足，于是被跳过。
 未验证，别当结论用。
 
+> 后来的走向和这一节猜的不同：从 `u-boot.bin` 里读出默认环境之后才知道它有个
+> `bootmenu`，第 4 项就是 `run fastboot`。走那条通道比改 GPT / 插键盘都省事，
+> 所以 §10.5 的两条路**都没有再走**。真正用上的方法是 §12。
+
 ### 10.5 下一步（按代价排序）
 
 1. **USB 键盘**（USB-C OTG）。插上重启，U-Boot 的 USB host 会认出来，在 `=>` 下敲
@@ -558,3 +564,160 @@ fastboot reboot
 
 进不去 fastboot 时的逃生路见 §8.1：recovery 里的 adb 是 root，`adb push <文件> /dev/block/sde49`
 （boot）/ `sde45`（dtbo）可以直接写块设备；推 `/cache` 会「报告成功但文件不存在」。
+
+## 12. 阶段 1 通了：U-Boot 的 fastboot + 2MB 对齐 + 应急 shell
+
+这一节是 11-07 下午的整条链路。结论先给：**内核进了 userspace，root shell 在 COM4 上**。
+
+### 12.1 那版 U-Boot 的默认环境（从 u-boot.img 里读出来的）
+
+`u-boot.img` 是 v0 头 + gzip。解开（`zlib.decompressobj(16+MAX_WBITS)`，尾部还有
+107 KB 的 DTB）之后从 1.4 MB 的 `u-boot.bin` 里能直接读到默认环境：
+
+```
+bootdelay=0
+stdin=serial,button-kbd                 ← 没有 usbkbd，键盘无论怎么插都不行
+stdout=serial,vidconsole
+bootcmd=bootefi bootmgr; pause; run menucmd
+menucmd=setenv bootcmd run menucmd; bootmenu -1     ← -1 = 无限等
+preboot=scsi scan; run setup_rootdev; run setup_blkmap
+fastboot=fastboot -l $fastboot_addr_r usb 0
+serial_gadget=setenv stdin serial,button-kbd,usbacm; ...
+```
+
+启动菜单（`bootmenu_N`）一共 11 项，其中三项有用：
+
+| 项 | 内容 |
+|---|---|
+| 1 | `Enable serial console gadget` |
+| 2 | `Enable USB mass storage`（`ums 0 scsi 0`） |
+| 3 | **`Enable fastboot mode`（`run fastboot`）** |
+
+菜单是 `button-kbd` 驱动的——**音量键和电源键**（`key-vol-up`=115、`resin`=114、
+`pwrkey`=116）。所以即使没有键盘也能操作菜单，这是这条路能走通的前提。
+
+### 12.2 迭代方式：`fastboot boot`，不写任何分区
+
+选第 4 项之后，U-Boot 变成一个 fastboot 设备：
+
+```
+fastboot devices        → f4be9589  fastboot
+version-bootloader     → U-Boot Tauchgang 2026.10-rc4-gc3cb35371
+```
+
+`fastboot flash` 在这里没用（`invalid partition or device`——它同样不认识 GPT 分区），
+但 **`fastboot boot <img>` 可用**：把镜像下到 DRAM 里直接跑。**全程不写任何分区，
+失败了长按电源就回到原状态。** 这是本轮最快的一条迭代通道，比刷 boot 分区安全得多。
+
+### 12.3 三个非显然的必要条件
+
+**（1）镜像必须是 Android boot header v2。** U-Boot 的 `fastboot boot` 走 `bootm` 的
+Android 镜像解析，v1 会报：
+
+```
+Error: header_version must be >= 2 to get dtb
+Working FDT set to 0
+FDT and ATAGS support not compiled in
+** ERROR: Please RESET the board **
+```
+
+v2 在 v1（1648 B）后面多 `dtb_size`(4) + `dtb_addr`(8)，共 1660 B，然后把 DTB 作为
+独立段放在 recovery_dtbo 之后。`external-and-mods/kernel-common/mkbootimg-v2.py` 就是
+干这个的。
+
+**（2）内核必须落在 2MB 对齐的物理地址上。** 这是 arm64 启动协议的要求，不满足时
+内核连第一张页表都建不起来，表现是 `Starting kernel ...` 之后**一个字都没有**、
+USB 也不恢复——和「内核根本没跳」看起来一模一样。
+
+`fastboot boot` 把镜像放在 `$fastboot_addr_r`＝`0x253400000`（2MB 对齐），但内核在
+镜像内的偏移是 `page_size`。U-Boot 打印过：
+
+```
+Kernel load addr 0x253401000      ← page_size = 4096，只对齐到 4KB
+```
+
+所以把 **header 的 `page_size` 写成 `0x200000`**，内核段就落在镜像内偏移 2 MB 处，
+加载地址变成 `0x255400000`，正好 2MB 对齐。这一改，内核当场就起来了。
+
+**（3）命令行要能被引导器覆盖。** 内核的 `CMDLINE` / `CMDLINE_FORCE` / `CMDLINE_EXTEND`
+在 Kconfig 里是一个 **choice**（三选一）。只写两个 `=n` 会把 choice 清成非法的
+「全空」，`olddefconfig` 会回填 `CMDLINE_FORCE=y`，等于没改。正确的是把目标成员
+写成 `y`：
+
+```
+CONFIG_CMDLINE_FROM_BOOTLOADER=y
+CONFIG_CMDLINE_FORCE=n
+CONFIG_CMDLINE_EXTEND=n
+```
+
+另一个坑：`kernel-common/build.sh` 的片段合并**只认 `NAME=value`，跳过 `#` 开头的行**，
+所以 `# CONFIG_X is not set` 这种 Kconfig 惯例写法在这里是**无效**的，必须写 `=n`。
+
+### 12.4 第一次进 userspace，和它暴露的两件事
+
+对齐之后的那一屏：8 只 Tux、DPU/DSI/Adreno 依次 probe、`Run /init as init process`、
+`configfs-gadget ... NCM` 注册，然后：
+
+```
+root mount failed
+Kernel panic - not syncing: Attempted to kill init!
+```
+
+两个问题，都在这一屏里：
+
+1. **init 的应急 shell 只对 REDMAGIC 6 生效。** `initramfs/init` 里写的是
+   `if grep -qa "REDMAGIC 6" .../model`，raphael 不匹配 → PID 1 直接 `exec sh`，
+   没有控制终端 → 退出 → 内核 panic。改成 `[ "$usbshell" = 1 ] || <REDMAGIC 条件>`
+   之后，同一个镜像起来就有一个常驻 shell 挂在 ttyGS1 上。
+2. **`/proc/partitions` 是空的。** `CONFIG_SCSI_UFS_QCOM=m`、`CONFIG_PHY_QCOM_QMP_UFS=m`
+   ——都是模块，而 boot 镜像只带内核不带模块，手机等于没有存储。改成 `=y`（这一条
+   正在编）。
+
+### 12.5 现在的验收状态：能进去，并且能说话
+
+应急 shell 在 USB 串口上（`VID_1D6B:0104`，产品串 `STEAMOS-ARM-DEBUG`）：
+
+| 口 | 用途 |
+|---|---|
+| COM3 | `acm.usb0`，内核 console |
+| COM4 | `acm.usb1` / `ttyGS1`，**交互 shell** |
+
+Windows 上不需要装任何驱动、也不需要管理员权限，`System.IO.Ports.SerialPort` 直接开：
+
+```
+~ # id
+uid=0 gid=0
+~ # uname -a
+Linux (none) 7.3.0-raphael-steamos #5 SMP PREEMPT Sat Nov  7 07:52:44 UTC 2026 aarch64
+~ # free -m
+Mem:  7462 MB total      ← 我们的内存映射对了（ABL 实测那份）
+~ # grep -c processor /proc/cpuinfo
+8
+```
+
+同一条链路上还有 NCM 网卡（`02-16-42-00-00-02`，配 `172.16.42.2/24` 之后
+`ncat 172.16.42.1 23` 是同一个 shell），但**在 Windows 上给网卡加静态 IP 需要管理员**，
+所以串口是更省事的那条。
+
+### 12.6 每天的固定动作
+
+```bash
+# 1. 编（容器，源码与工具链都在 raphael-work 卷里）
+./build-raphael-kernel.sh          # 或 work/wslc-build.sh（这台机器用的）
+
+# 2. 打镜像（v2 头 + 2MB 页）
+python3 external-and-mods/kernel-common/mkbootimg-v2.py \
+  --kernel work/kernel-raphael/output/7.3.0-raphael-steamos/boot/Image \
+  --dtb    work/kernel-raphael/output/7.3.0-raphael-steamos/dtbs/sm8150-xiaomi-raphael.dtb \
+  --cmdline "console=tty0 loglevel=7 ignore_loglevel steamos.usbshell=1" \
+  --pagesize 0x200000 --out work/steamos-raphael/boot-v2-2mb.img
+
+# 3. 手机上：长按电源 10 秒 → 开机 → 菜单选 Enable fastboot mode
+fastboot boot work/steamos-raphael/boot-v2-2mb.img
+
+# 4. 电脑上开 COM4
+```
+
+第 3 步每次都要人按菜单——这是当前唯一的低效点（`bootdelay=0`，靠按键打断 autoboot
+不可能）。等能动 `boot` 分区之后，把 U-Boot 本体 + 一个能自动选 fastboot 的环境
+写进去就能免掉。
