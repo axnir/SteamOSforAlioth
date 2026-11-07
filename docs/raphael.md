@@ -292,7 +292,7 @@ qcom,board-id = <0x28 0>            /* 40  */
       258 MB 的 tarball 放进 `work/cache/`，构建脚本从那里取（不再联网）。
       `work/ref/linux-raphael` 那个半截克隆可以直接删掉
 
-### 阶段 1：能出画面、能进 shell（ABL 已过关，内核还没起来）
+### 阶段 1：能出画面、能进 shell（ABL 已过关，内核还没到 userspace）
 
 产出：`work/steamos-raphael/boot-debug.img`
 
@@ -319,10 +319,27 @@ qcom,board-id = <0x28 0>            /* 40  */
       因为这台机器没有可外接的串口，内核死在 USB 起来之前就完全没有观测通道
 - [x] **ABL 那关过了**：前提是先 `fastboot erase dtbo`（§8.1）。清掉之后同一个镜像
       就被接受 —— 小米 logo 消失说明跳转了，设备也不再回 fastboot
-- [ ] **跳转成功但黑屏、USB 无设备**：内核死在 simpledrm 出字之前（或 fbcon 没绑上）。
-      下一步的怀疑对象是 DTS 里硬编码的 `memory@80000000`（UEFI 的 3 段约 6 GiB，
-      机器有 7.5 GiB）—— 删掉让 ABL 填；或者给 ramoops 找一块区域留崩溃日志
+- [x] 内存映射改成 ABL 实测值（`memory@80000000` 的三段从 `/proc/device-tree` 读的，
+      高内存在 `0x180000000` 而不是 UEFI 那份的 `0x100000000`），花屏消失
+- [x] splash framebuffer 补 `no-map` 预留（`0x9c000000` + `0x2400000`，从原厂 DTB 读的）
+- [x] ramoops 按原厂地址接上（`0xB0000000` / 4 MiB / console 2 + pmsg 2），DTS 里 no-map
+- [ ] **内核仍然没到 userspace**：全黑、initramfs 的信标没有出现、USB 无设备。
+      `pstore` 闭环也走不通 —— Android 的 4.14 ramoops 解析不了 7.3 写的记录，
+      Android 11 又没有 `/dev/mem`。所以「下次启动读上一次日志」这条路，
+      前提（我们的内核能跑到 userspace）不成立
 - [ ] 验收：USB 网卡 + `172.16.42.1:23` 能进 shell
+
+### 阶段 1.5：把观测通道建起来（当前卡在这里，§10）
+
+ABL 直接跳 mainline 这条路，卡点不是镜像格式也不是设备树内容，而是**看不见**：
+没有串口、USB 还没起来、pstore 读不回来。所以换 U-Boot 接管 `boot`。
+
+- [x] `fastboot flash boot u-boot.img` + `fastboot erase dtbo` → **面板上出现 U-Boot 日志**
+- [x] 确认这版 U-Boot 的 USB 侧是空的（无 fastboot、无 adb），面板只能看不能敲
+- [x] 解出这台机器的 GPT（4K LBA，头部在 4096，31 个分区）
+- [x] 做好 256 MiB FAT32 启动盘（`Image` + DTB + `extlinux.conf`），`flash cache` 写入成功
+- [ ] **U-Boot 没把 `cache` 当启动候选**：只试了 `scsi 0..5` 和 `blkmap 0`（§10.4）
+- [ ] 下一步：USB 键盘直接问 U-Boot，或把 `cache` 的 GPT 类型改成 ESP（§10.5）
 
 ### 阶段 2：rootfs 起得来
 
@@ -439,16 +456,105 @@ fastboot flash dtbo work/raphael-facts/stock-dtbo.img
 它需要机内签名固件、一份 raphael overlay、以及一个已经确认能启动的 boot.img，
 三样都还没有。
 
-## 10. 明天从这里开始
+## 10. 换到 U-Boot：面板控制台成立，启动介质还没解决
 
-两个实验，按顺序做，都不需要重新设计任何东西：
+§8 的结论是「ABL 直接跳 mainline 内核时，内核跑不到 userspace，而且没有任何观测通道」。
+换 U-Boot 就是为了把观测通道建起来 —— 代价是 §5 里选 A 时那套 boot.img 打包逻辑作废
+（参考项目在这台机器上用的就是 U-Boot → systemd-boot）。
 
-1. **删掉 `memory@80000000`**，让 ABL 填。现在的 DTS 硬编码的是 UEFI 交接的 3 段
-   （≈6 GiB），而这台机器 `MemTotal` 是 7.5 GiB —— 说明那份映射本身就不是这台机器
-   的真实布局。alioth 的 DTS 里**没有** memory 节点，ABL 会填。改法是在
-   `kernel-sm8150/patches/` 加一个删节点的补丁（append 删不掉节点，只能打补丁）。
-2. 如果 1 之后还是黑屏，**把崩溃日志留下来**。原厂那 4 份 DTB 里都没有 ramoops 节点，
-   所以地址得自己挑一块不在内核使用范围内的 DRAM，加上 `reserved-memory/ramoops`
-   + `CONFIG_PSTORE_RAM/CONSOLE/PMSG`，崩完启 Android 从 `/sys/fs/pstore` 读。
+### 10.1 怎么刷（两条命令，缺一不可）
 
-两个都要重新编（约 11 分钟，源码和工具链都缓存在 `raphael-work` 卷里，不会重下）。
+```bash
+fastboot flash boot work/uboot/u-boot.img    # 671 744 B，v0 头 + gzip 的 U-Boot
+fastboot erase dtbo                          # 不清就 6 秒回 fastboot
+fastboot reboot
+```
+
+`u-boot.img` 来自 `GengWei1997/linux-xiaomi-raphael-uboot` 的 v1.0.0 发布包
+（`u-boot-sm8150-xiaomi-raphael-20260911.zip`，sha256 `ba6548b5…b992`）。
+它的头部是 v0 + gzip，和我们最早被 ABL 拒掉的那版是同一种封装，但**它能跑**。
+差别不在封装，在 `dtbo`：清掉之后 ABL 放行。
+
+结果：**面板上出现完整的 U-Boot 日志**，`Model: Xiaomi Redmi K20 Pro` 识别正确。
+观测通道这一关过了。
+
+但 **USB 侧什么都没有**：`fastboot devices` 和 `adb devices` 全空。
+面板是单向的 —— 看得见，敲不进去。这是这版 U-Boot 的硬约束，后面所有方案都得绕着它走。
+
+### 10.2 它看到的是 6 个 LUN，不是分区
+
+```
+scanning bus for devices...
+Device 0: (0:0) SAMSUNG KLUFG8R1EM-B0C1  481896.0 MB (123365376 x 4096)
+Device 1: (0:1)  8 MB   Device 2: (0:2)  8 MB   Device 3: (0:3) 32 MB
+Device 4: (0:4)  6 GB   Device 5: (0:5) 32 MB
+Created "root"
+Block 0x0+0x752a7fb mapped to block 0x7c000 of "scsi 0"
+Cannot persist EFI variables without system partition
+Loading Boot0000 'scsi 0' failed ... Boot0005 'scsi 5' failed
+Loading Boot0006 'blkmap 0' failed
+```
+
+`scsi 0` 是**整块主 flash**（123 365 376 个 4096 字节块），不是某个分区。
+`0x7c000` 是解开的钥匙：它正好是 `userdata` 的起始 LBA（见 10.3），
+所以 U-Boot **确实解析了 GPT**，并且给最后一个分区建了一块 blkmap（名字 "root"）。
+
+### 10.3 这台机器的 GPT 在 4K LBA 上
+
+| 位置 | 值 |
+|---|---|
+| GPT 头 | 偏移 **4096**（不是 1024） |
+| 分区表 | 偏移 8192，32 条目 × 128 B |
+| 分区数 | 31 |
+
+节选（LBA 按 4096 字节）：
+
+| # | 分区 | 起始 LBA | 字节偏移 | 大小 |
+|---|---|---|---|---|
+| 11 | `misc` | 1024 | 4 194 304 | 4 MiB |
+| 21 | `splash` | 32604 | 133 545 984 | 32.6 MiB |
+| 28 | `recovery` | 163840 | 671 088 640 | 64 MiB |
+| 29 | `cache` | 180224 | 738 197 504 | 256 MiB |
+| 30 | `cust` | 245760 | 1 006 632 960 | 1024 MiB |
+| 31 | `userdata` | **507904 = 0x7c000** | 2 080 374 784 | 479 912 MiB |
+
+这一条要记牢：`sgdisk` 默认按 512 字节 LBA 干活，对这张表**读不到**。
+要动就按 4096 当块长，或者直接按字节偏移读写（`work/gpt.bin` 前 256 KB 已备份）。
+
+### 10.4 启动盘刷进去了，但没被尝试
+
+做了一块 256 MiB FAT32（正好等于 cache）：`Image` + DTB + `extlinux/extlinux.conf`，
+用 `make-raphael-bootfs.sh` 生成，`fastboot flash cache` 写进去了。U-Boot 的启动候选里
+**一个都没有 cache** —— 只试了 `scsi 0..5` 和 `blkmap 0`。
+
+同一个现象的另一半是 EFI：它打完 `Cannot persist EFI variables without system partition`
+就去试 UEFI 启动项。而 `cache` 的类型 GUID 是 `5594c694-c871-4b5f-90b1-690a6f68e0f7`
+（高通自定义的 cache），不是 ESP（`c12a7328-f81f-11d2-ba4b-00a0c93ec93b`）。
+
+**当前最合理的假设**：这版 U-Boot 的 bootstd 只按「整块设备」建 bootdev，不把 GPT
+分区当成候选；唯一会按 GUID 去找的是 ESP。`cache` 两条都不满足，于是被跳过。
+未验证，别当结论用。
+
+### 10.5 下一步（按代价排序）
+
+1. **USB 键盘**（USB-C OTG）。插上重启，U-Boot 的 USB host 会认出来，在 `=>` 下敲
+   `part list scsi 0` / `ls scsi 0:29 /` / `booti` 就能把问题问清楚，也能当场手工启动一次内核。
+   这是唯一能立刻消除不确定性的手段。
+2. **改 GPT 类型**：把 `cache` 的 type GUID 换成 ESP，重算 header 与 entries 的 CRC，
+   用 root 的 `dd` 按字节偏移写回（备份 `work/gpt.bin`）；FAT 里再加
+   `/EFI/BOOT/BOOTAA64.EFI`（systemd-boot aarch64，可从 Fedora 的
+   `systemd-boot-unsigned` aarch64 包里取）。这条路要一轮 Android 往返。
+
+## 11. 恢复 Android（每次都一样）
+
+```bash
+fastboot flash boot work/raphael-facts/stock-boot.img
+fastboot flash dtbo work/raphael-facts/stock-dtbo.img
+fastboot reboot
+```
+
+33 秒回到 Android，两个分区的 sha256 与备份逐字节一致（`b794c34b…`、`f921ddda…`）。
+`cache` 里那块 FAT 不用管：Android 不挂载它，也不影响启动（已验）。
+
+进不去 fastboot 时的逃生路见 §8.1：recovery 里的 adb 是 root，`adb push <文件> /dev/block/sde49`
+（boot）/ `sde45`（dtbo）可以直接写块设备；推 `/cache` 会「报告成功但文件不存在」。
