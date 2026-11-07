@@ -1023,3 +1023,71 @@ fastboot reboot
 
 `boot` 已是原版 U-Boot，可省略。`cache` 那一步是双保险（U-Boot 也可能直接从
 cache 分区的 FAT 找 ESP 回退路径）。
+
+## 17. 阶段 2 完成：SteamOS 图形会话在 raphael 上跑起来了
+
+### 17.1 最终状态（2026-11-07 晚，实测）
+
+```
+PID1=systemd   NAME="SteamOS" (holo)   uname 7.3.0-raphael-steamos aarch64
+/dev/loop0 on / type ext4 (rw,relatime)      ← 嵌套 GPT 的 p2，可写
+COM3 = ttyGS0 上的 root shell（uid=0），COM4 = ttyGS1，另有 USB NCM 网卡
+sddm.service                    active (running)
+start-gamescope-session ... --user steamos --autologin
+systemd --user / dbus-broker 均已起
+GPU: [drm] loaded qcom/a630_sqe.fw / a640_gmu.bin，zap 无报错
+```
+
+引导链：`U-Boot → bootefi bootmgr → ESP(sda29) → systemd-boot → linux.efi(EFI stub)
++ initramfs → losetup 挂 userdata 嵌套 GPT 的 p2 → switch_root → systemd → sddm
+→ gamescope`。
+
+### 17.2 一个反直觉但决定性的事实
+
+EFI 变量 `LoaderDevicePartUUID = BE3FC1E6-2236-E8ED-DC39-3241DC5C5F16`，
+即 **`sda29`（cache 分区）** —— systemd-boot 实际从 **cache 的 FAT** 启动，
+不是 userdata 嵌套 GPT 的 p1，尽管 U-Boot 的 `setup_blkmap` 把整个 userdata
+映射成了 `blkmap 0`。两个 ESP 内容相同，但**改 p1 不会影响启动**；固件/initrd
+必须落进 cache 那一份。
+
+cache 的 FAT 是按 512 字节/扇区格式化的，直接 `mount -t vfat /dev/sda29`
+在这台 4K-LBA UFS 上会报 `can't read superblock`。用
+`losetup -b 512 /dev/loop2 /dev/sda29` 再挂 `/dev/loop2` 就能读写。
+
+### 17.3 从「systemd 起来了」到「图形会话」的四层修复
+
+| 现象 | 真因 | 修法 |
+|---|---|---|
+| 电脑上没有任何 USB 设备 | 新内核 cmdline 没有 gadget | `raphael-usb-gadget.service`（sysinit.target.wants）+ `gadget.sh` configfs 建 2×ACM + NCM；配套 `raphael-debug-shell.service` 在 ttyGS0 起 root shell |
+| 启动卡 `5min13s / no limit` | `CONFIG_ZRAM=m`，`dev-zram0.device` 永远不出现 | `modules-load.d/raphael.conf` 开机加载 zram |
+| `Dependency failed for Graphical Interface`，一直 `initializing` | Valve 的 `/usr/lib/systemd/system/{efi,esp,home}.mount` 是**静态 unit**，硬等 `/dev/disk/by-partsets/*`；改 fstab 和 `/etc` 里的 mask 都压不住（generator 优先级更高） | 从 rootfs 删掉这三个 unit；`etc/fstab` 换成只留 `/boot`；udev 规则 `99-raphael-partsets.rules` 把 partsets 链接指向 `sda29` / `loop0`，让 device job 完成 |
+| `adreno_request_fw ... a630_sqe.fw -2`、`Unable to load qcom/sm8150/Xiaomi/raphael/a640_zap.mbn` | GPU 在 0.96s probe，那时只有 initramfs；且 zap 路径带厂商/机型子目录 | 把 `a630_sqe.fw`、`a640_gmu.bin`、`a640_zap.{mbn,mdt,b00..b02}` 放进 initramfs 的 `lib/firmware/qcom/` 与 `qcom/sm8150/Xiaomi/raphael/`，rootfs 同步一份 |
+
+**运行时修复全部已固化进构建**（`scripts/build-raphael-reference.sh` 的 2/7、
+4.5/7 和 `scripts/raphael-overlay/`），下次重建镜像自动带上，不需要再手工改。
+
+### 17.4 两个坑
+
+- **`systemctl reboot` 在 `initializing` 时会失败**：`Failed to connect to system
+  scope bus`（D-Bus 还没起），看着像重启了其实是 USB 重枚举，旧日志/旧 unit
+  全在，极易误判。用 `/opt/raphael/bin/busybox reboot -f`。
+- **串口命令里 `\x2d` 会被 shell 吃掉**：systemd 的转义 unit 名
+  `dev-disk-by\x2d...` 做 mask 时必须用单引号，否则文件名变成 `byx2d...`，
+  mask 静默失效。
+
+### 17.5 串口工具（Windows 侧，用 pwsh 7 运行）
+
+- `scripts/raphael-serial.ps1 -CommandFile <每行一条 shell 命令>`：批量执行并回显
+- `scripts/raphael-push-file.ps1 -LocalFile <文件> -RemotePath <路径>`：分块
+  base64 传二进制/脚本，带 md5 校验（串口单行上限 4096，必须先 `stty -echo`）
+
+### 17.6 还能继续收拾的（都不是启动链问题了）
+
+- `dev-disk-by-partlabel-syspersist.device` 的 nofail 挂载仍在等超时（不影响
+  graphical.target）
+- `deckard-*`（fan/charger/typec/fpga/led）是 Steam Frame 专属服务，在手机上
+  反复失败重启；可按需 mask
+- `hci0 QCA ... error -2`：WCN3998 蓝牙固件路径还没对上；机内固件已在
+  `work/raphael-fw/`
+- `cache` 的 FAT 是 512 字节扇区，Linux 侧要 `losetup -b 512` 才能挂
+

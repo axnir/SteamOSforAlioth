@@ -1,0 +1,7 @@
+# SteamOS 3 A/B partsets 是 Steam Deck / Frame 的分区集，这台手机上不存在。
+# /usr/lib/systemd/system/{efi,esp,home}.mount 会硬等这些 device，把
+# graphical.target 拖死在 initializing。让它们指向真实块设备即可：
+#   self/efi, shared/esp -> sda29 (cache FAT, systemd-boot 实际所在的 ESP)
+#   shared/home          -> loop0 (嵌套 GPT p2，可写 ext4 根)
+SUBSYSTEM=="block", KERNEL=="sda29", SYMLINK+="disk/by-partsets/self/efi", SYMLINK+="disk/by-partsets/shared/esp"
+SUBSYSTEM=="block", KERNEL=="loop0", SYMLINK+="disk/by-partsets/shared/home"

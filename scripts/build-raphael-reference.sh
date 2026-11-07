@@ -49,6 +49,23 @@ for m in phy-qcom-qmp-ufs qcom_ice ufs-qcom; do
   f=$(find "$KOUT/modules" -name "$m.ko*" | head -1)
   [ -n "$f" ] && cp "$f" "$IR/lib/modules/" || { echo "缺模块 $m"; exit 1; }
 done
+
+# GPU 固件必须进 initramfs：msm DRM 在 0.96s probe，那一刻只有 initramfs 可见，
+# 放在 rootfs 的 /usr/lib/firmware 来不及（实测 Direct firmware load ... -2）。
+# zap-shader 的路径由 DTB 写死为 qcom/sm8150/Xiaomi/raphael/a640_zap.mbn，
+# 所以要同时放 qcom/ 下和那个子目录里，.mdt/.bNN 是 qcom_mdt_load() 要的分段。
+mkdir -p "$IR/lib/firmware/qcom/sm8150/Xiaomi/raphael"
+FWSRC="$REPO/work/raphael-fw/vendor-firmware"
+for f in a630_sqe.fw a640_gmu.bin; do
+  [ -f "$FWSRC/$f" ] && cp "$FWSRC/$f" "$IR/lib/firmware/qcom/" ||
+    echo "警告: 缺机内固件 $f（GPU 可能降级）"
+done
+for f in a640_zap.mbn a640_zap.mdt a640_zap.b00 a640_zap.b01 a640_zap.b02; do
+  if [ -f "$PAY/usr/lib/firmware/qcom/$f" ]; then
+    cp "$PAY/usr/lib/firmware/qcom/$f" "$IR/lib/firmware/qcom/"
+    cp "$PAY/usr/lib/firmware/qcom/$f" "$IR/lib/firmware/qcom/sm8150/Xiaomi/raphael/"
+  fi
+done
 cat > "$IR/init" <<'INIT'
 #!/bin/busybox sh
 export PATH=/bin:/sbin
@@ -177,6 +194,21 @@ if [ -d "$REPO/scripts/raphael-overlay" ]; then
     "$TREE/etc/systemd/system/sysinit.target.wants/raphael-usb-gadget.service"
   echo "   overlay: $(find "$REPO/scripts/raphael-overlay" -type f | wc -l) 个文件"
 fi
+
+# Valve 的 /usr/lib/systemd/system/{efi,esp,home}.mount 是静态 unit，不读 fstab，
+# 而且 generator 目录的优先级高于 /etc 里的 mask —— 光改 fstab 或 systemctl mask
+# 都压不住。直接从树里删掉，才能让 graphical.target 不被 device job 拖死。
+rm -f "$TREE/usr/lib/systemd/system/efi.mount" \
+      "$TREE/usr/lib/systemd/system/esp.mount" \
+      "$TREE/usr/lib/systemd/system/home.mount"
+
+# 同样的 GPU 固件在 rootfs 里也放一份（systemd 起来后重新 probe / 用户态查询用）。
+mkdir -p "$TREE/usr/lib/firmware/qcom/sm8150/Xiaomi/raphael"
+cp -a "$TREE/usr/lib/firmware/qcom"/a640_zap.* \
+      "$TREE/usr/lib/firmware/qcom/sm8150/Xiaomi/raphael/" 2>/dev/null || true
+for f in a630_sqe.fw a640_gmu.bin; do
+  [ -f "$FWSRC/$f" ] && cp "$FWSRC/$f" "$TREE/usr/lib/firmware/qcom/"
+done
 # /boot 挂 cache（与参考仓库同一条），nofail 避免挂不上拖进 emergency
 mkdir -p "$TREE/boot"
 grep -q 'PARTLABEL=cache' "$TREE/etc/fstab" 2>/dev/null || \

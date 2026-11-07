@@ -1,0 +1,5 @@
+# raphael: Valve 的 A/B 分区集（by-partsets/{self,shared}/{efi,esp,home}）在这台
+# 手机上不存在。原 fstab 那三条会让 systemd 一直等设备、卡死 graphical.target。
+# 根是嵌套 GPT p2 的可写 ext4，/home 直接用根里的目录。
+# /boot 挂 cache FAT（systemd-boot 实际所在的 ESP）；nofail 防止拖进 emergency。
+PARTLABEL=cache /boot vfat umask=0077,nofail,noatime,x-systemd.device-timeout=10 0 0
