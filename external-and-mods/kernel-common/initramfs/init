@@ -335,6 +335,26 @@ for _t in ext4 btrfs; do
     break
   fi
 done
+# Valve 的 rootfs.img 是 btrfs 且根在**子卷**里：按默认子卷挂上来 /newroot 是
+# 空的（switch_root 会把 initramfs 删掉然后死在 /sbin/init 上 —— 实测过）。
+# 所以默认子卷挂上后查不到 init 时，挂顶层（subvolid=5）逐个子卷试，谁的根下
+# 有 init 就用谁。
+if [ -n "$rootdev" ] && [ ! -e /newroot/sbin/init ] && [ ! -e /newroot/init ]; then
+  if mkdir -p /mnt2 && mount -t btrfs -o subvolid=5 "$rootdev" /mnt2 2>/dev/null; then
+    for sv in /mnt2/*/; do
+      name="${sv#/mnt2/}"; name="${name%/}"
+      umount /newroot 2>/dev/null
+      if mount -t btrfs -o "subvol=$name" "$rootdev" /newroot 2>/dev/null &&
+         { [ -e /newroot/sbin/init ] || [ -e /newroot/init ]; }; then
+        echo "rootfs: btrfs subvolume $name"
+        root_mounted="btrfs"
+        break
+      fi
+    done
+    umount /mnt2 2>/dev/null
+  fi
+fi
+
 if [ -n "$root_mounted" ]; then
   if [ -z "$logdir" ]; then
     logdir=/newroot/var/log/steamos-arm-boot
@@ -410,7 +430,14 @@ if [ -n "$root_mounted" ]; then
   else
     umount /boot 2>/dev/null
   fi
-  exec switch_root /newroot /sbin/init
+  # SteamOS 的 /sbin/init 可能是指向 /usr 的链接、或 systemd 的真实路径，
+# 别写死：按顺序找一个存在的。
+_init_bin=""
+for c in /sbin/init /init /usr/lib/systemd/systemd /usr/sbin/init /bin/sh; do
+  if [ -f "/newroot$c" ]; then _init_bin="$c"; break; fi
+done
+echo "switch_root: init=${_init_bin:-<none found>}"
+exec switch_root /newroot "${_init_bin:-/sbin/init}"
 fi
 snap "FAILED to mount root ($rootdev)"
 echo "root mount failed; see bootlog.txt on the FAT partition"
