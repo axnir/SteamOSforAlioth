@@ -952,3 +952,74 @@ Valve 这份 rootfs 是给 Steam Frame（VR 头显）做的，图形会话依赖
 - `work/uboot/u-boot-fastboot.img`（§14，开机自动进 fastboot）**刷过一次，已换回
   原版 `u-boot.img`**：它让每次开机都停在 fastboot 等设备，日常不可用，只适合
   密集迭代时临时刷，完事必须换回带菜单的原版。
+
+## 16. 回到参考仓库方案：嵌套 GPT + systemd-boot（阶段 2 的正解）
+
+### 16.1 为什么前面几轮全废
+
+从 `u-boot.bin` 的默认环境里挖出来的决定性证据：
+
+```
+setup_blkmap=part start ${rootdev} userdata userdata_start;
+             part size  ${rootdev} userdata userdata_size;
+             blkmap create root;
+             blkmap map root 0 0x${userdata_size} linear ${rootdev} 0x${userdata_start}
+```
+
+**这版 U-Boot 把整个 `userdata` 映射成 `blkmap 0`**，`bootefi bootmgr` 在那里找
+ESP。日志里的 `Boot0006 'blkmap 0' failed` 就是这个意思。参考仓库
+`GengWei1997/linux-xiaomi-raphael-uboot` 的做法是：`fastboot flash userdata
+rootfs.img` 刷进去的**不是裸文件系统，而是一整块带嵌套 GPT 的磁盘镜像**——
+
+| 分区 | 起始(4K LBA) | 大小 | 类型 | 内容 |
+|---|---|---|---|---|
+| p1 | 2048 | 256 MiB | ESP `c12a7328-…` | FAT32：`EFI/BOOT/BOOTAA64.EFI`(systemd-boot) + `linux.efi` + `initramfs` + `dtbs` + `loader/entries/*.conf` |
+| p2 | 67584 | 12 GiB | DPS arm64 root `b921b045-…` | ext4 rootfs（可写） |
+
+引导链：`U-Boot → bootefi bootmgr → blkmap 0 上的 ESP → \EFI\BOOT\BOOTAA64.EFI
+→ systemd-boot 读 loader/entries → linux.efi(EFI stub) + initramfs → 挂 p2 →
+switch_root → systemd`。内核命令行在 **loader 条目的 `options` 行**，不在 U-Boot 里。
+
+我之前做错的是：把 Valve 的**裸 btrfs** 直接刷进 `userdata`，U-Boot 找不到 ESP；
+然后用 `fastboot boot` + 自造 initramfs 硬扛，还试图往根里注入——而 Valve 的根是
+**只读的**（`/proc/1/root/opt/PROBE` 实测 `Read-only file system`），运行时注入从原理上
+就不可能成功。
+
+### 16.2 三件产物
+
+| 文件 | 大小 | 内容 |
+|---|---|---|
+| `work/steamos-raphael/boot-cache.img` | 256 MiB | FAT32 引导镜像（也可单独刷 `cache` 分区作双保险） |
+| `work/steamos-raphael/userdata-nested-sparse.img` | 9.4 GiB | 带嵌套 GPT 的 userdata 磁盘镜像（sparse） |
+| `work/uboot/u-boot.img` | 656 KiB | 原版带菜单 U-Boot（已在 `boot` 分区） |
+
+rootfs 是把 Valve 的 `rootfs.img`（btrfs）**离线用 `btrfs restore` 抽成目录树**，
+合并 raphael payload（7.3.0 模块、机内签名固件、调试 unit、静态 busybox），
+再用 `mkfs.ext4 -d` 重做成**可写** ext4——绕开只读根。
+
+构建脚本（已落地）：
+- `scripts/build-raphael-reference.sh` —— 抽树 / 极简 initramfs / FAT 引导镜像 / ext4 rootfs
+- `scripts/make-raphael-nested-gpt.ps1` —— **pwsh 7** 生成 4K GPT 结构块
+- `scripts/assemble-raphael-nested.sh` —— 容器里 `dd` 稀疏组装 + `img2simg`
+
+### 16.3 工具约定（踩过坑）
+
+- **必须用 pwsh 7，不能用系统自带的 5.1**：5.1 把 UTF-8 无 BOM 的中文注释按
+  GBK 读，会导致变量解析错乱（实测 `$P2_SECS` 变空）。本机 `pwsh` 7.6.9 在
+  `C:\Users\moeka\AppData\Local\Microsoft\WindowsApps\pwsh.exe`。
+- pwsh 的 `WriteAllLines` 在 Windows 写 **CRLF**，Linux 侧 `source` 前要 `tr -d '\r'`。
+- `wslc` 容器没有 `CAP_SYS_ADMIN`，**不能 loop 挂载**，所以离线改 btrfs 只能走
+  `btrfs restore` → `mkfs.ext4 -d`。
+
+### 16.4 刷机（未执行，等确认）
+
+```bash
+fastboot erase dtbo
+fastboot flash cache    work/steamos-raphael/boot-cache.img
+fastboot flash userdata work/steamos-raphael/userdata-nested-sparse.img
+fastboot flash boot     work/uboot/u-boot.img
+fastboot reboot
+```
+
+`boot` 已是原版 U-Boot，可省略。`cache` 那一步是双保险（U-Boot 也可能直接从
+cache 分区的 FAT 找 ESP 回退路径）。
