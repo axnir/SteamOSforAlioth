@@ -1,0 +1,19 @@
+[Unit]
+Description=Raphael USB gadget (2x ACM + NCM)
+# 必须挂在 sysinit：multi-user.target 被 dev-zram0.device 之类的 job 拖住时，
+# 挂在那边的服务根本不会执行，我们就永远拿不到串口。
+DefaultDependencies=no
+Conflicts=shutdown.target
+Before=shutdown.target basic.target raphael-debug-shell.service
+After=systemd-modules-load.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/raphael/bin/busybox sh /opt/raphael/gadget.sh
+StandardOutput=journal+console
+StandardError=journal+console
+TimeoutStartSec=30
+
+[Install]
+WantedBy=sysinit.target

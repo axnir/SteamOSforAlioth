@@ -1,0 +1,18 @@
+[Unit]
+Description=raphael 阶段 2 调试 root shell（ttyGS0 / COM3）
+# 这台机器没有物理串口，USB gadget 的 ACM0 是唯一一条能进新系统的线。
+# initramfs 的 usb_shell 占着 ttyGS1（COM4）做应急 shell，所以这个用 ttyGS0。
+DefaultDependencies=no
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Service]
+Type=simple
+# 用 payload 自带的静态 busybox：SteamOS 的 /bin/sh 可能指向还没挂上的 /usr，
+# 而这一层恰恰是我们要用来查「为什么 /usr 没挂上」的，不能依赖它。
+ExecStart=/opt/raphael/bin/busybox sh -c 'trap "" HUP; while :; do /opt/raphael/bin/busybox sh </dev/ttyGS0 >/dev/ttyGS0 2>&1; /opt/raphael/bin/busybox sleep 1; done'
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target rescue.target emergency.target basic.target

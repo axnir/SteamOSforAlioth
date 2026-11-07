@@ -158,6 +158,18 @@ echo "===== 4/7 合并 payload 到 Valve rootfs 树 ====="
 cp -a "$PAY"/. "$TREE"/
 mkdir -p "$TREE/usr/lib/modules"
 cp -a "$KOUT/modules/7.3.0-raphael-steamos" "$TREE/usr/lib/modules/"
+
+# 4.5/7 raphael 系统配置（可复现，全部在 git 里，不依赖 work/ 里的手工产物）。
+# 关键：gadget 的 enable 链接必须落在 sysinit.target.wants —— multi-user.target
+# 会被 dev-zram0.device 之类的 job 拖住，挂在那边的服务永远不会执行，系统起来
+# 之后电脑上就一个串口都看不到。
+if [ -d "$REPO/scripts/raphael-overlay" ]; then
+  cp -a "$REPO/scripts/raphael-overlay/." "$TREE"/
+  mkdir -p "$TREE/etc/systemd/system/sysinit.target.wants"
+  ln -sf /etc/systemd/system/raphael-usb-gadget.service \
+    "$TREE/etc/systemd/system/sysinit.target.wants/raphael-usb-gadget.service"
+  echo "   overlay: $(find "$REPO/scripts/raphael-overlay" -type f | wc -l) 个文件"
+fi
 # /boot 挂 cache（与参考仓库同一条），nofail 避免挂不上拖进 emergency
 mkdir -p "$TREE/boot"
 grep -q 'PARTLABEL=cache' "$TREE/etc/fstab" 2>/dev/null || \
