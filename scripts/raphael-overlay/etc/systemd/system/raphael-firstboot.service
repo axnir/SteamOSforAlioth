@@ -1,0 +1,23 @@
+[Unit]
+Description=raphael first boot: grow rootfs to the nested-GPT p2
+# 哨兵不在就根本不启动；脚本自己也会再查一次（两道都要，ConditionPathExists
+# 只在启动时算一次）。
+ConditionPathExists=/var/lib/raphael-firstboot-pending
+# 要在根可写之后、Game Mode 起来之前做完：扩 12 GiB → 465 GiB 只要几秒，
+# 但 Steam 在这之前看到的是一个几乎满的磁盘。
+DefaultDependencies=no
+After=local-fs.target
+Before=sysinit.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# 上限必须与 scripts/make-raphael-nested-gpt.ps1 的 $P2_SECS 一致；
+# assert-raphael-firstboot.sh 会断言这一点。
+Environment=RAPHAEL_ROOT_SECS=122000000
+ExecStart=/usr/lib/steamos-arm/raphael-firstboot
+# 刻意不设 SuccessExitStatus：失败要在 systemctl --failed 里看得见。
+# 它拦不住开机（WantedBy 是弱依赖），哨兵还在，下次开机自然重试。
+
+[Install]
+WantedBy=sysinit.target

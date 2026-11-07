@@ -8,8 +8,16 @@ $BS = 4096
 $P1_START = 2048
 $P1_SECS  = 65536
 $P2_START = $P1_START + $P1_SECS
-$EXT4_BYTES = [long]12884901888   # 12 GiB，与 mkfs.ext4 的 truncate 一致
-$P2_SECS    = 3145728             # 12 GiB / 4096
+# p2 占满整个 userdata：设备上是 122,857,467 个 4K 扇区，取 122,000,000 留余量，
+# 尾部还要放 34 个扇区的 backup GPT。
+#
+# 镜像里 mkfs.ext4 只有 12 GiB（内容约 9.3 GiB），首次开机由
+# raphael-firstboot 的 resize2fs 扩到 RAPHAEL_ROOT_SECS —— 就是这里的
+# $P2_SECS。两处必须一致，scripts/assert-raphael-firstboot.sh 会断言。
+# 这样做的理由与 alioth 相同：镜像按内容大小做（刷得快、sparse 小），
+# 分区按整盘做（Steam 装游戏不会立刻撞墙）。
+$P2_SECS    = 122000000
+$EXT4_BYTES = [long]($P2_SECS * $BS)
 $LAST_USABLE = $P2_START + $P2_SECS - 1
 $BACKUP_LBA  = $LAST_USABLE + 34
 $TOTAL_SECS  = $BACKUP_LBA + 1

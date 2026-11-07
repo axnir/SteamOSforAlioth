@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# 首次开机：把根文件系统扩到整个 p2，成功后删掉哨兵。
+#
+# 照 alioth-firstboot，去掉 A/B 标记那半：raphael 是单槽（U-Boot + 嵌套 GPT），
+# 没有 qbootctl、也没有 needs-marking 的槽位。扩根这半原样保留，理由相同：
+# 镜像里的 ext4 只有 12 GiB（内容约 9.3 GiB），而 p2 有 465 GiB；不扩的话
+# Steam 第一次装游戏就没空间，而且报错离原因很远。
+#
+# 顺序是这个脚本的全部要点：
+#   哨兵在？ -- 不在就什么都不做
+#   resize2fs
+#   删哨兵   <-- 只有成功才走到这里
+# 任何中断（掉电、SIGKILL、resize2fs 失败）都落在「哨兵还在」，下次开机重来。
+#
+# 必须显式给块数：根是 initramfs 里的 loop0，offset 276824064，它的长度是
+# 「userdata 分区 - offset」，比 p2 多出尾部 backup GPT 的 34 个扇区。不带
+# 上限的 resize2fs 会写到 p2 之外、盖掉 backup GPT。
+set -euo pipefail
+
+ROOT_MNT="${RAPHAEL_FIRSTBOOT_ROOT:-/}"
+SENTINEL="${ROOT_MNT%/}/var/lib/raphael-firstboot-pending"
+ROOT_SECS="${RAPHAEL_ROOT_SECS:-}"
+
+log() { echo "raphael-firstboot: $*"; }
+
+[[ -e "$SENTINEL" ]] || { log "哨兵不在，已经跑过了"; exit 0; }
+
+dev="$(findmnt -no SOURCE -T "$ROOT_MNT")"
+[[ -b "$dev" ]] || { log "根设备 '$dev' 不是块设备，放弃（哨兵保留）"; exit 1; }
+
+part_bytes="$(blockdev --getsize64 "$dev")"
+log "根设备 $dev，可见 $((part_bytes / 1024 / 1024)) MiB"
+
+if [[ -n "$ROOT_SECS" ]]; then
+  log "resize2fs $dev $ROOT_SECS（4K 块，= p2 大小）"
+  resize2fs "$dev" "$ROOT_SECS"
+else
+  log "resize2fs $dev（未给上限，占满可见设备）"
+  resize2fs "$dev"
+fi
+
+rm -f "$SENTINEL"
+log "完成：根已扩到 $(dumpe2fs -h "$dev" 2>/dev/null | awk -F: '/^Block count:/{gsub(/ /,"",$2);print $2}') 个 4K 块"

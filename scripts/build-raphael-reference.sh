@@ -192,6 +192,14 @@ if [ -d "$REPO/scripts/raphael-overlay" ]; then
   mkdir -p "$TREE/etc/systemd/system/sysinit.target.wants"
   ln -sf /etc/systemd/system/raphael-usb-gadget.service \
     "$TREE/etc/systemd/system/sysinit.target.wants/raphael-usb-gadget.service"
+
+  # 首次开机扩根（照 alioth-firstboot）。哨兵必须由镜像带进来 ——
+  # 脚本只删不建，没有它 resize2fs 永远不会跑，Steam 会撞上一个 12 GiB 的根。
+  chmod 755 "$TREE/usr/lib/steamos-arm/raphael-firstboot" 2>/dev/null || true
+  mkdir -p "$TREE/var/lib"
+  touch "$TREE/var/lib/raphael-firstboot-pending"
+  ln -sf /etc/systemd/system/raphael-firstboot.service \
+    "$TREE/etc/systemd/system/sysinit.target.wants/raphael-firstboot.service"
   echo "   overlay: $(find "$REPO/scripts/raphael-overlay" -type f | wc -l) 个文件"
 fi
 
