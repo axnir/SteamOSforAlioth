@@ -1,0 +1,17 @@
+[Unit]
+Description=raphael: user-space thermal policy (cap CPU max_freq by temperature)
+# 只依赖 thermal / cpufreq 这两个 sysfs 树，它们在 sysinit 之后就在了。
+After=local-fs.target sysinit.target
+
+[Service]
+Type=exec
+ExecStart=/usr/lib/steamos-arm/raphael-thermal
+# 退出时必须走 SIGTERM，让脚本把 scaling_max_freq 写回原值再走。被 SIGKILL
+# 掉的话 CPU 会一直停在降档频率上，而且没有任何症状 —— 和 game-tune 同理。
+KillSignal=SIGTERM
+TimeoutStopSec=10
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

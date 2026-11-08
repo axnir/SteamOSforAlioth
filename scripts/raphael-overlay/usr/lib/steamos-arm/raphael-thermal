@@ -1,0 +1,252 @@
+#!/usr/bin/env bash
+# raphael 的用户态温控守护：温度分档压 CPU 的**上限频率**，凉下来再放回去。
+#
+# 为什么需要它（2026-11-08 真机实测，不是推测）：
+#
+#   thermal_zone5 (cluster0)  trip_point_0 = hot @ 90 °C
+#                             trip_point_1 = critical @ 110 °C
+#   thermal_zone5/ 下没有任何 cdev* 条目；cooling_device0..3（cpu0/cpu4/cpu7
+#   三簇 cpufreq + GPU devfreq）一个都没被绑定。
+#
+# 也就是说内核在 90 °C 之前**一次都不降频**，90 °C 只是发个 hot 通知，110 °C
+# 直接关机。Android 那边是 thermal-engine 按外壳温度（约 42 °C）持续压频，
+# 移植过来没有那个守护，SoC 就一直是「能跑多快跑多快」：停在 Steam UI、没开
+# 游戏、35% CPU 负载，cluster0 79.9 °C / cpu5-bottom 81.8 °C。
+#
+# 为什么写 scaling_max_freq，而不是像 game-tune 那样改 governor：
+#
+#   1. 两者不打架。game-tune 只写 scaling_governor 和 GPU 的 min/max，这一支
+#      只写 CPU 的 max。同一个属性两个写者，最后一定是「谁最后写谁赢」，而
+#      两边都不知道对方的存在。
+#   2. governor 是「怎么选频」，max_freq 是「能选到多高」。压上限对
+#      schedutil/performance 都成立，所以游戏里 game-tune 切到 performance
+#      之后，这里照样限得住。
+#
+# GPU 不归它管。game-tune 在游戏里把 min_freq 顶到 max_freq，这边再动 max_freq
+# 会让两边互相把对方的设定夹掉；GPU 的散热在游戏里由 game-tune 的进入/退出
+# 天然限制，待机时它本来就停在 257 MHz。
+#
+# 原值快照落 /run（tmpfs，一次开机内有效），不从当前值反推：服务
+# Restart=on-failure 重启时，正被压着的档位会被当成「原值」，从此再也放不回去。
+# 这和 game-tune 是同一个坑，处理方式也一样。
+#
+# 日志一律 ASCII：这些行在串口 journal 里中文会被打成 ???，看不出是哪一条。
+set -uo pipefail
+
+CPUFREQ_ROOT="${RAPHAEL_THERMAL_CPUFREQ:-/sys/devices/system/cpu/cpufreq}"
+THERMAL_ROOT="${RAPHAEL_THERMAL_ROOT:-/sys/class/thermal}"
+BATT="${RAPHAEL_THERMAL_BATTERY:-/sys/class/power_supply/battery}"
+SNAP_FILE="${RAPHAEL_THERMAL_SNAP:-/run/raphael-thermal.orig}"
+INTERVAL="${RAPHAEL_THERMAL_INTERVAL:-5}"
+# 充电时把阈值整体下移这么多（毫摄氏度）。充电本身在发热，同样的 CPU 负载
+# 会让电池和外壳更烫，所以早一点开始压。
+CHARGE_SHIFT="${RAPHAEL_THERMAL_CHARGE_SHIFT:-3000}"
+# 断言脚本用：给一个固定温度（毫摄氏度），跳过读传感器。
+FIXED_TEMP="${RAPHAEL_THERMAL_TEMP:-}"
+
+log() { echo "raphael-thermal: $*" >&2; }
+
+# 档位 0 是「原值」。enter 是升到该档的门槛，exit 是退回下一档的门槛；两个
+# 值分开是为了迟滞 —— 只有一个门槛时，温度贴着它上下抖，sysfs 会被每 5 秒
+# 写一次，而每次写都可能触发一次完整的调频决策。
+TIER_ENTER=(0 78000 84000 88000)
+TIER_EXIT=(0 72000 79000 84000)
+# 每档的 CPU 上限（kHz）。取值都落在真机的 scaling_available_frequencies
+# 里：policy0 300000..1785600、policy4 710400..2419200、policy7 825600..2841600。
+TIER_CAP0=(0 1555200 1305600 1113600)
+TIER_CAP4=(0 1920000 1612800 1401600)
+TIER_CAP7=(0 2131200 1804800 1497600)
+TIER_NAME=("original" "warm" "hot" "critical")
+
+# 参与判断的传感器：外壳那侧的 *-bottom 加 cluster0。type 在真机上是
+# cluster0-thermal / cpu4-bottom-thermal ... / gpu-top-thermal。
+pick_zones() {
+  local z t
+  for z in "$THERMAL_ROOT"/thermal_zone*; do
+    [[ -r "$z/temp" ]] || continue
+    t="$(cat "$z/type" 2>/dev/null)" || continue
+    case "$t" in
+      *-bottom-thermal|cluster0-thermal) printf '%s\n' "$z/temp" ;;
+    esac
+  done
+}
+
+ZONES=()
+while IFS= read -r z; do ZONES+=("$z"); done < <(pick_zones)
+[[ ${#ZONES[@]} -gt 0 ]] || log "warn: no *-bottom-thermal/cluster0 zone found under $THERMAL_ROOT"
+
+hottest() {
+  local f t max=0
+  if [[ -n "$FIXED_TEMP" ]]; then printf '%s\n' "$FIXED_TEMP"; return 0; fi
+  for f in "${ZONES[@]}"; do
+    t="$(cat "$f" 2>/dev/null)" || continue
+    [[ "$t" =~ ^[0-9]+$ ]] || continue
+    (( t > max )) && max="$t"
+  done
+  printf '%s\n' "$max"
+}
+
+charging() {
+  [[ "$(cat "$BATT/status" 2>/dev/null)" == Charging ]]
+}
+
+declare -A ORIG=()
+
+load_snapshot() {
+  local name val
+  [[ -s "$SNAP_FILE" ]] || return 1
+  while read -r name val; do
+    [[ -n "$name" && -n "$val" ]] && ORIG["$name"]="$val"
+  done <"$SNAP_FILE"
+  [[ ${#ORIG[@]} -gt 0 ]]
+}
+
+snapshot() {
+  local d name
+  if load_snapshot; then
+    log "reusing recorded originals from $SNAP_FILE"
+    return 0
+  fi
+  for d in "$CPUFREQ_ROOT"/policy*; do
+    [[ -r "$d/scaling_max_freq" ]] || continue
+    name="$(basename "$d")"
+    ORIG["$name"]="$(cat "$d/scaling_max_freq" 2>/dev/null)"
+  done
+  : >"$SNAP_FILE" 2>/dev/null || log "warn: cannot write $SNAP_FILE (restart would lose the originals)"
+  for name in "${!ORIG[@]}"; do printf '%s %s\n' "$name" "${ORIG[$name]}" >>"$SNAP_FILE" 2>/dev/null; done
+  log "originals: $(for name in $(printf '%s\n' "${!ORIG[@]}" | sort); do printf '%s=%s ' "$name" "${ORIG[$name]}"; done)"
+}
+
+# available_frequencies 里挑 ≤ cap 的最高一档。挑不到就退回原值 —— 宁可不管，
+# 也不要把 CPU 钉到一个它不存在的频率上。
+pick_freq() {
+  local d="$1" cap="$2" fallback="$3" f best=""
+  for f in $(cat "$d/scaling_available_frequencies" 2>/dev/null); do
+    [[ "$f" =~ ^[0-9]+$ ]] || continue
+    (( f <= cap )) || continue
+    if [[ -z "$best" ]] || (( f > best )); then best="$f"; fi
+  done
+  printf '%s\n' "${best:-$fallback}"
+}
+
+write_freq() { # <file> <value> <label>
+  local f="$1" v="$2" label="$3" cur
+  cur="$(cat "$f" 2>/dev/null)"
+  [[ "$cur" == "$v" ]] && return 0
+  if ! printf '%s\n' "$v" >"$f" 2>/dev/null; then
+    log "failed to write $v to $label (currently $cur)"
+    return 1
+  fi
+  return 0
+}
+
+apply_tier() { # <tier>
+  local tier="$1" d name orig cap target changed=0
+  for d in "$CPUFREQ_ROOT"/policy*; do
+    [[ -e "$d/scaling_max_freq" ]] || continue
+    name="$(basename "$d")"
+    orig="${ORIG[$name]:-}"
+    [[ -n "$orig" ]] || continue
+    if [[ "$tier" == 0 ]]; then
+      target="$orig"
+    else
+      case "$name" in
+        policy0) cap="${TIER_CAP0[$tier]}" ;;
+        policy4) cap="${TIER_CAP4[$tier]}" ;;
+        policy7) cap="${TIER_CAP7[$tier]}" ;;
+        *) cap=0 ;;
+      esac
+      if [[ "$cap" == 0 ]]; then target="$orig"; else target="$(pick_freq "$d" "$cap" "$orig")"; fi
+      # 不往上抬：原值本来就比这一档低的时候（比如有人在别处限过频），
+      # 保持更低的那个。
+      if [[ -n "$orig" ]] && (( target > orig )); then target="$orig"; fi
+    fi
+    write_freq "$d/scaling_max_freq" "$target" "$name" && changed=$((changed + 1))
+  done
+  log "tier $tier (${TIER_NAME[$tier]}) applied to $changed policies"
+}
+
+# 给定当前温度和档位，算下一步该在哪个档 —— 一次只动一档。温度瞬间冲高时
+# 一步压到底，会立刻掉到低档再弹回来，那两下抖动比高温本身更糟。
+next_tier() { # <tier> <temp>
+  local tier="$1" t="$2" up
+  up=$((tier + 1))
+  # 充电时 shift 为正，门槛整体**下移** —— 同样的温度更早开始压。
+  if (( up < ${#TIER_ENTER[@]} )) && (( t >= TIER_ENTER[up] - tshift )); then
+    printf '%s\n' "$up"
+    return 0
+  fi
+  # 降档同样一档一档退；TIER_EXIT 的迟滞保证不会贴着门槛来回跳。
+  if (( tier > 0 )) && (( t < TIER_EXIT[tier] - tshift )); then
+    printf '%s\n' "$((tier - 1))"
+    return 0
+  fi
+  printf '%s\n' "$tier"
+}
+
+# 反复调用 next_tier 直到稳定。--once 用它，一轮就落到该落的档；守护循环里
+# 则故意只用 next_tier 走一小步。
+settle_tier() { # <tier> <temp>
+  local tier="$1" t="$2" new guard=0
+  while (( guard < 8 )); do
+    guard=$((guard + 1))
+    new="$(next_tier "$tier" "$t")"
+    [[ "$new" == "$tier" ]] && break
+    tier="$new"
+  done
+  printf '%s\n' "$tier"
+}
+
+tshift=0
+refresh_shift() {
+  tshift=0
+  charging && tshift="$CHARGE_SHIFT"
+}
+
+snapshot
+
+if [[ "${1:-}" == --status ]]; then
+  refresh_shift
+  t="$(hottest)"
+  log "hottest=${t}mC shift=${tshift}mC charging=$(charging && echo yes || echo no)"
+  log "zones=${#ZONES[@]}"
+  for d in "$CPUFREQ_ROOT"/policy*; do
+    [[ -r "$d/scaling_max_freq" ]] || continue
+    log "  $(basename "$d") max=$(cat "$d/scaling_max_freq") orig=${ORIG[$(basename "$d")]:-?}"
+  done
+  exit 0
+fi
+
+# 单轮：评估一次、该动就动、退出。断言脚本和手工验证都靠它。
+# 注意它必须排在 trap 之前（同 charge-guard 的 --once 坑：放在 trap 之后
+# 会被 exit 触发的恢复逻辑当场抹掉）。
+if [[ "${1:-}" == --once ]]; then
+  refresh_shift
+  apply_tier "$(settle_tier 0 "$(hottest)")"
+  exit 0
+fi
+
+tier=0
+restore_and_exit() {
+  trap - TERM INT EXIT
+  apply_tier 0
+  rm -f "$SNAP_FILE"
+  exit 0
+}
+trap restore_and_exit TERM INT EXIT
+
+log "start: ${#ZONES[@]} zones, interval ${INTERVAL}s, enter $(printf '%s ' "${TIER_ENTER[@]:1}")mC (+${CHARGE_SHIFT}mC while charging)"
+refresh_shift
+tier="$(settle_tier 0 "$(hottest)")"
+apply_tier "$tier"
+while :; do
+  sleep "$INTERVAL"
+  refresh_shift
+  t="$(hottest)"
+  new="$(next_tier "$tier" "$t")"
+  if [[ "$new" != "$tier" ]]; then
+    tier="$new"
+    log "temp ${t}mC -> tier $tier (${TIER_NAME[$tier]}) [shift ${tshift}mC]"
+    apply_tier "$tier"
+  fi
+done
