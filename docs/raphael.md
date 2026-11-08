@@ -2139,3 +2139,117 @@ DropInPaths=/etc/systemd/system/raphael-usb-gadget.service.d/50-qcom.conf
 本次开机、`cat /sys/class/remoteproc/remoteproc1/state` 是不是 `running`、
 `/dev/qcom_rmtfs_mem1` 在不在、最后 `ls /sys/class/net` 有没有 `wlan0`。
 
+
+## 25. WiFi 开机自启通了；域名解析卡死（2026-11-08 19:40）
+
+### 25.1 开机自启：四条判据全绿
+
+19:39 那次开机（关机重启，全程不手工干预）：
+
+```
+$ uptime
+ 19:39:16 up 0 min
+$ cat /sys/class/remoteproc/remoteproc1/state
+running
+$ ls /sys/class/net
+lo  usb0  wlan0
+$ head -4 /var/log/raphael-qcom.log
+[qcom] start Sun Nov  8 07:39:12 PM CST 2026
+[qcom] qcom_rmtfs_mem1 就绪（等了 1s）
+[qcom] started qrtr-ns
+[qcom] modem start requested
+$ tail -2 /var/log/raphael-qcom.log
+[qcom] wlan0 就绪（5s）
+```
+
+`wlan0` 出现后 NetworkManager 自动连上 5G，没有任何手工步骤：
+
+```
+x5g:wlan0:activated
+iw dev wlan0 link  →  SSID: Xiaomi_0A83_5G  freq: 5180.0  signal: -20 dBm
+ip -br addr show wlan0  →  192.168.31.220/24
+iw reg get  →  country CN
+iw dev wlan0 get power_save  →  Power save: off
+```
+
+**§24.9 那个「qcom 栈跑太早」的回归到此收口**：等 `/dev/qcom_rmtfs_mem1`
+（这次只等了 1 秒）再起三件套，modem 就能拿到 EFS，`wlan0` 5 秒出来。
+之前设备上跑的还是旧版脚本，所以第一次重启仍然失败——判据是
+`md5sum /opt/raphael/qcom-setup.sh` 要和仓库一致，别只看「推过了」。
+
+触摸那条 udev 规则也确认生效（`udevadm info --query=property --name=/dev/input/event5`）：
+
+```
+ID_INPUT_TOUCHSCREEN=1
+LIBINPUT_CALIBRATION_MATRIX=0 1 0 -1 0 1
+```
+
+（设备上那份规则文件里多出一行孤立的 `, \`，属性照样生效，但下次推 overlay
+会被仓库版本覆盖成干净的三行，不用管。）
+
+### 25.2 新问题：能 ping 通 IP，但所有域名卡死
+
+同一次开机里紧接着发现：
+
+```
+$ ping -c 2 223.5.5.5      →  2 received, 12 ms          ← 链路/路由正常
+$ ping -c 2 www.qq.com     →  （不返回，一直挂着）        ← 卡在解析
+$ curl https://store.steampowered.com/
+                           →  000，12.00s               ← 同样是解析
+$ cat /etc/resolv.conf
+nameserver 127.0.0.53                                   ← systemd-resolved stub
+```
+
+参考仓库对这件事有明确警告（`work/ref/archlinux-xiaomi-raphael/notes/porting-checklist.md` §12.1）：
+
+> On Arch, `systemd-resolved` is *not* enabled by default and `networkmanager` writes
+> `/etc/resolv.conf` itself, but: if `/etc/resolv.conf` is a regular file, NetworkManager
+> leaves it alone on some configurations; … make it a symlink to the NM-managed path
+
+翻译成现象：`/etc/resolv.conf` 指向 resolved 的 stub，而 NetworkManager 又不在
+`dns=systemd-resolved` 模式 —— 两边都不给上游，`127.0.0.53` 收下查询但转不出去，
+客户端于是**永久等待**（不是快速失败，这点很像「网卡坏了」，其实是 DNS）。
+
+**注意区分**：「解析失败」会立刻报 `Could not resolve host`；「解析卡住」是超时。
+后者才是 resolved 没有上游的指纹。
+
+修法落在 `scripts/raphael-overlay/opt/raphael/fix-dns.sh`（幂等，可直接在设备上跑）：
+
+1. 先打印现场：`readlink -f /etc/resolv.conf`、`resolvectl status` 的上游、
+   `NM dns 模式`、`nslookup www.qq.com 223.5.5.5`（直连 DNS）对比 `getent hosts`（走系统）
+2. 连接上钉死 DNS：`ipv4.dns "223.5.5.5 119.29.29.29"` + `ipv4.ignore-auto-dns yes`
+3. 给 resolved 上游：`/etc/systemd/resolved.conf.d/50-raphael.conf`
+   （`DNS=` / `FallbackDNS=`），并确认 NM 是 `dns=systemd-resolved`；
+   若 resolved 没在跑，就把 `/etc/resolv.conf` 换成实体文件让 NM 自己写
+
+`getent hosts www.qq.com` 从「挂着」变成「一行输出」，就是修好了。
+
+### 25.3 串口控制台的坑：前台命令会把整个 shell 卡死
+
+这次排查里 `ping www.qq.com` 挂住之后，COM3 上**后续所有命令都没有回显**
+（`echo ALIVE` 也没反应），看起来像整机死了。实际上是那条前台命令还占着 tty，
+shell 排在它后面等——设备本身活得好好的（同一时刻 `curl` 的 12 秒超时结果还是回来了）。
+
+**规矩**：往串口发任何可能碰网络的命令，一律加 `timeout`：
+
+```sh
+timeout 5  getent hosts www.qq.com
+timeout 12 curl -s -o /dev/null -w "%{http_code}\n" --max-time 10 https://store.steampowered.com/
+```
+
+`fix-dns.sh` 里每条探测都带了 `timeout`，就是为了不再把控制台搞哑。
+
+另一个观察：那次 `[Service]` 在 `systemctl cat raphael-qrtr-ns` 里看着像和上一行粘连，
+但该 unit `ActiveState=active`、`ConditionResult=yes`，且仓库里的文件是干净的 ——
+先用 `md5sum` 对齐仓库与设备上的文件，再判断是不是真的粘连，不要凭串口回显的形状下结论。
+
+### 25.4 剩下的活
+
+| 项 | 状态 | 下一步 |
+|---|---|---|
+| WiFi 开机自启（含 5G） | ✅ 已验 | 无 |
+| power save 持久化 | ✅ 已验 | 无 |
+| 触摸旋转矩阵 | 属性已生效 | 需要在 Game Mode 里实际点一下确认方向 |
+| 域名解析 | ❌ 卡死 | 跑 `sh /opt/raphael/fix-dns.sh`，看验收三行 |
+| Steam 登录（QR 空） | 暂停 | 等网络稳定后再看 `Try another CM` |
+| MAC 随机 | 未处理 | `nmcli con mod x5g wifi.cloned-mac-address <MAC>` |
