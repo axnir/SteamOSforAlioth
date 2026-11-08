@@ -2406,3 +2406,130 @@ DTS 里 FE（`mm1-dai-link`）只有 `cpu`，FE→BE 是运行时靠 ASoC 的 mi
 3. **UCM 还是要写**。现在靠「裸 PCM + 手动 mixer」能出声，但没有音量硬件控制、
    没有耳机插拔切换、没有多设备 profile。厂商 `alsa-xiaomi-raphael.deb` 的五个
    文件（见 §26.1）拿到就一步到位；拿不到就按 DTS 手写一份最小 UCM。
+
+## 28. 三个物理按键：电源键已修，音量键走 InputPlumber（2026-11-08 20:40）
+
+### 28.1 三个键在三个不同的设备上
+
+真机 `/proc/bus/input/devices` 实测，和 alioth 完全同构：
+
+| 节点 | event | keycode | 物理键 | 归属 |
+|---|---|---|---|---|
+| `gpio-keys` | event0 | `KEY_VOLUMEUP` | 音量加（pm8150 gpio6，DTS 的 `vol_up_n`） | InputPlumber |
+| `pm8941_resin` | event3 | `KEY_VOLUMEDOWN` | 音量减（pon@800 旁边的 resin） | InputPlumber |
+| `pm8941_pwrkey` | event2 | `KEY_POWER` | 电源 | `steamos-powerbuttond` |
+
+`EV=3`（EV_SYN 之外只有 EV_KEY）、`PROP=0`，没有 `INPUT_PROP_DIRECT`，
+所以它们不会被 libinput 当成指针设备。驱动层没问题，缺的一直是「谁来响应」。
+
+### 28.2 电源键：镜像给了程序，没给 unit（已修）
+
+`/usr/lib/hwsupport/steamos-powerbuttond` 在（11808 字节，可执行），但
+`systemctl status steamos-powerbuttond` 是 `not-found` —— **没有任何 unit 启动它**。
+
+而且镜像自带的 `/usr/lib/udev/rules.d/70-steamos-power-button.rules` 只**消费**属性：
+
+```
+SUBSYSTEM=="input", KERNEL=="event*", ENV{STEAMOS_POWER_BUTTON}=="1", MODE="0660", TAG+="uaccess"
+```
+
+没有任何规则去设置 `STEAMOS_POWER_BUTTON`。守护进程的筛选逻辑全在 strings 里那三个串
+（`event*` / `input` / `STEAMOS_POWER_BUTTON`），找不到带属性的设备就**静默 exit 0**：
+没有报错、journal 里一行都没有。alioth 2026-10-23 踩过同一个坑。
+
+三样东西补上：
+
+| 文件 | 作用 |
+|---|---|
+| `/etc/udev/rules.d/99-raphael-keys.rules` | `ATTRS{name}=="pm8941_pwrkey"` → `ENV{STEAMOS_POWER_BUTTON}="1"` |
+| `/etc/systemd/user/steamos-powerbuttond.service` | 抄 sm8250-overlay，`PartOf=gamescope-session.target` |
+| `/etc/systemd/user/gamescope-session.target.d/99-zz-raphael-powerbuttond.conf` | `Wants=`，把 daemon 拉进 Game Mode 会话 |
+
+**`zz` 不能省**：systemd 按文件名顺序合并 drop-in，`steamos-overlay` 的 `99-odin.conf`
+带一个空 `Wants=` 会把排在它前面的 drop-in 清空，症状就是「电源键在 Game Mode 里没反应」。
+alioth 当年用 `99-alioth-...` 就中过，靠 sm8250-overlay 的 `99-sm8250-...` 排在其后兜住的。
+
+已经在真机验证过的部分：
+
+```
+$ udevadm info --query=property --name=/dev/input/event2 | grep STEAMOS
+STEAMOS_POWER_BUTTON=1
+$ udevadm info --query=property --name=/dev/input/event3 | grep STEAMOS   # 音量下不该有
+（空）
+$ systemctl --user show steamos-powerbuttond -p ActiveState -p ExecMainPID
+ActiveState=active
+ExecMainPID=37386
+```
+
+所以音量下不会被误当成电源键，`restart` 也不再是「静默退出 0」。
+
+### 28.3 音量键：选方案 B（Steam 键 + 快捷菜单）
+
+镜像里**完全没有 InputPlumber**：`/usr/bin/inputplumber` 不存在、
+`systemctl is-enabled inputplumber` 是 `not-found`，只有 Valve 的
+`90-steam-inputplumber.rules`（`SUBSYSTEM=="dmi", ENV{USE_INPUTPLUMBER}=="1"`，
+手机上没有 DMI，永远不会触发）。alioth 也是单独装的。
+
+两个方案的取舍（采 B）：
+
+- **A 保留硬件音量**：写个小守护监听那两个 keycode 调 `wpctl`。好处是音量一键直达；
+  坏处是 Deck UI 的 **Steam 键和快捷菜单在纯触摸下没有可靠入口**，游戏全屏捕获触摸时尤其如此。
+- **B 照 alioth**：音量上 → `Guide`（Steam 菜单），音量下 → `QuickAccess`（QAM）。
+  代价是失去硬件音量，但快捷菜单里有音量滑条，两次按键而不是一次。
+
+配置两份，结构照抄 alioth：
+
+```
+etc/inputplumber/devices.d/02-xiaomi-raphael.yaml    匹配 DT model "Xiaomi Redmi K20 Pro"
+etc/inputplumber/capability_maps.d/raphael_keys.yaml VOLUMEUP→Guide, VOLUMEDOWN→QuickAccess
+```
+
+`02-xiaomi-raphael.yaml` 里 **`pm8941_pwrkey` 故意不列为 source**：它归
+`steamos-powerbuttond`，被 InputPlumber grab 掉的话待机和电源菜单就没了。
+蓝牙手柄也不列 —— InputPlumber 自带 Xbox/DualSense/8BitDo 的 profile，
+设备专属的 composite 去抢只会用更差的实现覆盖能用的。
+
+### 28.4 libiio：一条比想象长的依赖链
+
+InputPlumber 的 release 二进制 `NEEDED` 里有 `libiio.so.0`（即使没有 IMU 也链了），
+而本镜像一个 libiio 都没有。试过的路和结论：
+
+| 路线 | 结果 |
+|---|---|
+| dnf / 从 Fedora 43 拿 rpm | **不能用**。fc43 的 libiio 0.26 NEED `libavahi-client.so.3`、`libavahi-common.so.3`、`libusb-1.0.so.0`、`libxml2.so.2` 且按 glibc **2.42** 编；设备是 **2.39**，补依赖也过不了版本符号 |
+| 容器里交叉编译（`gcc-aarch64-linux-gnu` + cmake） | **不能跑**。这台机器的 wslc 容器**没有外网**：`curl` 镜像站是 `000`，连 `http://223.5.5.5/` 也是 `000`。`dnf` 因此报 `No match for argument: cmake`（仓库元数据根本没下来，tar/gzip 显示「已安装」只是因为本地 rpmdb）。顺带一个坑：容器自带的 `fedora.repo` 用 metalink，而我们写的 `fedora-tuna.repo` **按字母顺序排在它前面**，`[fedora]` 段会被后者覆盖 —— 要 `rm -f /etc/yum.repos.d/*.repo` 再写 |
+| Debian bookworm **arm64**（libiio0 0.24-4） | **采用**。glibc 只要求 **2.33**（设备 2.39 满足），NEED 的是 `libavahi-client.so.3` / `libavahi-common.so.3`（glibc 2.17）/ `libusb-1.0.so.0` / `libxml2.so.2` / libc |
+
+libiio 用到的 18 个符号（从二进制里抓的）全是 0.x 的老 API
+（`iio_create_default_context`、`iio_device_attr_read_double` …），0.24 全有。
+
+**这三个库不放 `/usr/lib`**，放 `/usr/lib/raphael-inputplumber/`，unit 里设
+`Environment="LD_LIBRARY_PATH=..."`。理由：SteamOS 自己很可能带一份 `libavahi`，
+为了一个守护进程去覆盖系统库是不划算的交换，放在独立目录既不会遮蔽系统库，
+卸载时删一个目录就干净了。
+
+### 28.5 状态
+
+| 项 | 状态 |
+|---|---|
+| 三个键的驱动与 event 设备 | ✅ 实测 |
+| 电源键 udev 属性 | ✅ 实测 `event2` 有、`event3` 无 |
+| 电源键 daemon | ✅ `active`，待按一下确认待机/电源菜单 |
+| 音量键配置（yaml + capability map） | ✅ 已写 |
+| `inputplumber.service` | ✅ 已写（`Type=simple`，不是上游的 `Type=dbus`：BusName 不出现时 systemd 会报 "Failed to get unit for bus name" 直接停） |
+| 库与二进制部署 | ⏸ 设备 20:47 断开（串口、WiFi 同时消失），部署脚本已就绪 |
+
+部署脚本 `scripts/raphael-deploy-inputplumber.ps1`：小文件走串口 base64，
+9.5 MB 的二进制和三个库走 USB NCM + netcat（`169.254.240.121`）——
+base64 过 115200 串口只有约 1 KB/s，9.5 MB 要两个半小时。
+
+验收（设备回来后）：
+
+```sh
+ls -l /usr/lib/raphael-inputplumber/     # 三个 .so
+LD_LIBRARY_PATH=/usr/lib/raphael-inputplumber ldd /usr/bin/inputplumber | grep "not found"
+systemctl is-active inputplumber
+```
+
+然后按音量加 → Steam 菜单，音量减 → 快捷菜单。反了就把
+`raphael_keys.yaml` 里两条 mapping 的 keycode 对调。

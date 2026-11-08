@@ -1,0 +1,19 @@
+# Xiaomi Redmi K20 Pro (raphael, SM8150) 的三个物理按键。
+#
+# 真机 /proc/bus/input/devices 实测（2026-11-08）：
+#
+#   gpio-keys      event0  KEY_VOLUMEUP    pm8150 gpio6，DTS 里的 vol_up_n
+#   pm8941_pwrkey  event2  KEY_POWER       pm8150 pon@800
+#   pm8941_resin   event3  KEY_VOLUMEDOWN  pon@800 旁边的 resin
+#
+# 电源键：镜像自带的 70-steamos-power-button.rules 只「消费」STEAMOS_POWER_BUTTON
+# 属性（给它 0660 + uaccess），**没有任何规则去设置这个属性**。
+# steamos-powerbuttond 的匹配逻辑全在 strings 里那三个串（event* / input /
+# STEAMOS_POWER_BUTTON）：它枚举一圈 event 设备，没有带属性的就静默 exit 0 ——
+# 没有报错、journal 里一行都没有，表现是电源键既不息屏也不出电源菜单。
+# alioth 2026-10-23 踩过同一个坑，这里是同一条修法。
+#
+# 只匹配 pm8941_pwrkey 一个，因为 pm8941_resin 就在同一个 pon@800 节点下面、
+# 上报的是 KEY_VOLUMEDOWN，按名字区分才不会把音量下也变成电源键。
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="pm8941_pwrkey", \
+  ENV{STEAMOS_POWER_BUTTON}="1"

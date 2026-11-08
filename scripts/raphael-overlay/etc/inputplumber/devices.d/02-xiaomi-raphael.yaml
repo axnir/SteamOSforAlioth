@@ -1,0 +1,56 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/ShadowBlip/InputPlumber/main/rootfs/usr/share/inputplumber/schema/composite_device_v1.json
+# Xiaomi Redmi K20 Pro (raphael, SM8150) -> virtual Steam Deck controller.
+#
+# Same arrangement as alioth (alioth-overlay/etc/inputplumber/devices.d/02-xiaomi-alioth.yaml),
+# for the same reason: this phone has no sticks, no shoulders, no face buttons.
+# What it has is a touchscreen (Deck UI handles that natively) and exactly three
+# physical buttons. Deck UI has no touch-only route to the Steam menu or the
+# Quick Access menu, so the two volume keys are spent on those.
+#
+# Where the keys live, measured on the device 2026-11-08 (/proc/bus/input/devices):
+#   gpio-keys      event0  KEY_VOLUMEUP    pm8150 gpio6, vol_up_n in the DTS
+#   pm8941_resin   event3  KEY_VOLUMEDOWN  the power-key block next to pwrkey
+#   pm8941_pwrkey  event2  KEY_POWER       NOT a source here, see below
+#
+# pm8941_pwrkey is deliberately absent: that key belongs to steamos-powerbuttond
+# (see etc/udev/rules.d/99-raphael-keys.rules and the 99-zz-raphael-powerbuttond
+# drop-in). Grabbing it as a gamepad source would take suspend/resume and the
+# power menu away from it.
+#
+# Bluetooth gamepads are also deliberately absent. InputPlumber already ships
+# Xbox / DualSense / 8BitDo profiles that target deck-uhid; a device-specific
+# composite claiming them would override working upstream handling with a
+# worse copy.
+version: 1
+kind: CompositeDevice
+name: Xiaomi Redmi K20 Pro
+
+matches:
+  - udev:
+      sys_path: /sys/firmware/devicetree/base
+      attributes:
+        - name: model
+          value: Xiaomi Redmi K20 Pro
+
+single_source: false
+
+source_devices:
+  - group: gamepad
+    evdev:
+      name: gpio-keys
+      phys_path: gpio-keys/input0
+      handler: event*
+    capability_map_id: raphael_keys
+  - group: gamepad
+    evdev:
+      name: pm8941_resin
+      phys_path: pm8941_resin/input0
+      handler: event*
+    capability_map_id: raphael_keys
+
+options:
+  auto_manage: true
+
+target_devices:
+  - deck-uhid
+  - keyboard

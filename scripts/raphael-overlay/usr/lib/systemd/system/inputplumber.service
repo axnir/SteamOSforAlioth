@@ -1,0 +1,38 @@
+# InputPlumber for raphael.
+#
+# The upstream release tarball ships this unit, but we only carry the binary
+# (external-and-mods/InputPlumber/inputplumber-0.81.0-konkr — the 0.81.0 build
+# with the AYANEO haptics polling fix), so it is reproduced here.
+#
+# Type=simple rather than the upstream Type=dbus: a BusName= that never appears
+# makes systemd stop the unit with "Failed to get unit for bus name". The daemon
+# runs in the foreground either way.
+#
+# LD_LIBRARY_PATH: InputPlumber NEEDs libiio.so.0, which this rootfs does not
+# have, and Debian's libiio in turn NEEDs libavahi-client/libavahi-common. Those
+# three live in /usr/lib/raphael-inputplumber instead of /usr/lib so that we
+# cannot shadow a system library of the same name (SteamOS may well ship its own
+# libavahi, and replacing it to satisfy one daemon would be a bad trade).
+#
+# Why this exists at all: Valve's Frame image ships the udev rule
+# (90-steam-inputplumber.rules) and nothing else. Without the daemon the two
+# volume keys on this phone reach nobody -- see
+# etc/inputplumber/devices.d/02-xiaomi-raphael.yaml.
+[Unit]
+Description=InputPlumber (raphael: volume keys as Steam / Quick Access)
+Documentation=https://github.com/ShadowBlip/InputPlumber
+After=systemd-udevd.service
+StartLimitIntervalSec=60
+StartLimitBurst=4
+
+[Service]
+Type=simple
+Environment="LD_LIBRARY_PATH=/usr/lib/raphael-inputplumber"
+ExecStart=/usr/bin/inputplumber
+Restart=on-failure
+RestartSec=1
+TimeoutStopSec=5
+Slice=system.slice
+
+[Install]
+WantedBy=multi-user.target

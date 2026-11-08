@@ -1,0 +1,19 @@
+# raphael: the image ships /usr/lib/hwsupport/steamos-powerbuttond but no unit
+# for it on non-Valve hardware. The Frame's own unit is Requisite=steamvr.service,
+# which is masked on this image, so with it the PMIC power key would do nothing
+# in Game Mode.
+#
+# Copied from sm8250-overlay (same image, same missing-unit situation); started
+# by gamescope-session.target.d/99-zz-raphael-powerbuttond.conf.
+#
+# It is a *user* unit on purpose: it belongs to the gamescope session, needs the
+# user session bus for the power menu, and must not run before Steam exists.
+[Unit]
+Description=Power Button daemon for SteamOS (raphael)
+PartOf=gamescope-session.target
+After=gamescope-session.service
+
+[Service]
+ExecStart=/usr/lib/hwsupport/steamos-powerbuttond
+Restart=on-failure
+Slice=session.slice
