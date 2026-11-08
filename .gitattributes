@@ -6,3 +6,11 @@ external-and-mods/lsfg-vk/** linguist-vendored
 external-and-mods/kernel/vendor/** linguist-vendored
 external-and-mods/kernel/reference/** linguist-vendored
 external-and-mods/kernel/device-tree/** linguist-vendored
+
+# 设备端文件必须是 LF：core.autocrlf=true 会把 checkout 出来的 shebang 写成
+# "#!/bin/sh\r"，Linux 侧执行时报 not found / 126，而且报错位置跟真因完全不像
+# （sddm-helper 以 126 退出、图形会话静默不起来就是这么来的）。
+# 这条只管工作区，仓库里存的本来就是 LF。
+scripts/raphael-overlay/** text eol=lf
+scripts/alioth-overlay/** text eol=lf
+*.sh text eol=lf

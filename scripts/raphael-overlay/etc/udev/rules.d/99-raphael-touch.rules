@@ -1,0 +1,18 @@
+# raphael 的面板是原生 1080x2340 竖屏，gamescope 用 shader 旋转成 2340x1080。
+# --force-composition-rotation 只决定「旋转在哪一层做」，不设角度；gamescope
+# 不知道面板朝向，也就不会变换触摸坐标。结果就是画面转了、触摸还停在竖屏
+# 坐标系里，手指落点和看到的位置差 90 度，表现为「点不中 / 点不动」。
+#
+# 这条规则与 alioth 那条完全一致：
+#   alioth-overlay/usr/lib/udev/rules.d/70-alioth.rules:19
+#   docs/alioth.md §「其余已修的真机问题」第 1 行
+#
+# 矩阵 0 1 0 -1 0 1 把归一化坐标 (nx, ny) 映射成 (ny, 1-nx)，即顺时针补 90 度。
+# 实测若是镜像（左右或上下反），换成 0 -1 1 1 0 0（映射成 1-ny, nx）。
+#
+# 设备名取自 /proc/bus/input/devices 的 `N: Name="goodix_ts"`。
+# 驱动是否真的和控制器说上话看 PID:9886 与 stage2 init success（docs/raphael.md §20），
+# 不是看有没有 event 节点。
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="goodix_ts", \
+  ENV{ID_INPUT}="1", ENV{ID_INPUT_TOUCHSCREEN}="1", TAG+="seat", TAG+="uaccess", \
+  ENV{LIBINPUT_CALIBRATION_MATRIX}="0 1 0 -1 0 1"

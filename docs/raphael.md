@@ -1493,6 +1493,10 @@ Windows：scripts/raphael-push-net.ps1 -LocalFile <文件> -RemotePath <路径>
 本来就是 403）——证明链路可用。Steam 要吃到这个代理，环境变量得进 PAM 会话
 （`/etc/environment`），`~/.config/environment.d/` 那一套在 sddm 会话里不生效。
 
+> **⚠️ 这条结论已在 §22.4 被推翻，别再照做。** 代理能让 Steam **下载更新**，
+> 但它会掐死 CM 的登录握手（`Try another CM` → `ConnectionDisconnected`）。
+> 而且有了 WiFi（§24）之后完全不需要它。`usb0` 现在只当串口调试通道。
+
 ### 21.7 待办（按依赖排序）
 
 1. 阶段 0 验证 `qcom_pd_mapper` + `wlanmdsp.mbn` 位置 → 是否出现 WLFW / wlan0
@@ -1628,12 +1632,10 @@ XDG_RUNTIME_DIR=/run/user/1000 su steamos -s /bin/bash -c \
 3. **登录**：用 Steam 手机 App 的 Steam Guard 扫码。**这一步不需要在手机上点任何东西**，
    所以触摸没修好也不影响登录。
 
-4. **触摸**（仍未解决）：`gamescope` 确实打开了 `/dev/input/event5`，
-   `goodix_ts` 的 `PROP=2`（INPUT_PROP_DIRECT）、`EV=b` 都正常。
-   所以问题在坐标变换 / 触摸模式，不在驱动。可疑点：
-   - `--force-composition-rotation` 把 1080×2340 转成横屏，触摸坐标没跟着转
-   - `--default-touch-mode 4` 的实际语义要对照 gamescope 源码确认
-   - udev 侧可能要 `LIBINPUT_CALIBRATION_MATRIX`（见 §20.4）
+4. **触摸**：**已定位，见 §24.6**。根因是 udev 里缺 `LIBINPUT_CALIBRATION_MATRIX`
+   —— 画面被 `--force-composition-rotation` 在 shader 里转了 90°，输入坐标没跟着转。
+   修法照抄 alioth，已写进 `scripts/raphael-overlay/etc/udev/rules.d/99-raphael-touch.rules`。
+   本节下面列的那些可疑点里，`--default-touch-mode 4` 是**合法值**（passthrough），不是问题。
 
 5. 登录之后再回到 §21.7 的 WiFi 与固化清单。
 
@@ -1660,6 +1662,11 @@ XDG_RUNTIME_DIR=/run/user/1000 su steamos -s /bin/bash -c \
   `systemctl restart sddm` 安全（后者会带走 ttyGS0 上的串口 shell）。
 
 ## 23. Modem 稳了、WLFW 有了；Wi-Fi 卡在 WLAN 处理器的 SRPLL（2026-11-08 13:30）
+
+> **⚠️ 本节的「卡在 SRPLL」已被 §24 解决，只作历史记录读。** 真因是 DTB 缺
+> `qcom,calibration-variant`，而当时 DTB 内嵌在内核里、改一次要重编重刷，所以没能验证。
+> 现在 DTB 是 ESP 外部加载的，换一次 5 分钟。另外本节 23.2 说「tqftpserv 开机不自启、
+> 根因未查」也已经有答案了 —— 是 unit 文件被写坏（§24.4），不是启动顺序。
 
 本节记录 12:00–13:30 这一轮。**结论：从「根本没有网卡」推进到「WLAN 处理器启动后自己崩」**，
 下面的每条都是设备上的实测，不是推测。
@@ -1788,3 +1795,269 @@ ref clock 有没有真的使能，以及我们手写的 raphael DTS 与作者预
   `wlanmdsp.mbn` 覆盖成了 0 字节。正确做法是先传 `/tmp`、校验 md5、再 `cp`。
 - 重启后 `usb0` **只保留 `172.16.42.1/24`**，`169.254.240.121/16` 是手工加的，
   必须重新 `ip addr add`，否则 NCM 推送全部失败。
+
+## 24. 事故恢复、DTB 热替换、WiFi 打通，以及一个会毁掉所有 unit 的隐性坑（2026-11-08 16:20）
+
+§23 的「WiFi 卡在 SRPLL」**已经过期**：这一节之后 WiFi 通了，`wlan0` 能连 2.4G 出网。
+同时这一节记录一次真实事故（boot 分区被覆盖）和一个必须永久遵守的传输纪律。
+
+### 24.1 事故：`/dev/sde49` 被 `dd` 写成了调试内核
+
+14:26，另一个 agent 编了一版含 `qcom,calibration-variant` 的 `boot-debug.img`（104 MB），
+然后执行了：
+
+```sh
+dd if=/tmp/boot-debug.img of=/dev/sde49 bs=4M conv=fsync
+```
+
+**raphael 的 `sde49`（boot 分区）里放的是 U-Boot，不是内核。** 内核在 ESP（`sda29`/cache）
+的 `linux.efi` 里。这一写直接把引导器覆盖掉，设备只能停在 ABL fastboot，串口也没了。
+
+**恢复步骤（已实测）**：
+
+```
+fastboot flash boot work/uboot/u-boot.img   # sha256 ba6548b5…b992，先核对
+fastboot erase dtbo                        # ABL 的前提：dtbo 有残留 overlay 就整体拒绝
+fastboot reboot
+```
+
+注意两点：
+
+- ABL 的 fastboot 链接会**瞬断**，`flash` 报错不一定是没写进去，重试 2–3 次通常就成功；
+  判据是之后 `fastboot getvar product` 还能回 `raphael`。
+- 写 boot 之后**必须** `erase dtbo`，否则 ABL 拒绝启动我们的镜像（§14 记过）。
+
+如果要测一个新内核，正确做法是 `fastboot boot <img>` 下到 DRAM 直接跑，**不写任何分区**。
+
+### 24.2 DTB 是 ESP 外部加载的 —— 换 DTB 不用刷机
+
+这是这一轮最有价值的结构性发现。ESP 上的 `loader/entries/steamos.conf`：
+
+```
+linux      /linux.efi
+initrd     /initramfs
+devicetree /dtbs/qcom/sm8150-xiaomi-raphael.dtb
+```
+
+DTB **不内嵌在 `linux.efi` 里**，由 systemd-boot 单独加载。所以换 DTB 的完整流程是：
+
+```sh
+losetup -b 512 -f --show /dev/sda29     # 直接 mount 会 can't read superblock，必须 512 字节扇区
+mount /dev/loopX /efi
+cp /efi/dtbs/qcom/sm8150-xiaomi-raphael.dtb{,.bak}
+cp /tmp/new.dtb /efi/dtbs/qcom/sm8150-xiaomi-raphael.dtb
+umount /efi && reboot
+```
+
+没有重编内核、没有刷分区、没用 fastboot。**这条路以后任何 DTS 改动都走它。**
+
+### 24.3 WiFi 从 0 到 `wlan0`：三件事缺一不可
+
+| # | 是什么 | 缺了会怎样 |
+|---|---|---|
+| 1 | DTB 里 `qcom,calibration-variant = "Xiaomi_raphael"` | `board_file ... crc32 00000000`，没选到 BDF，固件拿空板级数据启动 → `ccpm_hw_clk.c:666: SRPLL lock failed` |
+| 2 | `tqftpserv` 在跑（`/readonly/firmware/image` 指向固件目录） | ath10k 停在 `using dummy regulator` 一行，走不到固件下载 |
+| 3 | `iw dev wlan0 set power_save off` | 大包全丢，HTTP 能过、HTTPS 卡死（`api.steampowered.com` 10 秒超时，而 ping 网关 0% 丢包） |
+
+第 1 条是 §23 老结论的验证版：方向对，当时没法测。换成 ESP 外部 DTB 后一次就成了，
+`dmesg` 里出现：
+
+```
+ath10k_snoc: qcom chip_id 0x30224 chip_family 0x4001 board_id 0xff soc_id 0x40060000
+ath10k_snoc: firmware ver api 5 crc32 b3d4b790
+ath10k_snoc: invalid MAC address; choosing random
+```
+
+第 3 条**参考仓库 `porting-checklist §6.2` 里明写着**（`wifi.powersave = 2`），我们一直没做。
+
+**2.4G 能连，5G 连不上**：`Xiaomi_0A83_5G` 在 5180 MHz，认证阶段就 `CONN_FAILED`
+（`SME: Trying to authenticate ... → CTRL-EVENT-SSID-TEMP-DISABLED`），还没到密码校验。
+配套的是 dmesg 里 `chan info: invalid frequency 0 (idx 41 out of bounds)` 刷屏 ——
+**信道表不完整**。可逆实验：把 `/usr/lib/firmware/ath10k/WCN3990/hw1.0/board-2.bin`
+改名成 `.bak`，强制 ath10k 用厂商仓库里那份 26 KB 的 `board.bin`
+（`GengWei1997/firmware-xiaomi-raphael`）。效果：告警从刷屏降到个位数，**5G 仍然不通**。
+**不要改回原名**——通用的 `board-2.bin` 盖住设备专属文件正是参考仓库要求避免的
+（`porting-checklist §11.3`）。5G 的真正原因见 **§24.8**：引导参数里没有管制域。
+
+### 24.4 【重要】传文件不能用 `probe-ui.ps1` 的命令方式
+
+**这一节比前面三条都重要，因为它会静默毁掉配置文件。**
+
+`work/probe-ui.ps1` 读命令行文件时会这样过滤：
+
+```
+$lines = Get-Content $CommandFile | Where-Object { $_ -notmatch '^\s*#' -and $_.Trim() -ne '' }
+```
+
+也就是**丢掉所有空行和 `#` 开头的行**。这对命令是对的，但对「把文件内容逐行 echo 出去」
+这种做法是灾难。实际后果（今天全中）：
+
+```
+[Unit]
+Description=Qualcomm TFTP service
+ConditionPathExists=/dev/qcom_rmtfs_mem1[Service]   ← 粘连
+```
+
+`[Service]` 被接到上一行末尾，于是：
+
+- `ConditionPathExists=/dev/qcom_rmtfs_mem1[Service]` 这个路径不存在 → **条件不成立**；
+- 整个 unit 被 systemd 静默跳过，`systemctl show` 显示 `ConditionResult=no`，
+  `journalctl -u xxx` **一条记录都没有**（这正是 §21.5 / §23.2 那个「开机不自启」的真实原因）；
+- 里面所有中文注释和空行也一起没了。
+
+**纪律**：往设备写文件一律走 base64 分段，参照 `scripts/raphael-apply-overlay-live.ps1`
+（`printf '%s' '<段>' >> /tmp/_f.b64` → `base64 -d`）。只有**执行命令**才用 `probe-ui.ps1`。
+
+顺带纠正一个认知：`/etc/systemd/system/` 下的同名 unit 会**盖住** `/usr/lib/systemd/system/`
+里的版本。之前手工在 `/etc` 建了 `raphael-tqftpserv.service`、`tqftpserv.service`、
+`rmtfs.service` 等副本，全是粘连的坏文件，导致 repo overlay（干净的那份）根本没生效。
+修法是删掉 `/etc` 下的影子副本，让 `/usr/lib` 的生效：
+
+```sh
+rm -f /etc/systemd/system/{tqftpserv,rmtfs,raphael-qrtr-ns,raphael-rmtfs,raphael-tqftpserv}.service
+systemctl daemon-reload
+systemctl enable raphael-qrtr-ns raphael-rmtfs raphael-tqftpserv
+```
+
+### 24.5 usb0 那条路已经不用了
+
+用户决定放弃 `169.254.240.121` 手工地址。现在上网走 WiFi（`x24` 这个 NM profile 会自动连）。
+`usb0` 只当调试通道（`Get-PnpDevice` 看 COM3/COM4），不再承载流量。
+
+顺带一提：Steam 那个指向 `169.254.240.120:7890` 的 drop-in 是把 CM 掐死的元凶，
+已经改名禁用（`zz-proxy.conf` → `.disabled`）。
+
+### 24.6 触摸：根因是缺旋转矩阵，方案直接照抄 alioth
+
+**先纠正本节早先写错的一条结论：`--default-touch-mode 4` 不是非法值。**
+
+gamescope 的 usage 原文（`src/main.cpp`）：
+
+```
+--default-touch-mode   0: hover, 1: left, 2: right, 3: middle, 4: passthrough
+```
+
+`4` 就是 passthrough —— 触摸事件不模拟鼠标点击、原样透传给客户端。
+Steam 客户端自己处理 touch，这是 SteamOS 的常态，不是 bug。这个参数在
+`parse_integer` 之后直接强转 `TouchClickMode`，不做范围校验，所以「越界值」
+这个说法本来就不成立。
+
+**真正的原因 alioth 那边早就有记录**（`docs/alioth.md`「其余已修的真机问题」第 1 行）：
+
+> 触摸相对画面逆时针 90° —— `--force-composition-rotation` 只决定旋转在哪做、
+> 不设角度，gamescope 不知道面板朝向，于是不变换触摸坐标
+
+修法是一条 udev 规则（`alioth-overlay/usr/lib/udev/rules.d/70-alioth.rules:19`）：
+
+```
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="Focaltech FT8756 Touchscreen", \
+  ENV{ID_INPUT}="1", ENV{ID_INPUT_TOUCHSCREEN}="1", TAG+="seat", TAG+="uaccess", \
+  ENV{LIBINPUT_CALIBRATION_MATRIX}="0 1 0 -1 0 1"
+```
+
+**raphael 这边一条 `CALIBRATION_MATRIX` 都没有**（`grep -r` 全仓库零命中），
+所以触摸坐标一直停在竖屏 1080×2340 的坐标系里，而画面已经被 shader 转成
+2340×1080。手指落点和看到的位置差 90° —— 这正好解释「驱动 OK、`event5` 有事件、
+gamescope 也持有它的 fd，但就是点不动」。
+
+已落地：`scripts/raphael-overlay/etc/udev/rules.d/99-raphael-touch.rules`
+（设备名换成 `goodix_ts`，矩阵与 alioth 相同）。
+`raphael-apply-overlay-live.ps1` 用 `Get-ChildItem -Recurse` 扫目录，会自动带上。
+
+矩阵 `0 1 0 -1 0 1` 把归一化坐标 (nx, ny) 映射成 (ny, 1−nx)，即顺时针补 90°。
+若实测是镜像，换成 `0 -1 1 1 0 0`（映射成 1−ny, nx）。
+
+**上机验证（3 步，不用重启）**：
+
+```sh
+udevadm control --reload
+udevadm trigger --subsystem-match=input
+udevadm info -q all -n /dev/input/event5 | grep -i CALIBRATION   # 期望 0 1 0 -1 0 1
+evtest /dev/input/event5   # X 0..1079 / Y 0..2339 随手指线性变化（排除驱动层）
+```
+
+| 现象 | 结论 |
+|---|---|
+| 点得准 | 成了 |
+| 左右或上下镜像 | 换 `0 -1 1 1 0 0` |
+| `evtest` 完全没有事件 | 那是驱动层，另一回事 |
+| 坐标对了但仍点不动 | 再试 `--default-touch-mode 1`（触摸当左键），这是独立变量 |
+
+`GAMESCOPE_IGNORE_TOUCH` 可以彻底排除：它只在 `DEVICE_MODEL` 命中 `AYN Thor` /
+`Thor Lite` / `AYANEO Pocket DS` 时才设置（`gamescope-session:242-255`），
+raphael 不在其中，变量为空。
+
+先不要动 `--default-touch-mode 4`。矩阵是主因，一次只改一个变量。
+
+### 24.7 下次上机的执行顺序
+
+1. `scripts/raphael-apply-overlay-live.ps1` —— 复原 unit + `/opt/raphael/qcom-setup.sh`，
+   删掉 `/etc` 影子副本，重启三个 qcom 单元。
+2. `systemctl restart raphael-usb-gadget`（或在设备上重跑 `/opt/raphael/qcom-setup.sh`），
+   然后**重启一次**，确认 `raphael-tqftpserv` 开机就是 `active`、`ConditionResult=yes`、
+   `ls /sys/class/net/` 里有 `wlan0`。这一步过了才算「WiFi 持久化」。
+3. 触摸，按 §24.6 三步走。
+4. 5G：`sh /opt/raphael/set-regdom.sh CN`（§24.8），然后 `iw reg get` 看是不是 CN；
+   不通就 `sh /opt/raphael/wifi-diag.sh` 一次收齐证据。
+5. Steam 登录（仍暂停）。
+
+### 24.8 5G 连不上的答案：引导参数里没有管制域
+
+**参考仓库写得很直白**，不是我自己推的：
+
+> `WIFI_COUNTRY` 的唯一下游是阶段 10 写进引导项的内核参数 `cfg80211.ieee80211_regdom=`，
+> 不设置时设备落在世界域、多数 5 GHz 信道被禁用。
+> —— `work/ref/archlinux-xiaomi-raphael/openwiki/.claims/concepts/configuration-model.json`
+
+同一份材料里还有更直接的一条（`architecture/boot-chain-and-image-layout.md` 的故障表）：
+
+> | 5GHz Wi-Fi 连不上 | 引导参数里没有 `cfg80211.ieee80211_regdom` | 在 `config/build.conf` 里设 `WIFI_COUNTRY` 后重跑阶段 10 |
+
+**因果链**：SteamOS 用的内核（我们自己按 vendor 配置编的）开了
+`CONFIG_CFG80211_REQUIRE_SIGNED_REGDB`，上游 `wireless-regdb` 的签名它不认 → 加载
+`regulatory.db` 必然失败 → cfg80211 落在 world 域（alpha2 `00`）→ 5GHz 规则带
+`NO_IR`，客户端连不上。参考仓库是**故意**删掉 `regulatory.db` 的（`HANDOVER.md §4.8`），
+把管制域完全交给引导参数。
+
+所以我们照做：`scripts/raphael-overlay/opt/raphael/set-regdom.sh`。
+
+```sh
+sh /opt/raphael/set-regdom.sh CN        # 默认 CN；可换国家码
+sh /opt/raphael/set-regdom.sh CN /dev/sda29
+```
+
+它做两件事：
+
+1. **改 ESP 的 loader entry**：给每个 `loader/entries/*.conf` 的 `options` 行末尾追加
+   `cfg80211.ieee80211_regdom=CN`。走的是 §24.2 那条已经验证过的通道
+   （`losetup -b 512` + mount），不刷机；幂等，已写过的跳过，首次改之前留 `*.conf.bak`。
+   若 `/efi` 已挂载就直接就地改。
+2. **立刻 `iw reg set CN`**：不用等重启就能重试 5G。但**引导项要下次进 systemd-boot
+   才生效**，所以「开机就是 CN」这条只能重启后验。
+
+**`board-2.bin` 不回滚。** §24.3 那次实验（改名成 `.bak`，让 ath10k 回落到设备专属的
+26 KB `board.bin`）把 `invalid frequency 0` 的刷屏降到了个位数，方向是对的 —— 参考仓库
+`porting-checklist §11.3` 的修法之一就是 `rm -f .../board-2.bin`，因为内核固件加载器
+**先试无后缀名**，通用的 `board-2.bin` 会盖住设备专属的那份。保持现状即可，不要再改回原名。
+
+**顺带持久化 `power_save off`**：新增
+`scripts/raphael-overlay/etc/NetworkManager/conf.d/wifi-powersave.conf`（`wifi.powersave = 2`），
+不用每次手工 `iw dev wlan0 set power_save off`。这条同样是参考仓库
+`porting-checklist §6.2` 明写的要求。
+
+**MAC 随机**（`ath10k_snoc: invalid MAC address; choosing random`）：DTB 里没有
+`local-mac-address`，参考仓库也没解决这个问题（它只解决蓝牙 `local-bd-address`）。
+影响只是每次开机 MAC 变、路由器重新分配 IP，不影响连通性。要固定就：
+
+```sh
+nmcli con mod <profile> wifi.cloned-mac-address <MAC>
+```
+
+**取证脚本** `scripts/raphael-overlay/opt/raphael/wifi-diag.sh`：一次输出 regdom、
+板级文件哈希、ath10k dmesg、扫描列表、认证失败前最后几条内核消息。下次上机不通就跑它，
+别再靠猜。
+
+```sh
+sh /opt/raphael/wifi-diag.sh > /tmp/wifi.txt
+```
+
