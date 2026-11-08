@@ -1502,3 +1502,289 @@ Windows：scripts/raphael-push-net.ps1 -LocalFile <文件> -RemotePath <路径>
    `qcom-setup.sh` 补 modprobe 与 ath10k 固件路径；修好 `ExecStartPost` 未生效的问题；
    重刷一次 `userdata`
 5. 之后：蓝牙 MAC（`bdaddr` 从 modem NV 取）、待机掉电、装游戏跑 Proton
+
+## 22. Steam 客户端跑起来了；卡在登录握手（2026-11-08 12:00）
+
+本节是当前状态的快照。**上机第一件事是看 §22.6 的「下一步」。**
+
+### 22.1 阶段推进：UI 已经不是黑屏了
+
+§21.2 的「Steam 必须联网更新一次」这个问题**已经彻底解决**：
+
+```
+11:34:44  Download complete (663,719 / 663,719 KB)
+11:34:45  Extracting package...
+11:35:24  Installing update...
+11:35:50  Update complete, launching Steam...
+11:35:53  Verifying installation... → Verification complete
+```
+
+客户端版本 `1792099137`。663 MB 走了约 63 分钟（平均 ~150 KB/s）。
+
+### 22.2 判断「有没有画面」的正确姿势（别数进程）
+
+`steamwebhelper` 自带 `--remote-debugging-port=8080`，直接读页面：
+
+```sh
+curl -s http://127.0.0.1:8080/json
+```
+
+会列出 `Steam Big Picture Mode` / `QuickAccess_uid2` / `MainMenu_uid2` /
+`notificationtoasts_uid2`。页面存在 = Gamepad UI 真的加载了。
+
+要读页面**内容**，设备上没有 `curl --ws`（8.7.1 编译时没开），用
+`scripts/raphael-cdp-eval.py`（手写的最小 WebSocket 客户端，python3 标准库）：
+
+```sh
+python3 raphael-cdp-eval.py                 # 标题 + URL + 可见文本前 300 字
+python3 raphael-cdp-eval.py --list          # 只列页面
+python3 raphael-cdp-eval.py 'document.title'
+```
+
+推送方式：base64 分段 `printf '%s' '<段>' >> /tmp/d.b64` → `base64 -d`，
+见 `work/qx.cmd` 的生成方式；4450 字节的脚本走串口不到 3 秒。
+
+当时读到的内容（这就是证据，不是猜的）：
+
+```
+11:42 AM  Sign in with Mobile App
+Step 1  Open the Steam Mobile App to the Steam Guard tab, then tap the gear.
+Step 2  Ensure your mobile app shows this verification image.
+Sign in failed, try again.
+```
+
+### 22.3 真正的阻塞：CM 拒绝登录
+
+```
+[11:56:45] RecvMsgClientLogOnResponse() : 'Try another CM' / 'Failure',
+           ignored since we're not waiting for a logon response
+[11:56:45] ConnectionDisconnected('Disconnected By Remote Host') : 'Failure'
+           (169.254.240.120:3128, WebSocket)
+[11:56:45] Sending SteamServerConnectFailure_t No Connection Reconnect
+```
+
+`console_log.txt` 里对应每 30–60 秒一条 `LogonFailure No Connection`。
+
+链条是：TCP/TLS 通了 → WebSocket upgrade 通了 → CM 收到登录帧 → 回
+`Try another CM` 并立即断开。**扫码页的 QR challenge 拿不到，所以二维码是空的**
+（页面上只有 3 个 `<img>`：`mobile_login` 插图、一个 0x0 的社区贴纸、
+一个输入图标，**没有 QR 元素**）。
+
+### 22.4 代理是罪魁，而且它根本不必要
+
+两个独立事实：
+
+1. **NetNat 已经给了真外网**，代理是多余的：
+
+   ```
+   env -u http_proxy -u https_proxy ... curl https://api.steampowered.com/
+   → direct_api=404 t=0.48s        （404 是根路径的正常响应，说明真的到了服务器）
+   direct_cm=403 t=5.85s
+   ```
+
+2. **所有断开都是从代理地址发出的**：`ConnectionDisconnected(... (169.254.240.120:3128, WebSocket))`。
+   去掉代理之后 ping 到的 CM 从华沙/首尔（250 ms+）变成香港（**67 ms**）。
+
+所以 §21.6 那条「借电脑上网走 `work/proxy.js`」的结论要修正：**它能下更新，
+但会把 CM 的登录握手掐死，不要用它跑 Steam 登录。**
+
+### 22.5 坑：改 `/etc/environment` 对已在运行的会话无效
+
+改了 `/etc/environment` 之后 Steam 进程里**仍有 5 个 proxy 变量**。原因是
+`systemd --user`（PID 725）在会话登录那一刻就把环境固化下来了，之后
+`systemctl --user start steam.service` 继承的是**用户管理器**的环境，不是文件。
+
+正确做法：
+
+```sh
+XDG_RUNTIME_DIR=/run/user/1000 su steamos -s /bin/bash -c \
+  'systemctl --user unset-environment http_proxy https_proxy HTTP_PROXY HTTPS_PROXY;
+   systemctl --user restart steam.service'
+```
+
+> 这一步已经执行，但**结果未验证**（用户中断）。下次上机先确认进程里
+> `grep -ci proxy` 为 0，再看 `connection_log.txt` 是否还出现 `Try another CM`。
+
+### 22.6 下一步（按顺序，别跳）
+
+1. **确认代理真的清干净了**
+
+   ```sh
+   pgrep -f 'steamrtarm64/steam -cef'            # 拿到 PID
+   tr '\0' '\n' < /proc/<PID>/environ | grep -i proxy      # 期望：无输出
+   tail -n 15 /home/steamos/.local/share/Steam/logs/connection_log.txt
+   ```
+
+   判据：不再出现 `Try another CM`，而是 `Logged In` 或停在 `Connected`。
+
+2. **看二维码**
+
+   ```sh
+   python3 /tmp/cdp.py 'document.querySelectorAll("img[src*=qr],canvas").length'
+   ```
+
+   从 `0` 变成 ≥1 就说明 QR 拿到了。页面标题仍是 `Steam Big Picture Mode`。
+
+3. **登录**：用 Steam 手机 App 的 Steam Guard 扫码。**这一步不需要在手机上点任何东西**，
+   所以触摸没修好也不影响登录。
+
+4. **触摸**（仍未解决）：`gamescope` 确实打开了 `/dev/input/event5`，
+   `goodix_ts` 的 `PROP=2`（INPUT_PROP_DIRECT）、`EV=b` 都正常。
+   所以问题在坐标变换 / 触摸模式，不在驱动。可疑点：
+   - `--force-composition-rotation` 把 1080×2340 转成横屏，触摸坐标没跟着转
+   - `--default-touch-mode 4` 的实际语义要对照 gamescope 源码确认
+   - udev 侧可能要 `LIBINPUT_CALIBRATION_MATRIX`（见 §20.4）
+
+5. 登录之后再回到 §21.7 的 WiFi 与固化清单。
+
+### 22.7 这一轮改了什么（可回滚）
+
+| 文件 | 改动 | 备份 |
+|---|---|---|
+| `/etc/environment` | 删掉 4 个 proxy 变量，只留注释 | `/var/lib/steamos-arm-stock/environment.20261108` |
+| `/etc/sddm.conf.d/zz-raphael.conf` | `Relogin=false` → `true` | `/var/lib/steamos-arm-stock/zz-raphael.conf.20261108` |
+
+`Relogin=true` 是为了防止「杀掉会话后停在 greeter、又没有触摸」这种死局。
+副作用是会话挂了会自动重启 —— 如果之后遇到无限重登，先改回 `false`。
+
+另外注意：`zz-raphael.conf` 里的中文注释是乱码（写文件时编码错了），
+内容本身不影响 sddm 解析（都是 `#` 开头的注释行），但下次重写 overlay 时要修。
+
+### 22.8 顺手记下的两个事实
+
+- `gamescopectl` 是 ELF 二进制，直接跑会 `Command not found`（参数不认），
+  需要 `XDG_RUNTIME_DIR` + `GAMESCOPE_WAYLAND_DISPLAY`，但目前没有可用的
+  截图子命令 —— 要看画面还是走 CEF 调试口。
+- `gamescopereaper --respawn` 会在 steam 退出后**只重拉 steam**，不重启
+  gamescope（PID 826 全程没变）。所以 `pkill steam` 不会丢会话，比
+  `systemctl restart sddm` 安全（后者会带走 ttyGS0 上的串口 shell）。
+
+## 23. Modem 稳了、WLFW 有了；Wi-Fi 卡在 WLAN 处理器的 SRPLL（2026-11-08 13:30）
+
+本节记录 12:00–13:30 这一轮。**结论：从「根本没有网卡」推进到「WLAN 处理器启动后自己崩」**，
+下面的每条都是设备上的实测，不是推测。
+
+### 23.1 Steam 的「没网络」根因：`environment.d` 里残留的死代理
+
+不是 `/etc/environment`（那里早就干净了），而是：
+
+```
+/home/steamos/.config/environment.d/90-proxy.conf
+  http_proxy/https_proxy/HTTP_PROXY/HTTPS_PROXY=http://169.254.240.120:3128
+```
+
+那个代理是上一轮用完就关掉的 `work/proxy.js`，设备侧 10 秒超时。Steam 的每次连接都
+带着它，于是 `connection_log.txt` 里全是：
+
+```
+Connectivity test (2.18.64.197:80 (169.254.240.120:3128)): HTTP fetch failed
+```
+
+**判定方法**（比读配置可靠）：
+
+```sh
+tr '\0' '\n' < /proc/$(pgrep -f 'steam -cef' | head -n 1)/environ | grep -i proxy
+```
+
+**修法**（注意 `systemctl --user unset-environment` 在这里**不生效**，
+`show-environment` 里变量会原地复活；`set-environment X=` 置空是有效的，但最终方案是
+给 unit 加 drop-in，让 Steam 进程根本看不到这些变量）：
+
+```sh
+# /home/steamos/.config/systemd/user/steam.service.d/zz-no-proxy.conf
+[Service]
+Environment=http_proxy=http://169.254.240.120:7890     # 指向 Windows 上的代理
+Environment=https_proxy=http://169.254.240.120:7890
+Environment=HTTP_PROXY=http://169.254.240.120:7890
+Environment=HTTPS_PROXY=http://169.254.240.120:7890
+Environment=no_proxy=localhost,127.0.0.1,steamloopback.host
+```
+
+`169.254.240.120:7890` 是 Windows 侧的 Clash（`netstat` 显示监听 `0.0.0.0:7890`，
+设备经 usb0 直连可用；实测 `curl -x` 到 `api.steampowered.com` 404 / 0.4 s）。
+
+**遗留**：即使代理换对了，Steam 的扫码登录仍然失败：
+
+```
+[12:19:39] SteamUI: ERROR: Login: Failed to poll auth session. Result 2. Transport Error: 2
+[12:15:55] LogonFailure No Connection
+```
+
+CM 是连上的（`[Connected]` + `ConnectionCompleted() (103.10.124.5:443, WebSocket)`），
+但登录会话拿不到，页面因此**不画二维码**（`img[src*=qr],canvas` 数为 0）。
+所以「没有二维码」是症状，不是渲染 bug。
+
+### 23.2 Modem 反复崩溃的根因：qcom 用户态是用 shell 脚本拉起来的，会死
+
+`/opt/raphael/qcom-setup.sh` 用 `setsid` 起 `qrtr-ns`/`rmtfs`/`tqftpserv`，
+运行一段时间后**三个进程全没了**（`pgrep -af 'tqftpserv|rmtfs|qrtr-ns'` 空输出），
+于是 modem 每 40 秒 `fatal error without message` 一次，永远起不来 WLAN 电源域。
+
+参考仓库 `Winter21c/archlinux-xiaomi-raphael` 的做法是 **systemd 单元 + udev 规则**
+（`scripts/05-qcom.sh`），照抄之后 modem 立刻稳定（`handling crash` 计数 0）：
+
+```
+/etc/systemd/system/rmtfs.service      rmtfs -r -P -s，ConditionPathExists=/dev/qcom_rmtfs_mem1，Restart=always
+/etc/systemd/system/tqftpserv.service  Restart=always，StateDirectory=tqftpserv
+/etc/udev/rules.d/99-rmtfs.rules       qcom_rmtfs_mem* 出现时拉起 rmtfs.service
+```
+
+两个细节：
+- `tqftpserv` 在**开机时是 inactive**（`systemctl is-active` 返回 inactive，但 unit 是
+  enabled），必须手工 `systemctl start tqftpserv`；起来之后 25 秒内 WLFW 就出现。
+  根因还没查（怀疑 `StateDirectory` 或启动顺序），先记着。
+- `rmtfs` 必须带 `-r -P -s`，裸跑 `rmtfs`（以前的写法）不绑 EFS 设备。
+
+### 23.3 补全 mcfg 树、加 skip_otp
+
+- `/lib/firmware/qcom/sm8150/Xiaomi/raphael/modem_pr/` 原来只有 4 个文件（两个 `.dig`），
+  现在是 **191 个**（从 `work/raphael-fw/modem-image/modem_pr` 打包推过去，1.13 MB）。
+  modem 之前一直在要 `mcfg_hw/oem_hw.txt`、`mcfg_hw/mbn_hw.txt`。
+- `/etc/modprobe.d/ath10k.conf`：`options ath10k_core skip_otp=y`
+  （参考仓库 `scripts/06-config.sh:180` 的要求，之前缺失）。
+
+### 23.4 现在的判据链（照参考仓库的三步）
+
+```sh
+systemctl is-active tqftpserv          # 必须 active（开机不会自己起来，要手工 start）
+qrtr-lookup | awk '$1==69'             # 69 1 0 0 87 ATH10k WLAN firmware service  ← 已达成
+ls /sys/class/ieee80211/               # 仍然为空
+```
+
+### 23.5 卡点：WLAN 处理器报 `CCPM: SRPLL lock failed`
+
+```
+ath10k_snoc 18800000.wifi: firmware crashed! (guid 5af9282e-b384-4e94-a6f0-cdf313034e66)
+PDM: service 'wlan_process' crash: 'EF:wlan_process:0x1:qmi_platform:0x108b:ccpm_hw_clk.c:66'
+qcom_q6v5_pas 4080000.remoteproc: fatal error received:
+  err_qdi.c:1021:...ccpm_hw_clk.c:666:CCPM: SRPLL lock failed
+```
+
+已排除：
+
+| 假设 | 证据 |
+|---|---|
+| `wlanmdsp.mbn` 版本不对 | 两份都试过：vendor dump `a64def…`、原来那份 `9b96d3…`，**报错完全一样** |
+| `firmware-5.bin` 只有 60 字节是坏的 | `scripts/fetch-raphael-firmware-ext.sh:29` 明确写 `firmware-5.bin:60`，这是 WCN3990 的正常形态（代码在 `wlanmdsp.mbn` 里） |
+| 供电电压不对 | `regulator_summary`：ldo11 3312 mV、ldo2 1304 mV、ldo7 1800 mV、ldo1 752 mV，全部符合，且 use count 都是 1（已使能） |
+| `vdd-3.3-ch1` 缺失 | 确实缺（dummy regulator），但多数板子这路本来就不接；sm8150-hdk 才用 PMIC 的 ldo4 |
+
+DTS 里 wifi 节点的四路供电（`sm8150-xiaomi-raphael.dts:591-594`）：
+`vreg_l1a_0p75` / `vreg_l7a_1p8` / `vreg_l2c_1p3` / `vreg_l11c_3p3`。
+
+**下一步的方向**（需要内核源码 + 重刷 boot，`work/wslc-build.sh` 里可以编）：
+`SRPLL` 是 modem 侧 CCPM 给 WLAN 用的 PLL，锁不上通常是参考时钟（`RPMH_RF_CLK2`，
+DTS 里 `clock-names = "cxo_ref_clk_pin"`）或 WLAN 子系统的上电时序问题。要查的是
+ref clock 有没有真的使能，以及我们手写的 raphael DTS 与作者预编译内核里的 DTS 有什么差异
+（参考仓库用的是作者的 `linux-image` deb，**没有 DTS 源码可抄**）。
+
+### 23.6 运维教训（这一轮踩的）
+
+- **串口会被自己弄死**：`echo stop > /sys/class/remoteproc/remoteproc1/state` 会**阻塞 shell**，
+  必须后台执行：`(echo stop > ...) &`；`pkill -f 'busybox nc -l'` 会匹配到执行它的那个 shell
+  自己，直接杀死控制台。串口卡死后只能重启设备。
+- **不要用 `nc` 推固件**：`rapheal-push-net.ps1` 在监听没起来时 `Connect` 仍可能成功，
+  结果是 0 字节，而脚本会**无条件 `cp`**，把目标文件覆盖成空。这次就把
+  `wlanmdsp.mbn` 覆盖成了 0 字节。正确做法是先传 `/tmp`、校验 md5、再 `cp`。
+- 重启后 `usb0` **只保留 `172.16.42.1/24`**，`169.254.240.121/16` 是手工加的，
+  必须重新 `ip addr add`，否则 NCM 推送全部失败。
