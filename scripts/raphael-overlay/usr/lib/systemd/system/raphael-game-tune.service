@@ -1,0 +1,17 @@
+[Unit]
+Description=raphael: raise CPU/GPU clocks while a Steam game is running
+# cgroup 树要先在那儿才有东西可看；别的都不需要，看不到游戏就什么都不做。
+After=local-fs.target
+
+[Service]
+Type=exec
+ExecStart=/usr/lib/steamos-arm/raphael-game-tune
+# 退出时必须走 SIGTERM 的恢复路径，不能被 SIGKILL 掉 —— 否则小核会一直钉在
+# 最高频待机，而且没有任何症状提示。脚本自己也在 EXIT trap 里兜了一层。
+KillSignal=SIGTERM
+TimeoutStopSec=10
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

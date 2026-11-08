@@ -1,0 +1,217 @@
+#!/usr/bin/env bash
+# 电池温度看门狗：热了就把**输入**电流上限压下去，凉了再放回来。
+#
+# 为什么需要它 —— 结论来自 alioth 的实测（docs/alioth.md「充电」）：
+#
+#   qcom_pm8150b_charger 不实现 JEITA。
+#
+# 它既不读也不写 JEITA 寄存器（整个驱动里 "jeita" 一个字都没有），注册的电池
+# 中断只有 bat-ov（过压）。bootloader 在 0x1090..0x1093 留了非零值，但没人
+# 解码过它，所以**不能**说「硬件会保护你」。没有被验证过的保护等于没有保护。
+#
+# raphael 真机实测（2026-11-08 21:10）：
+#   power_supply 只有 `battery` 和 `usb` 两个（不是 alioth 的 pm8150b-charger）
+#   usb/current_max          -r--r--r--   只读，写进去 Permission denied
+#   usb/input_current_limit  -rw-r--r--   可写（QTI 的 ICL），往返 500000→1000000→500000 验过
+# 所以闸门优先 input_current_limit，current_max 兜底。
+#
+# 这个脚本能动的闸只有一个。充电电流（FCC，寄存器 0x1061）是驱动在 probe 时
+# 按 DTS 写死的，sysfs 不暴露；能压的是输入侧。压低输入功率就压低了充电电流，
+# 这是间接但有效的。副作用是它同时也限制了供给系统的功率 —— 热的时候正是想
+# 要的。
+#
+# 【重要】满档不取「启动时的值」。插在电脑 USB 口时 ICL 是 500 mA（SDP），
+# 之后换成 33 W 头会变成 DCP 的 3 A 左右。如果把 500 mA 当成「满档」记下来，
+# 降温恢复会把充电反压回 500 mA —— 用户看到的是「充电莫名其妙变慢」。
+# 所以改成：**进入限流的那一刻**记住当时的 ICL，恢复时写回它。插拔电源由驱动
+# 自己改 ICL，脚本只在「正在限流」的时候接管。
+set -uo pipefail
+
+BATT="${RAPHAEL_GUARD_BATT:-/sys/class/power_supply/battery}"
+CHG="${RAPHAEL_GUARD_CHG:-}"
+PS_ROOT="${RAPHAEL_GUARD_PS_ROOT:-/sys/class/power_supply}"
+INTERVAL="${RAPHAEL_GUARD_INTERVAL:-10}"
+
+# 档位：温度（0.1 °C）-> 输入电流上限（µA）。从高到低排，第一个命中的生效。
+# 迟滞：降档用上面的阈值，升档要低于 RESTORE_TEMP，避免在阈值上来回抖。
+HOT1="${RAPHAEL_GUARD_HOT1:-400}"   ; ICL1="${RAPHAEL_GUARD_ICL1:-1500000}"
+HOT2="${RAPHAEL_GUARD_HOT2:-430}"   ; ICL2="${RAPHAEL_GUARD_ICL2:-1000000}"
+HOT3="${RAPHAEL_GUARD_HOT3:-450}"   ; ICL3="${RAPHAEL_GUARD_ICL3:-500000}"
+RESTORE_TEMP="${RAPHAEL_GUARD_RESTORE:-380}"
+
+log() { echo "raphael-charge-guard: $*" >&2; }
+
+# charger 的 sysfs 目录。名字匹配 charger / usb 两种，都要求有 current_max 或
+# input_current_limit，避免误选 battery。
+find_charger() {
+  local d base
+  if [[ -n "$CHG" ]]; then printf '%s\n' "$CHG"; return 0; fi
+  for d in "$PS_ROOT"/*; do
+    [[ -e "$d/current_max" || -e "$d/input_current_limit" ]] || continue
+    base="$(basename "$d")"
+    case "$base" in
+      *charger*|usb|*_usb|usb_*) printf '%s\n' "$d"; return 0 ;;
+    esac
+  done
+  # 名字对不上但只有一个候选时也接受（换内核/换驱动时不至于直接摆烂）。
+  local cands=()
+  for d in "$PS_ROOT"/*; do
+    [[ "$(basename "$d")" == battery ]] && continue
+    [[ -e "$d/current_max" || -e "$d/input_current_limit" ]] && cands+=("$d")
+  done
+  [[ ${#cands[@]} -eq 1 ]] && { printf '%s\n' "${cands[0]}"; return 0; }
+  return 1
+}
+
+read_temp() { # 打印 0.1 °C；读不到就什么都不打印
+  local t
+  t="$(cat "$BATT/temp" 2>/dev/null)" || return 1
+  [[ "$t" =~ ^-?[0-9]+$ ]] || return 1
+  printf '%s\n' "$t"
+}
+
+# 属性文件本身可不可写。**不能用 `[ -w ]`**：以 root 跑的时候 access(W_OK)
+# 对 0444 的文件也返回真，于是"看起来能写"。真机 2026-11-08 21:15 就这么错过
+# 一次 —— current_max 是 `-r--r--r--`，写进去 Permission denied，而手工
+# `[ -w ]` 检查是 true。看权限位才作数。
+attr_writable() {
+  local mode
+  mode="$(stat -c %A "$1" 2>/dev/null)" || return 1
+  [[ "$mode" == -rw* ]]
+}
+
+pick_icl_file() {
+  local f
+  if [[ -n "${RAPHAEL_GUARD_ICL_FILE:-}" ]]; then printf '%s\n' "$RAPHAEL_GUARD_ICL_FILE"; return 0; fi
+  for f in "$CHG/input_current_limit" "$CHG/current_max"; do
+    [[ -e "$f" ]] || continue
+    attr_writable "$f" && { printf '%s\n' "$f"; return 0; }
+  done
+  return 1
+}
+
+set_icl() { # set_icl <µA>
+  printf '%s\n' "$1" >"$ICL_FILE" 2>/dev/null \
+    || { log "写不了 $ICL_FILE（$1 µA）"; return 1; }
+}
+
+cur_icl() { cat "$ICL_FILE" 2>/dev/null; }
+
+CHG="$(find_charger)" || CHG=""
+if [[ -z "$CHG" ]]; then
+  log "找不到带电流上限的 charger 节点，退出（不做任何事）"
+  exit 0
+fi
+ICL_FILE="$(pick_icl_file)" || {
+  log "$CHG 下的 current_max / input_current_limit 都不可写（权限位），退出"
+  exit 0
+}
+
+# SAVED 文件：进入限流那一刻的 ICL，加上「我们自己最后写下去的值」。
+# 两个都要，因为光看 sysfs 分不出三种情况：这个值是被我们压的、是 SDP 本来就
+# 这么小、还是插拔电源导致驱动重新协商过。
+#
+#   cur != LAST 且 cur > target  -> 外部改的（换了电源），记住它
+#   cur != LAST 但 cur <= target -> 驱动做了 AICL 之类的微调，不必管
+#   cur == LAST                  -> 就是我们上一档写的，不能当成"满档"
+#
+# 落盘是为了 Restart=always：重启时如果正处在限流档，进程内存里什么都没有。
+# /run 是 tmpfs，一次开机内有效。
+SAVED_FILE="${RAPHAEL_GUARD_SNAP:-/run/raphael-charge-guard.saved}"
+SAVED=""
+LAST=""
+limited=0   # 1 = 当前这一档是脚本压下去的（外面看到的 ICL 不是用户/驱动的选择）
+
+if [[ -s "$SAVED_FILE" ]]; then
+  { read -r SAVED; read -r LAST; } <"$SAVED_FILE" 2>/dev/null
+  if [[ "$SAVED" =~ ^[0-9]+$ ]]; then
+    limited=1
+    [[ "$LAST" =~ ^[0-9]+$ ]] || LAST="$SAVED"
+  else
+    SAVED=""; LAST=""
+  fi
+fi
+
+save_state() { printf '%s\n%s\n' "$SAVED" "$LAST" >"$SAVED_FILE" 2>/dev/null \
+    || log "写不了 $SAVED_FILE，服务重启后的恢复会失去依据"; }
+
+# 进入限流：记住当时的值，再压下去。
+#
+# 已在限流时也要看一眼当前值：插拔电源由驱动重新协商 ICL（SDP 500 mA → DCP 3 A），
+# 如果不把「记住的值」更新过来，降温恢复会把大电源又压回 500 mA。
+enter_limit() { # enter_limit <µA> <理由>
+  local target="$1" reason="$2" cur
+  cur="$(cur_icl)"
+  if [[ ! "$cur" =~ ^[0-9]+$ ]]; then
+    log "读不到 $ICL_FILE 的当前值，不压（避免恢复时写一个瞎猜的数）"
+    return 1
+  fi
+  if [[ $limited -eq 0 ]]; then
+    SAVED="$cur"; LAST="$cur"; limited=1
+    save_state
+  elif [[ "$cur" != "$LAST" ]] && (( cur > target )); then
+    # 外部把上限调高了（换了电源）。更新记住的值，恢复时才写得回去。
+    if (( cur != SAVED )); then
+      SAVED="$cur"; LAST="$cur"
+      save_state
+      log "电源变化：记住的满档 -> $(( SAVED / 1000 )) mA"
+    fi
+  fi
+  [[ "$cur" == "$target" ]] && return 0
+  set_icl "$target" || return 1
+  LAST="$target"; save_state
+  log "输入上限 $(( SAVED / 1000 )) -> $(( target / 1000 )) mA（$reason）"
+}
+
+# 退出限流：写回进入时记住的那个值。
+leave_limit() { # leave_limit <理由>
+  [[ $limited -eq 1 ]] || return 0
+  set_icl "$SAVED" || return 1
+  log "输入上限恢复 $(( SAVED / 1000 )) mA（$1）"
+  limited=0
+  rm -f "$SAVED_FILE" 2>/dev/null
+}
+
+decide() { # 读温度并决定这一轮的档位
+  local t
+  if ! t="$(read_temp)"; then
+    # 读不到温度**不是**「不热」。按最保守的那一档处理，并且说出来。
+    enter_limit "$ICL3" "读不到电池温度 —— 按最热档处理"
+    return
+  fi
+  if   (( t >= HOT3 )); then enter_limit "$ICL3" "电池 $((t/10)).$((t%10))°C ≥ $((HOT3/10))°C"
+  elif (( t >= HOT2 )); then enter_limit "$ICL2" "电池 $((t/10)).$((t%10))°C ≥ $((HOT2/10))°C"
+  elif (( t >= HOT1 )); then enter_limit "$ICL1" "电池 $((t/10)).$((t%10))°C ≥ $((HOT1/10))°C"
+  elif (( t <  RESTORE_TEMP )); then leave_limit "电池 $((t/10)).$((t%10))°C < $((RESTORE_TEMP/10))°C"
+  fi
+  # HOT1 与 RESTORE_TEMP 之间：保持现状，这就是迟滞。
+}
+
+if [[ "${1:-}" == --status ]]; then
+  log "charger=$CHG 闸门=$ICL_FILE 现在=$(cur_icl) 限流中=$limited 记住的满档=${SAVED:-无}"
+  log "电池温度=$(read_temp || echo 读不到)（0.1 °C）  usb_type=$(cat "$CHG/usb_type" 2>/dev/null)"
+  exit 0
+fi
+
+# 退出时把闸放回去。不放回去的后果是「充电一直很慢」，而且没有任何界面会
+# 告诉你是这个已经停掉的服务留下的。
+restore_and_exit() {
+  trap - TERM INT EXIT
+  leave_limit "服务退出"
+  exit 0
+}
+trap restore_and_exit TERM INT EXIT
+
+if [[ "${1:-}" == --once ]]; then
+  decide
+  # 单轮模式不能走恢复路径：那会把刚写下去的降档值又放回去，看起来像「什么都
+  # 没发生」。trap 的注册位置必须排在 --once 之前才省事。
+  trap - TERM INT EXIT
+  exit 0
+fi
+
+log "启动：每 ${INTERVAL}s 看一次电池温度（降档 $((HOT1/10))/$((HOT2/10))/$((HOT3/10))°C，恢复 <$((RESTORE_TEMP/10))°C）"
+while :; do
+  decide
+  sleep "$INTERVAL"
+done

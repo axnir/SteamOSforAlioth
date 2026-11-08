@@ -1,0 +1,242 @@
+#!/usr/bin/env bash
+# 有 Steam 游戏在跑的时候，把 CPU 调速器切到 performance、GPU 钉到顶档；游戏退
+# 了再切回**开机时的原值**。
+#
+# 为什么需要它 —— 结论来自 alioth 的实测（docs/alioth.md「帧率」），不是猜测：
+#
+#   schedutil + GPU 按需调速（出厂默认）   48.40 fps
+#   CPU performance                       55.67 fps
+#   CPU performance + GPU 顶频             60.00 fps  <- 游戏自己的上限
+#
+# 瓶颈是**升频爬坡速度**，不是算力：切到 performance 之后 CPU 占用反而从 33%
+# 掉到 24%，同样的活在高频下干得更快。GPU 那 4 帧同理 —— 按需调速器在帧与帧
+# 之间掉回最低档，下一帧又要爬上来，而它的采样周期对一个 16.7 ms 的帧太慢。
+#
+# raphael 真机实测（2026-11-08 21:10，`/sys/class/devfreq/2c00000.gpu`）：
+#
+#   available_frequencies   257 345 427 499.2 585 675 MHz
+#   available_governors     userspace simple_ondemand      <-- 没有 performance
+#   min_freq / max_freq     257 MHz / 675 MHz，两个都可写
+#
+# 所以 GPU 那半边**不能照抄 alioth 切 governor**：这台内核根本没编进
+# performance/ml-adreno-tz，写进去只会 EINVAL。改成把 min_freq 顶到当前
+# max_freq —— simple_ondemand 算出来的目标频率会被 core clamp 到 [min,max]，
+# min==max 就等于钉死在顶档。退出时写回原 min_freq。
+#
+# 如果某版内核真带了 performance，脚本会优先用它（`available_governors` 里
+# 有就切 governor），两条路都留着，靠探测决定，不靠假设。
+#
+# 为什么要快照原值而不是写死：alioth 写死 `schedutil` 是它自己 DTS 的默认；
+# 抄过来一旦内核默认变了，恢复会把频率钉到一个这台机器不用的调速器上，而且
+# 没有任何症状。快照落 /run/raphael-game-tune.orig（tmpfs，一次开机内有效）——
+# 只放内存的话，服务 Restart=on-failure 重启时调速器正处在 performance，重新
+# 快照会把它当成「原值」，从此永远恢复不回去。
+#
+# 为什么不能常开：performance 对小核也生效（policy0 会一直钉在最高频），GPU
+# 钉顶更是直接发热。所以只在「有游戏 scope」的这段时间开，退出路径（包括
+# SIGTERM）必须恢复。
+#
+# 热不用自己管：cpufreq/devfreq 的 cooling device 是 thermal 框架通过限制
+# policy 的**最大**频率实现的，和调速器/下限是两回事。频率顶在当前允许的上限
+# 上，温度上来该降还是会降。
+set -uo pipefail
+
+CG_ROOT="${RAPHAEL_TUNE_CGROUP_ROOT:-/sys/fs/cgroup}"
+CPUFREQ_DIR="${RAPHAEL_TUNE_CPUFREQ:-/sys/devices/system/cpu/cpufreq}"
+DEVFREQ_ROOT="${RAPHAEL_TUNE_DEVFREQ_ROOT:-/sys/class/devfreq}"
+# 非空就跳过自动探测，直接用这个目录（断言脚本用得上）。
+DEVFREQ_DIR="${RAPHAEL_TUNE_DEVFREQ:-}"
+GAME_CPU_GOV="${RAPHAEL_TUNE_GAME_CPU_GOV:-performance}"
+GAME_GPU_GOV="${RAPHAEL_TUNE_GAME_GPU_GOV:-performance}"
+INTERVAL="${RAPHAEL_TUNE_INTERVAL:-2}"
+SNAP_FILE="${RAPHAEL_TUNE_SNAP:-/run/raphael-game-tune.orig}"
+
+log() { echo "raphael-game-tune: $*" >&2; }
+
+# GPU 的 devfreq 目录。名字里带 gpu 就算（真机是 2c00000.gpu）；找不到就只调
+# CPU，不影响功能。
+find_gpu_devfreq() {
+  local d
+  if [[ -n "$DEVFREQ_DIR" ]]; then printf '%s\n' "$DEVFREQ_DIR"; return 0; fi
+  for d in "$DEVFREQ_ROOT"/*; do
+    [[ -e "$d/governor" ]] || continue
+    case "$(basename "$d")" in
+      *gpu*) printf '%s\n' "$d"; return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# 这个目录支不支持某个调速器。available_governors 读不到时按「支持」处理 ——
+# 真正写不进去的时候 write_val 会报出来，不必在这里二次猜测。
+gov_supported() { # gov_supported <dir> <gov>
+  local avail
+  avail="$(cat "$1/available_governors" 2>/dev/null)" || return 0
+  [[ " $avail " == *" $2 "* ]]
+}
+
+# 写一个值。写不进去要说出来 ——「静默地什么都没发生」和「生效了」在帧率上
+# 看得出差别，但在日志里不该看不出来。
+write_val() { # write_val <文件> <值> <标签>
+  local f="$1" v="$2" tag="${3:-$1}" cur
+  cur="$(cat "$f" 2>/dev/null)"
+  [[ "$cur" == "$v" ]] && return 0
+  if ! printf '%s\n' "$v" >"$f" 2>/dev/null; then
+    log "写 $v 到 $tag 失败（当前 $cur）"
+    return 1
+  fi
+  return 0
+}
+
+declare -A ORIG_CPU=()
+GPU_DIR=""
+GPU_MODE="none"     # governor | minfreq | none
+ORIG_GPU_GOV=""
+ORIG_GPU_MIN=""
+
+probe_gpu() {
+  GPU_DIR="$(find_gpu_devfreq)" || { GPU_DIR=""; GPU_MODE=none; return; }
+  if gov_supported "$GPU_DIR" "$GAME_GPU_GOV"; then
+    GPU_MODE=governor
+  elif [[ -w "$GPU_DIR/min_freq" && -r "$GPU_DIR/max_freq" ]]; then
+    GPU_MODE=minfreq
+  else
+    GPU_MODE=none
+  fi
+}
+
+load_snapshot() {
+  local kind path val
+  while read -r kind path val; do
+    case "$kind" in
+      cpu)     [[ -n "$path" && -n "$val" ]] && ORIG_CPU["$path"]="$val" ;;
+      gpu)     [[ -n "$path" && -n "$val" ]] && { GPU_DIR="$path"; ORIG_GPU_GOV="$val"; } ;;
+      gpu_min) [[ -n "$path" && -n "$val" ]] && { GPU_DIR="$path"; ORIG_GPU_MIN="$val"; } ;;
+    esac
+  done <"$SNAP_FILE"
+}
+
+snapshot() {
+  local p
+  probe_gpu
+  if [[ -s "$SNAP_FILE" ]]; then
+    load_snapshot
+    log "沿用已记录的原值（$SNAP_FILE）"
+    return 0
+  fi
+  for p in "$CPUFREQ_DIR"/policy*/scaling_governor; do
+    [[ -e "$p" ]] || continue
+    ORIG_CPU["$p"]="$(cat "$p" 2>/dev/null)"
+  done
+  if [[ -n "$GPU_DIR" ]]; then
+    ORIG_GPU_GOV="$(cat "$GPU_DIR/governor" 2>/dev/null)"
+    ORIG_GPU_MIN="$(cat "$GPU_DIR/min_freq" 2>/dev/null)"
+  fi
+  {
+    for p in "${!ORIG_CPU[@]}"; do printf 'cpu %s %s\n' "$p" "${ORIG_CPU[$p]}"; done
+    [[ -n "$GPU_DIR" ]] && printf 'gpu %s %s\n' "$GPU_DIR" "$ORIG_GPU_GOV"
+    [[ -n "$GPU_DIR" && -n "$ORIG_GPU_MIN" ]] && printf 'gpu_min %s %s\n' "$GPU_DIR" "$ORIG_GPU_MIN"
+  } >"$SNAP_FILE" 2>/dev/null || log "写不了 $SNAP_FILE，服务的重启恢复会失去依据"
+  log "原值：${#ORIG_CPU[@]} 个 cpu policy（$(printf '%s ' "${ORIG_CPU[@]}")） gpu=${ORIG_GPU_GOV:-无} min_freq=${ORIG_GPU_MIN:-无} 模式=$GPU_MODE"
+}
+
+apply() { # apply <game|idle>
+  local mode="$1" p v n=0 skipped=0 top
+  for p in "$CPUFREQ_DIR"/policy*/scaling_governor; do
+    [[ -e "$p" ]] || continue
+    if [[ "$mode" == game ]]; then
+      v="$GAME_CPU_GOV"
+      gov_supported "$(dirname "$p")" "$v" || { skipped=$((skipped + 1)); continue; }
+    else
+      v="${ORIG_CPU[$p]:-}"
+      [[ -n "$v" ]] || continue
+    fi
+    write_val "$p" "$v" "cpu $(basename "$(dirname "$p")")" && n=$((n + 1))
+  done
+
+  if [[ -n "$GPU_DIR" ]]; then
+    case "$GPU_MODE" in
+      governor)
+        if [[ "$mode" == game ]]; then
+          write_val "$GPU_DIR/governor" "$GAME_GPU_GOV" "gpu governor" || true
+        elif [[ -n "$ORIG_GPU_GOV" ]]; then
+          write_val "$GPU_DIR/governor" "$ORIG_GPU_GOV" "gpu governor" || true
+        fi
+        ;;
+      minfreq)
+        # 顶档 = 当前 max_freq。thermal 可能把它压低了，所以不写死 675 MHz。
+        if [[ "$mode" == game ]]; then
+          top="$(cat "$GPU_DIR/max_freq" 2>/dev/null)"
+          [[ -n "$top" ]] && { write_val "$GPU_DIR/min_freq" "$top" "gpu min_freq" || true; }
+        elif [[ -n "$ORIG_GPU_MIN" ]]; then
+          write_val "$GPU_DIR/min_freq" "$ORIG_GPU_MIN" "gpu min_freq" || true
+        fi
+        ;;
+    esac
+  fi
+
+  if [[ "$mode" == game ]]; then
+    log "cpu=$GAME_CPU_GOV（$n 个 policy${skipped:+, $skipped 个不支持}） gpu=$GPU_MODE:$(cat "$GPU_DIR/governor" 2>/dev/null || echo 无)/$(cat "$GPU_DIR/min_freq" 2>/dev/null || echo -)"
+  else
+    log "已恢复：cpu 原值（$n 个 policy） gpu=${ORIG_GPU_GOV:-无} min_freq=${ORIG_GPU_MIN:-无}"
+  fi
+}
+
+# Steam 给每个游戏建一个自己的 systemd scope：
+#   app.slice/app-steam-app<appid>-<pid>.scope
+# Steam 客户端自己是 session.slice/steam.service，不会撞上这个模式。非 Steam
+# 游戏（手动加的快捷方式）同样走这里，所以它们也一起受益。
+#
+# 已知没覆盖到的一段：着色器预处理不在这个 scope 里，那几分钟仍是 schedutil。
+# 要扩大范围得先确认它在哪个 cgroup —— 猜宽的后果是 performance 常开。
+game_running() {
+  local hit
+  hit="$(find "$CG_ROOT" -maxdepth 6 -type d -name 'app-steam-app[0-9]*.scope' \
+         -print -quit 2>/dev/null)"
+  [[ -n "$hit" ]]
+}
+
+snapshot
+
+if [[ "${1:-}" == --status ]]; then
+  log "gamescope scope：$(game_running && echo 有 || echo 无)"
+  log "cpupolicy：$(for p in "$CPUFREQ_DIR"/policy*/scaling_governor; do [[ -e "$p" ]] && printf '%s=%s ' "$(basename "$(dirname "$p")")" "$(cat "$p")"; done)"
+  log "gpu：${GPU_DIR:-未找到} 模式=$GPU_MODE governor=$(cat "${GPU_DIR:-/nonexistent}/governor" 2>/dev/null) 可用=$(cat "${GPU_DIR:-/nonexistent}/available_governors" 2>/dev/null) min=$(cat "${GPU_DIR:-/nonexistent}/min_freq" 2>/dev/null) max=$(cat "${GPU_DIR:-/nonexistent}/max_freq" 2>/dev/null)"
+  exit 0
+fi
+
+if [[ "${1:-}" == --once ]]; then
+  # 单轮：评估一次、按需切换、退出。给断言脚本用，也便于手工验证。
+  if game_running; then apply game; else apply idle; fi
+  exit 0
+fi
+
+state=unknown
+
+# 退出时一定要恢复。不恢复的后果不是「性能不对」，是小核被钉在最高频、GPU
+# 钉在顶档待机 —— 而且没有任何症状提示你它还开着。
+restore_and_exit() {
+  trap - TERM INT EXIT
+  [[ "$state" == game ]] && apply idle
+  # 顺手清掉快照：下次启动重新读当前值。留着也没错，但那时用户可能手工改过
+  # 调速器，用旧快照会把它盖回去。
+  rm -f "$SNAP_FILE"
+  exit 0
+}
+trap restore_and_exit TERM INT EXIT
+
+log "启动：每 ${INTERVAL}s 看一次 $CG_ROOT 下有没有 Steam 游戏 scope"
+while :; do
+  if game_running; then
+    if [[ "$state" != game ]]; then
+      state=game
+      apply game
+    fi
+  else
+    if [[ "$state" != idle ]]; then
+      state=idle
+      apply idle
+    fi
+  fi
+  sleep "$INTERVAL"
+done
