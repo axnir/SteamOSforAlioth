@@ -1,0 +1,31 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/ShadowBlip/InputPlumber/main/rootfs/usr/share/inputplumber/schema/capability_map_v2.json
+# raphael's two volume keys -> the two Deck buttons Deck UI offers no touch-only
+# route to. Copied from alioth_overlay's alioth_keys; the reasoning is identical,
+# so it is only summarised here:
+#
+#   volume up   (gpio-keys, KEY_VOLUMEUP)        -> Guide        Steam menu
+#   volume down (pm8941_resin, KEY_VOLUMEDOWN)   -> QuickAccess  QAM
+#
+# The cost is the hardware volume control. It is recoverable: the Quick Access
+# menu that volume-down now opens carries a volume slider, so volume stays two
+# presses away instead of one. The alternative -- leaving the keys as volume and
+# reaching Steam/QAM by touch alone -- loses the Steam button entirely in games
+# that capture the whole screen, which is worse on a device whose only pointer
+# is a 6-inch touchscreen.
+version: 2
+kind: CapabilityMap
+name: Xiaomi raphael hardware keys
+id: raphael_keys
+
+mapping:
+  - name: Steam (volume up)
+    source_events:
+      - evdev: {event_type: KEY, event_code: KEY_VOLUMEUP, value_type: button}
+    target_event:
+      gamepad: {button: Guide}
+
+  - name: Quick Access (volume down)
+    source_events:
+      - evdev: {event_type: KEY, event_code: KEY_VOLUMEDOWN, value_type: button}
+    target_event:
+      gamepad: {button: QuickAccess}

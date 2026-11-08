@@ -115,6 +115,26 @@ if (-not $SkipLarge) {
   }
   Push-Large $ipBin '/usr/bin/inputplumber'
   $null = Send-Serial @('chmod 755 /usr/bin/inputplumber', "chmod 644 $libRemote/*.so*") 700
+
+  # /usr/share 下的资源（profiles / schema / devices / capability_maps，加
+  # dbus-1 策略和 polkit 规则）。**少了这个 InputPlumber 会 active 但什么都做不了**：
+  # 它匹配到 event0 之后建不出 deck-uhid，日志只有一句误导性的
+  #   Error adding device 'gpio-keys (event0)': Could not read: No such file or directory
+  # 实测 strace 显示 /dev/uhid 从头到尾没被 open 过 —— 不是 uhid 的问题，是
+  # profiles/deck-uhid.yaml 不在。见 docs/raphael.md §30.4。
+  $shareDir = Join-Path $root 'external-and-mods\InputPlumber\rootfs'
+  if (-not (Test-Path -LiteralPath $shareDir)) { throw "缺 $shareDir（从 release tarball 的 usr/share 解出来）" }
+  $shareTar = Join-Path $env:TEMP 'ip-share.tar.gz'
+  if (Test-Path -LiteralPath $shareTar) { Remove-Item -LiteralPath $shareTar -Force }
+  & tar -czf $shareTar -C $shareDir inputplumber dbus-1 polkit-1
+  Push-Large $shareTar '/tmp/ip-share.tar.gz'
+  $out = Send-Serial @(
+    'tar -xzf /tmp/ip-share.tar.gz -C /usr/share && echo SHARE_OK',
+    'ls /usr/share/inputplumber/profiles/ | head -5',
+    'ls /usr/share/inputplumber/ | tr "\n" " "; echo'
+  ) 1500
+  Write-Host $out
+  if ($out -notmatch 'SHARE_OK') { throw '/usr/share 资源没解开' }
 }
 
 Write-Host '== 依赖自检 =='
@@ -127,6 +147,9 @@ if (-not $SkipService) {
   $out = Send-Serial @(
     'systemctl daemon-reload',
     'systemctl enable --now inputplumber 2>&1 | tail -n 2',
+    'mkdir -p /usr/lib/systemd/system/multi-user.target.wants',
+    'ln -sfn /usr/lib/systemd/system/inputplumber.service /usr/lib/systemd/system/multi-user.target.wants/inputplumber.service',
+    'systemctl daemon-reload',
     'sleep 3',
     'systemctl is-active inputplumber',
     'journalctl -u inputplumber -n 12 --no-pager 2>&1 | tail -n 12'

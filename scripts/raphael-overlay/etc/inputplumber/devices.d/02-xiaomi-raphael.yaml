@@ -12,6 +12,16 @@
 #   pm8941_resin   event3  KEY_VOLUMEDOWN  the power-key block next to pwrkey
 #   pm8941_pwrkey  event2  KEY_POWER       NOT a source here, see below
 #
+# **Do not add phys_path.** The first version of this file carried
+# `phys_path: gpio-keys/input0` (copied from the P: line in
+# /proc/bus/input/devices), and InputPlumber reported for both keys:
+#   Error adding device 'gpio-keys (event0)': Could not read: No such file or directory
+# The match itself succeeded ("Found a matching input device evdev://event0"),
+# the failure was in turning that into a device — phys_path is looked up under
+# /dev/input/by-path, whose real entry is `platform-gpio-keys-event`, not
+# `gpio-keys/input0`. alioth's profile has no phys_path at all and that is the
+# working shape: name + handler is enough, the driver already scoped it.
+#
 # pm8941_pwrkey is deliberately absent: that key belongs to steamos-powerbuttond
 # (see etc/udev/rules.d/99-raphael-keys.rules and the 99-zz-raphael-powerbuttond
 # drop-in). Grabbing it as a gamepad source would take suspend/resume and the
@@ -38,13 +48,11 @@ source_devices:
   - group: gamepad
     evdev:
       name: gpio-keys
-      phys_path: gpio-keys/input0
       handler: event*
     capability_map_id: raphael_keys
   - group: gamepad
     evdev:
       name: pm8941_resin
-      phys_path: pm8941_resin/input0
       handler: event*
     capability_map_id: raphael_keys
 
