@@ -2253,3 +2253,75 @@ timeout 12 curl -s -o /dev/null -w "%{http_code}\n" --max-time 10 https://store.
 | 域名解析 | ❌ 卡死 | 跑 `sh /opt/raphael/fix-dns.sh`，看验收三行 |
 | Steam 登录（QR 空） | 暂停 | 等网络稳定后再看 `Try another CM` |
 | MAC 随机 | 未处理 | `nmcli con mod x5g wifi.cloned-mac-address <MAC>` |
+
+## 26. 待办清单（2026-11-08 19:50，Steam 已登录、开始试游戏）
+
+按「影响能不能当掌机用」排序，不是按难度。状态取自真机，没量过的写未验。
+
+### 26.1 P0 音频（唯一直接影响玩游戏的）
+
+先分清三种故障，判据不一样，修法完全不在同一层：
+
+| 现象 | 判据 | 层 |
+|---|---|---|
+| 只有 `Dummy Output` | `wpctl status` 里 sink 只有一个 dummy；`systemctl --user status wireplumber` 里有 `code=dumped, status=11/SEGV` | wireplumber 崩了 |
+| 有 sink 但一点声都没有 | sink 名是 `alsa_output.platform-sound.playback.0.0`（裸 PCM 形态，不是 UCM 形态） | 缺 UCM，WCD9340 的 mixer 路由没人配 |
+| 耳机有声、扬声器没声 | `aplay -D hw:0,0` 有波形但 TFA9874 没使能 | 功放/I2S 这一层 |
+
+**第一个可能性最大，而且 alioth 上已经踩过**（`docs/alioth.md` §「wireplumber SIGSEGV 崩溃循环」）：
+SteamOS 的镜像里 `70-spatial-node-config.conf` 把 Frame 的 VR 空间音频 lua 标成 `required`，
+它要加载 `/usr/lib/ladspa/vraudiocompositor.so`，这个 rootfs **不带**这个插件 →
+wireplumber 每次启动都 SIGSEGV、一两秒一个新 PID 地崩 → 整个会话管理器起不来 →
+唯一的 sink 是 Dummy Output。raphael 用的是同一份 SteamOS 镜像，**大概率一模一样**。
+alioth 的修法是 `75-alioth-no-frame-scripts.conf`（disable `steamos.spatial-node-config`
+和 `steamos.microphone-tracker`）+ `76-alioth-alsa.conf`（把 `api.alsa.use-acp` 打开、
+period-size 调小）+ `77-alioth-access.conf`（选 `steamos-default-nospatial` 权限管理器）。
+raphael 要照抄这三份，但不能盲抄：`76` 里的 period-size 和 PCM 名跟 DTS 的 dai-link 有关。
+
+**第二个可能性也很大**：`usr/share/alsa/ucm2/` 下没有任何 sm8150 / raphael 的 UCM
+（alioth 有 `ucm2/Xiaomi/Alioth`，raphael 一份都没有）。没有 UCM，ACP 就走不到
+EnableSequence，`MultiMedia1` 那类 mixer 一直是 0，sink 建出来也是哑的。
+参考仓库把 vendor UCM 的落点写清楚了（`porting-checklist §9.2`，五份文件）：
+
+```
+usr/share/alsa/ucm2/Raphael/Raphael.conf
+usr/share/alsa/ucm2/Raphael/HiFi.conf
+usr/share/alsa/ucm2/conf.d/sm8150_raphael/sm8150_raphael.conf
+usr/share/alsa/ucm2/conf.d/sm8150_raphael/xiaomi-XiaomiRedmiK20Pro.conf
+usr/share/alsa/ucm2/conf.d/sm8150_raphael/HiFi.conf
+```
+
+上游 `alsa-ucm-conf` 里**没有** sm8150（它只有 sm8250 及以上），所以这五份必须自己带。
+本机 `work/` 里还没有这些文件 —— 要么从厂商 `alsa-xiaomi-raphael.deb` 取，要么按
+`reg`/`dai-link` 手写一份最小 UCM（只有 Speaker/Headphone 两条路）。
+
+**第三条**：TFA9874 是 I2S 上的智能功放，§19.2 里它 probe 成功（`TFA9874 detected,
+revision 0x0c74`）只说明 I2C 通了，不代表它被使能出声。扬声器要单独验。
+
+### 26.2 其余按验收表排（对照 `docs/alioth.md` 阶段 2 那十二项）
+
+| 项 | raphael 状态 | 下一步 |
+|---|---|---|
+| 开机直接进 Game Mode | ✅ | — |
+| 横屏 2340×1080 | ✅ | — |
+| Steam 登录 | ✅（本次） | 没验「纯触摸完成」，屏幕键盘能用就够了 |
+| Proton 游戏跑通 | 🔄 在测 | 记下第一个能跑的游戏名和 Proton 版本 |
+| **扬声器** | ❌ | 见 26.1 |
+| mangoapp 性能浮层 | 未验 | 先 `ls /sys/class/drm/card[0-9]`：如果 msm 不是 `card0`（simpledrm 占了 minor 0），就要像 alioth 那样在 cmdline 加 `initcall_blacklist=simpledrm_platform_driver_init` |
+| 蓝牙 BD_ADDR 跨重启稳定 | 未验 | `hciconfig hci0` 重启前后对比；WCN3998 之前有过 `hci0 QCA error -2` |
+| 蓝牙手柄识别为 Deck 手柄 | 未验 | 配一个手柄看按键图标是不是 ABXY |
+| 音量键呼出快捷菜单 / 电源键待机 | 未验 | 需要确认键码有没有映射到 `qcom-pmic-resin`/`kpdpwr` |
+| Game Mode 显示电量 | 未验 | `cat /sys/class/power_supply/battery/capacity` 有数就行 |
+| 边充边玩温度 | 未验 | 边充边跑游戏，读 battery `temp` 和 thermal zone |
+| s2idle 待机一夜掉电 | 未验 | 需要一晚；先确认 `echo mem > /sys/power/state` 能进能出 |
+
+### 26.3 非验收项但会被问到的
+
+| 项 | 状态 | 备注 |
+|---|---|---|
+| 域名解析 | ⚠ 待复验 | 19:40 那次卡死过；现在能登 Steam 说明通了，但**为什么当时卡 12 秒没查**。下次上机跑 `sh /opt/raphael/fix-dns.sh` 的「现场」段留个证据 |
+| WiFi MAC 每次开机变 | 未处理 | `nmcli con mod x5g wifi.cloned-mac-address <MAC>` |
+| 亮度调节 | 未验 | Game Mode 的亮度滑块要走 backlight；`/sys/class/backlight/` 有没有节点 |
+| 刷新率 60/90 Hz | 未验 | 面板 EA8076 支持 60/90，gamescope 里能不能切 |
+| 触摸方向 | 属性已生效，未目视 | 点一下就知道；反了就换 `0 -1 1 1 0 0`（§24.6） |
+| 干净重刷后可复现 | 大体可以 | overlay 已进 `build-raphael-reference.sh`；但 `fix-dns.sh`、本节新增的东西要等下次重建镜像才进 rootfs |
