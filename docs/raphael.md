@@ -1876,8 +1876,8 @@ ath10k_snoc: invalid MAC address; choosing random
 **信道表不完整**。可逆实验：把 `/usr/lib/firmware/ath10k/WCN3990/hw1.0/board-2.bin`
 改名成 `.bak`，强制 ath10k 用厂商仓库里那份 26 KB 的 `board.bin`
 （`GengWei1997/firmware-xiaomi-raphael`）。效果：告警从刷屏降到个位数，**5G 仍然不通**。
-**不要改回原名**——通用的 `board-2.bin` 盖住设备专属文件正是参考仓库要求避免的
-（`porting-checklist §11.3`）。5G 的真正原因见 **§24.8**：引导参数里没有管制域。
+**这段当时的判断是反的**：真凶就是那份 26 KB 的 Android `board.bin`，`board-2.bin`
+才是对的。实测对照与结论见 **§24.8**。
 
 ### 24.4 【重要】传文件不能用 `probe-ui.ps1` 的命令方式
 
@@ -1991,32 +1991,37 @@ raphael 不在其中，变量为空。
 
 ### 24.7 下次上机的执行顺序
 
-1. `scripts/raphael-apply-overlay-live.ps1` —— 复原 unit + `/opt/raphael/qcom-setup.sh`，
-   删掉 `/etc` 影子副本，重启三个 qcom 单元。
-2. `systemctl restart raphael-usb-gadget`（或在设备上重跑 `/opt/raphael/qcom-setup.sh`），
-   然后**重启一次**，确认 `raphael-tqftpserv` 开机就是 `active`、`ConditionResult=yes`、
-   `ls /sys/class/net/` 里有 `wlan0`。这一步过了才算「WiFi 持久化」。
-3. 触摸，按 §24.6 三步走。
-4. 5G：`sh /opt/raphael/set-regdom.sh CN`（§24.8），然后 `iw reg get` 看是不是 CN；
-   不通就 `sh /opt/raphael/wifi-diag.sh` 一次收齐证据。
+截至 2026-11-08 19:20，5G 已经在真机上验证通过（§24.8），
+下一步是把 §24.9 的时序修复推到设备上再重启一次，确认「开机自己就有 wlan0」。
+
+1. `scripts/raphael-apply-overlay-live.ps1` —— 推 overlay（含新的 `qcom-setup.sh`、
+   `gadget.sh`），删 `/etc` 影子副本 + 那个没被读到的 drop-in，重启三个 qcom 单元。
+2. `rm -f /lib/firmware/ath10k/WCN3990/hw1.0/board.bin`（设备上可能还留着一份）。
+3. 重启一次，**只看四件事**：
+   `cat /sys/class/remoteproc/remoteproc1/state` → `running`；
+   `/var/log/raphael-qcom.log` 的时间戳是本次开机；
+   `ls /sys/class/net` → 有 `wlan0`；
+   `iw dev wlan0 link` → `Xiaomi_0A83_5G` / `freq: 5180.0`。
+4. 触摸，按 §24.6 三步走。
 5. Steam 登录（仍暂停）。
 
-### 24.8 5G 连不上的答案：引导参数里没有管制域
+### 24.8 5G：管制域要设，但真凶是那份 Android `board.bin`
 
-**参考仓库写得很直白**，不是我自己推的：
+**结论先说：真正让 5G 连不上的是 26 KB 的 `board.bin`，不是管制域。**
+管制域那件事是对的、也做了，但它只是必要条件，不是充分条件。
+
+#### 24.8.1 先做对的事：管制域写进引导参数
+
+参考仓库写得很直白：
 
 > `WIFI_COUNTRY` 的唯一下游是阶段 10 写进引导项的内核参数 `cfg80211.ieee80211_regdom=`，
 > 不设置时设备落在世界域、多数 5 GHz 信道被禁用。
 > —— `work/ref/archlinux-xiaomi-raphael/openwiki/.claims/concepts/configuration-model.json`
 
-同一份材料里还有更直接的一条（`architecture/boot-chain-and-image-layout.md` 的故障表）：
-
-> | 5GHz Wi-Fi 连不上 | 引导参数里没有 `cfg80211.ieee80211_regdom` | 在 `config/build.conf` 里设 `WIFI_COUNTRY` 后重跑阶段 10 |
-
 **因果链**：SteamOS 用的内核（我们自己按 vendor 配置编的）开了
 `CONFIG_CFG80211_REQUIRE_SIGNED_REGDB`，上游 `wireless-regdb` 的签名它不认 → 加载
 `regulatory.db` 必然失败 → cfg80211 落在 world 域（alpha2 `00`）→ 5GHz 规则带
-`NO_IR`，客户端连不上。参考仓库是**故意**删掉 `regulatory.db` 的（`HANDOVER.md §4.8`），
+`NO_IR`。参考仓库是**故意**删掉 `regulatory.db` 的（`HANDOVER.md §4.8`），
 把管制域完全交给引导参数。
 
 所以我们照做：`scripts/raphael-overlay/opt/raphael/set-regdom.sh`。
@@ -2035,15 +2040,37 @@ sh /opt/raphael/set-regdom.sh CN /dev/sda29
 2. **立刻 `iw reg set CN`**：不用等重启就能重试 5G。但**引导项要下次进 systemd-boot
    才生效**，所以「开机就是 CN」这条只能重启后验。
 
-**`board-2.bin` 不回滚。** §24.3 那次实验（改名成 `.bak`，让 ath10k 回落到设备专属的
-26 KB `board.bin`）把 `invalid frequency 0` 的刷屏降到了个位数，方向是对的 —— 参考仓库
-`porting-checklist §11.3` 的修法之一就是 `rm -f .../board-2.bin`，因为内核固件加载器
-**先试无后缀名**，通用的 `board-2.bin` 会盖住设备专属的那份。保持现状即可，不要再改回原名。
+**`board-2.bin` 必须留、`board.bin` 必须删 —— §24.3 那条「不要改回原名」是我写错了。**
+实机对照（2026-11-08 19:00）把这事彻底钉死：
+
+| 用的板级文件 | `chan info: invalid frequency` | 2.4G | 5G（5180，ch36） |
+|---|---|---|---|
+| 26 KB `board.bin`（Android vendor） | 刷屏 | 正常 | `authentication ... timed out`，**永不成功** |
+| 893 KB `board-2.bin`（kernel.org 通用） | **2 次** | 正常 | 一次连上，signal −22 dBm，store 200 / 1.3 s |
+
+原因是通用 `board-2.bin` 里本来就有 raphael 自己的条目：
+
+```
+bus=snoc,qmi-board-id=ff,qmi-chip-id=30224,variant=Xiaomi_raphael
+```
+
+正好匹配实机报的 `chip_id 0x30224 / board_id 0xff`（DTB 的 `calibration-variant`
+就是拿来选这条的）。而 Android 那份 26 KB `board.bin` 是单板 legacy 格式，
+**没有 5G 的分信道功率/校准表**，于是 5G 认证帧发出去没有任何回应 —— 内核侧表现为
+`send auth ... (try 1/3)` 之后再无下文，wpa_supplicant 只能超时。
+
+参考仓库 `porting-checklist §11.3` 让它 `rm -f .../board.bin`，说的就是这件事
+（那句「固件加载器先试无后缀名」指的是同名冲突，结论一样：Android 那份不能留）。
+所以：**`fetch-raphael-firmware-ext.sh` 不再下 `board.bin`，
+`build-raphael-reference.sh` 装完固件后显式 `rm -f .../board.bin`。**
 
 **顺带持久化 `power_save off`**：新增
 `scripts/raphael-overlay/etc/NetworkManager/conf.d/wifi-powersave.conf`（`wifi.powersave = 2`），
 不用每次手工 `iw dev wlan0 set power_save off`。这条同样是参考仓库
-`porting-checklist §6.2` 明写的要求。
+`porting-checklist §6.2` 明写的要求。实测生效（`iw dev wlan0 get power_save` → off）。
+
+**优先级**：`x5g` 的 `connection.autoconnect-priority=20`、`x24` 设 0，
+有 5G 时优先上 5G，没有就自动退回 2.4G。
 
 **MAC 随机**（`ath10k_snoc: invalid MAC address; choosing random`）：DTB 里没有
 `local-mac-address`，参考仓库也没解决这个问题（它只解决蓝牙 `local-bd-address`）。
@@ -2060,4 +2087,55 @@ nmcli con mod <profile> wifi.cloned-mac-address <MAC>
 ```sh
 sh /opt/raphael/wifi-diag.sh > /tmp/wifi.txt
 ```
+
+### 24.9 【事故】开机后一个 WiFi 都搜不到：qcom 栈跑得太早
+
+这是我在 §24.8 之后自己引入的回归，记下来是因为它的表现和原因隔得很远。
+
+**现象**：引导参数、`board-2.bin`、NM 配置都对，但开机后 `ls /sys/class/net` 只有
+`lo usb0`，`wlan0` 根本不存在 → Steam 界面里一个 WiFi 都搜不到。
+`dmesg` 里 ath10k 只有一行：
+
+```
+ath10k_snoc 18800000.wifi: supply vdd-3.3-ch1 not found, using dummy regulator
+```
+
+**根因**：我把 `qcom-setup.sh` 从 unit 的 drop-in 挪进了 `gadget.sh` 末尾（因为 drop-in
+开机时压根没被 systemd 读到，见下），但 **gadget 在 sysinit 阶段就起**，
+那时 `/dev/qcom_rmtfs_mem1` 还没建出来。rmtfs 于是退化成
+
+```
+failed to open /dev/qcom_rmtfs_mem1: No such file or directory
+falling back to uio access
+falling back to /dev/mem access
+```
+
+EFS 读不到 → modem 的 wlan PD 起不来 → QMI WLFW 一直不注册 → ath10k 永远停在
+dummy regulator 那一行 → 没有 `wlan0`。**同一份脚本晚 3 分钟手工重跑一次就全通了**，
+这就是纯时序问题。
+
+**修法**（`scripts/raphael-overlay/opt/raphael/qcom-setup.sh`）：
+
+1. 启动用户态三件套**之前**先等 `/dev/qcom_rmtfs_mem1`，最多 120 s；
+2. modem 起来后等 `wlan0`，60 s 不来就把 `qrtr-ns/rmtfs/tqftpserv` 重来一遍再等 90 s
+   （实测「晚一点重跑」就能让 WLFW 重新注册，比重启整机快）。
+
+**顺带修掉的一个更隐蔽的坑**：`raphael-usb-gadget.service` 的 drop-in
+`50-qcom.conf`（原来靠 `ExecStartPost` 跑 qcom-setup）**开机时 systemd 根本没读到**：
+
+```
+$ systemctl show raphael-usb-gadget -p DropInPaths -p ExecStartPost
+ExecStartPost={ ... }
+DropInPaths=/etc/systemd/system/raphael-usb-gadget.service.d/50-qcom.conf
+```
+
+上面是 `daemon-reload` **之后**的样子 —— 在那之前这两行都是空的。也就是说这台机器
+在 19:04 那次开机时 `qcom-setup.sh` 一次都没执行过（`/var/log/raphael-qcom.log`
+的时间戳停在上一次）。结论：**别把开机关键路径挂在 drop-in 的 ExecStartPost 上**，
+放进 `gadget.sh` 的 ExecStart 里更可靠；drop-in 已删除，`raphael-apply-overlay-live.ps1`
+的 `$stale` 列表里也加了它，免得残留让人误判。
+
+判断「qcom 栈是不是真的跑起来了」别只看进程：`raphael-qcom.log` 开头的时间戳是不是
+本次开机、`cat /sys/class/remoteproc/remoteproc1/state` 是不是 `running`、
+`/dev/qcom_rmtfs_mem1` 在不在、最后 `ls /sys/class/net` 有没有 `wlan0`。
 

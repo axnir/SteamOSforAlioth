@@ -44,3 +44,14 @@ if [ -d /sys/class/net/usb0 ]; then
   $BB ip addr add 172.16.42.1/24 dev usb0 2>/dev/null
 fi
 echo "gadget: up on $UDC, ttyGS0/ttyGS1 ready"
+
+# Qualcomm 栈（qrtr-ns/rmtfs/tqftpserv + 起 modem + usb0 链路本地地址）。
+#
+# 以前挂在 unit 的 ExecStartPost 上（drop-in 50-qcom.conf），但 2026-11-08 实测
+# 开机时 systemd 根本没读到那个 drop-in：`systemctl show -p DropInPaths` 为空、
+# ExecStartPost 也是空，于是 qcom-setup.sh 一次都没执行 —— 表现是 remoteproc
+# 停在 offline、ath10k 卡在 "using dummy regulator"、wlan0 压根不出现。
+# 放到 ExecStart 脚本末尾最稳，反正它本来就要求 UDC 已经绑好之后才能加 usb0 地址。
+#
+# 后台跑：它会 sleep 2 再写 remoteproc state，不能挡住 gadget 服务退出。
+setsid /opt/raphael/qcom-setup.sh >/dev/null 2>&1 &

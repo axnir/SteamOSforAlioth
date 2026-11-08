@@ -277,6 +277,11 @@ done
 # 由 scripts/fetch-raphael-firmware-ext.sh 下到 work/fw-ext/。
 if [ -d "$REPO/work/fw-ext" ]; then
   cp -a "$REPO/work/fw-ext/." "$TREE/usr/lib/firmware/"
+  # 必须删掉 Android 那份 26 KB 的 board.bin：它是单板 legacy 格式，没有 5G 的
+  # 分信道功率/校准表，ath10k 一旦回落到它，2.4G 能连、5G 认证帧发出去没回应
+  # （2026-11-08 实测：改名回 board-2.bin 后 5180 MHz 立刻可连）。
+  # 固件加载器是 board-2.bin 优先、找不到匹配才退 board.bin，留着就是定时炸弹。
+  rm -f "$TREE/usr/lib/firmware/ath10k/WCN3990/hw1.0/board.bin"
   echo "   无线固件: $(find "$REPO/work/fw-ext" -type f | wc -l) 个"
 else
   echo "   警告: work/fw-ext 不存在，蓝牙/WiFi 固件不会装（跑 fetch-raphael-firmware-ext.sh）"

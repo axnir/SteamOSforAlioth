@@ -48,11 +48,15 @@ for entry in "${common[@]}"; do
 done
 
 # 厂商件：优先镜像，退回直连。qca 的 rampatch 用厂商版（229 KB 比通用版 177 KB 匹配）
+#
+# 注意这里**没有** ath10k 的 board.bin。那个仓库里的 26 KB board.bin 是 Android 的
+# 单板 legacy 文件，没有 5G 的分信道功率/校准表：ath10k 回落到它时 2.4G 正常、
+# 5G 认证帧发出去没有任何回应（2026-11-08 实测）。用 kernel.org 的 board-2.bin，
+# 里面本来就有 bus=snoc,qmi-board-id=ff,qmi-chip-id=30224,variant=Xiaomi_raphael。
 vendor=(
   "qca/crbtfw21.tlv:200000"
   "qca/crnv21.bin:4000"
   "goodix_gt9886_cfg_f11.bin:1000"
-  "ath10k/WCN3990/hw1.0/board.bin:20000"
   # modem 起来后通过 TFTP 向 AP 要的三样；缺任何一个 modem 就每 0.5s fatal error
   "qcom/sm8150/Xiaomi/raphael/wlanmdsp.mbn:4000000"
   "qcom/sm8150/Xiaomi/raphael/modem_pr/mcfg/configs/mcfg_hw/mbn_hw.dig:20"

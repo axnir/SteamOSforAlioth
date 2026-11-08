@@ -72,7 +72,10 @@ $stale = @(
   '/etc/systemd/system/rmtfs.service',
   '/etc/systemd/system/raphael-qrtr-ns.service',
   '/etc/systemd/system/raphael-rmtfs.service',
-  '/etc/systemd/system/raphael-tqftpserv.service'
+  '/etc/systemd/system/raphael-tqftpserv.service',
+  # qcom 栈已经挪进 gadget.sh 的 ExecStart 末尾。这个 drop-in 在开机时会被
+  # systemd 漏掉（DropInPaths 为空），留着只会让人误以为它生效了。
+  '/etc/systemd/system/raphael-usb-gadget.service.d/50-qcom.conf'
 )
 $rm = @('echo CLEAN')
 foreach ($s in $stale) { $rm += "rm -f '$s'" }
