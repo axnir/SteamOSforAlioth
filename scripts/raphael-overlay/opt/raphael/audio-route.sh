@@ -27,12 +27,42 @@ MODE=${1:-speaker}
 
 ctl() {
   # $1 = 控件名，$2 = on/off
-  if amixer -c "$CARD" cset "name='$1'" "$2" >/dev/null 2>&1; then
-    echo "[audio] $1 = $2"
-  else
-    echo "[audio] 失败：$1（控件不存在，或声卡还没注册）"
-  fi
+  #
+  # 重试是必须的，不只是保险。2026-11-08 真机：服务在 22:10:08 启动，cget 已经
+  # 能查到控件（说明声卡注册完了），但 cset 失败 —— 那个时间窗里 PipeWire /
+  # WirePlumber 正在初始化，声卡的控制接口被占着，返回 EBUSY。同样的命令手工
+  # 跑一次就成功。所以等「控件存在」不够，要等到「写得进去」。
+  local n=0
+  while [ "$n" -lt 20 ]; do
+    if amixer -c "$CARD" cset "name='$1'" "$2" >/dev/null 2>&1; then
+      echo "[audio] $1 = $2"
+      return 0
+    fi
+    sleep 0.5
+    n=$(( n + 1 ))
+  done
+  echo "[audio] failed after 10s: $1 (card $CARD busy or missing)"
+  return 1
 }
+
+# 开机时 sound.target 变 active 只代表「有一张声卡注册了」，mixer 控件是
+# msm-snd-sm8150 的 probe 后半段才挂出来的，两者之间有几百毫秒到几秒的窗口。
+# 手工跑的时候声卡早就绪，所以看不出这个问题；做成 service 就会踩上。
+# 这里等到控件真的能写为止（最多 30 s），而不是一次性试完就算。
+wait_ctl() { # wait_ctl <控件名> [超时秒]
+  local n=0 max=$(( ${2:-30} * 2 ))
+  while [ "$n" -lt "$max" ]; do
+    if amixer -c "$CARD" cget "name='$1'" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.5
+    n=$(( n + 1 ))
+  done
+  echo "[audio] 等不到控件：$1（超时 ${2:-30}s）"
+  return 1
+}
+
+wait_ctl 'SLIMBUS_0_RX Audio Mixer MultiMedia1' 30 || true
 
 case "$MODE" in
   speaker)
