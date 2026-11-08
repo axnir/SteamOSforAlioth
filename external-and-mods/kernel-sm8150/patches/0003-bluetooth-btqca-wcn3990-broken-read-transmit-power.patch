@@ -1,0 +1,47 @@
+From: shouchen <TheOneovb@petlover.com>
+Subject: [PATCH] Bluetooth: btqca: mark LE Read Transmit Power broken on WCN3990
+
+The WCN3990 firmware on this board (soc 0x40010224, rom 0x1001, patched
+with qca/crbtfw21.tlv) advertises LE Read Transmit Power (0x204b) in its
+Read Local Supported Commands bitmap and then rejects the command with
+"Unknown HCI Command" (0x01).
+
+hci_le_read_tx_power_sync() guards that command on commands[38] bit 7
+only, so it is sent, the status comes back as 0x01, and the whole LE
+init stage aborts.  What that looks like from userspace, on raphael:
+
+  hci0: BD Address: ...  ACL MTU: 0:0  SCO MTU: 0:0  DOWN
+  hciconfig hci0 up -> Can't init device hci0: Function not
+                       implemented (38)      (bt_to_errno() fallback
+                                              for the unmapped status)
+  bluetoothctl show -> No default controller available
+
+btbcm and btusb already carry this quirk for controllers that lie about
+that bit; do the same for wcn3990 here.
+
+--- a/drivers/bluetooth/btqca.c
++++ b/drivers/bluetooth/btqca.c
+@@ -995,7 +995,23 @@
+ 	err = qca_check_bdaddr(hdev, &config);
+ 	if (err)
+ 		return err;
+ 
++	/*
++	 * WCN3990 firmware on this board (rom 0x1001 + crbtfw21.tlv) lists
++	 * LE Read Transmit Power (0x204b) in its supported-commands bitmap
++	 * and then answers it with "Unknown HCI Command" (0x01).
++	 * hci_le_read_tx_power_sync() treats that as fatal, so the LE init
++	 * stage aborts and hci0 never comes up.  btbcm and btusb work
++	 * around the same lie with this quirk.
++	 */
++	switch (soc_type) {
++	case QCA_WCN3990:
++		hci_set_quirk(hdev, HCI_QUIRK_BROKEN_READ_TRANSMIT_POWER);
++		break;
++	default:
++		break;
++	}
++
+ 	bt_dev_info(hdev, "QCA setup on UART is completed");
+ 
+ 	return 0;

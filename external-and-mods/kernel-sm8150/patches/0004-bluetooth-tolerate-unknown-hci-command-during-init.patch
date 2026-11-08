@@ -1,0 +1,93 @@
+From: shouchen <TheOneovb@petlover.com>
+Subject: [PATCH] Bluetooth: skip init commands the WCN3990 claims but rejects
+
+The supported-commands bitmap returned by Read Local Supported Commands is
+a hint, not a promise, and the WCN3990 on this board (soc 0x40010224, rom
+0x1001 patched with qca/crbtfw21.tlv) advertises LE commands that answer
+with "Unknown HCI Command" (0x01).
+
+hci_init_stage_sync() treats any error from a stage as fatal, so the first
+such lie aborts hci_init_sync() and leaves hci0 unconfigured - one quirk per
+opcode does not scale here, they come one after another:
+
+  hci0: HCI Read Transmit Power Level command is advertised, but not supported.
+  hci0: Opcode 0x2031 failed: -56
+  hciconfig hci0 up -> Can't init device hci0: Invalid request code (56)
+
+Reported by bt_to_errno() as -EBADRQC, 0x01 means the controller does not
+know the opcode at all: nothing was half-applied, nothing can be retried, so
+skipping it is the only sensible interpretation.  Gate that on a quirk and
+set the quirk for WCN3990 in the vendor setup callback.
+
+--- a/include/net/bluetooth/hci.h
++++ b/include/net/bluetooth/hci.h
+@@ -252,6 +252,28 @@
+ 	 */
+ 	HCI_QUIRK_BROKEN_READ_TRANSMIT_POWER,
+ 
++	/*
++	 * When this quirk is set, an "Unknown HCI Command" (0x01) status from
++	 * any command of an init stage is logged and skipped instead of
++	 * aborting the whole init sequence.
++	 *
++	 * The supported-commands bitmap is a hint, not a promise.  Some
++	 * controllers - the WCN3990 on raphael (rom 0x1001 patched with
++	 * crbtfw21.tlv) advertises LE commands it then rejects - abort init
++	 * on the first such lie and leave the controller dead:
++	 *
++	 *   hci0: Opcode 0x204b failed: -56
++	 *   hci0: Opcode 0x2031 failed: -56
++	 *
++	 * Ignoring the status is safe: 0x01 means the controller has no idea
++	 * what the opcode is, so there is nothing to retry and nothing was
++	 * half-applied.
++	 *
++	 * This quirk can be set before hci_register_dev is called or
++	 * during the hdev->setup vendor callback.
++	 */
++	HCI_QUIRK_TOLERATE_UNKNOWN_INIT_CMD,
++
+ 	/* When this quirk is set, HCI_OP_SET_EVENT_FLT requests with
+ 	 * HCI_FLT_CLEAR_ALL are ignored and event filtering is
+ 	 * completely avoided. A subset of the CSR controller
+--- a/net/bluetooth/hci_sync.c
++++ b/net/bluetooth/hci_sync.c
+@@ -3773,6 +3773,20 @@
+ 		int err;
+ 
+ 		err = stage[i].func(hdev);
++
++		/* -EBADRQC is how bt_to_errno() reports "Unknown HCI Command"
++		 * (status 0x01).  For a controller that sets bits for opcodes
++		 * it does not implement, that is not a broken init sequence,
++		 * it is a command that does not apply here - the only thing
++		 * aborting on it achieves is leaving the controller down.
++		 */
++		if (err == -EBADRQC &&
++		    hci_test_quirk(hdev, HCI_QUIRK_TOLERATE_UNKNOWN_INIT_CMD)) {
++			bt_dev_info(hdev, "init stage %zu (%ps): unsupported, skipped",
++				    i, (void *)stage[i].func);
++			continue;
++		}
++
+ 		if (err)
+ 			return err;
+ 	}
+--- a/drivers/bluetooth/btqca.c
++++ b/drivers/bluetooth/btqca.c
+@@ -763,6 +763,15 @@
+ 
+ 	bt_dev_info(hdev, "QCA controller version 0x%08x", soc_ver);
+ 
++	/*
++	 * This ROM's Read Local Supported Commands bitmap is not trustworthy:
++	 * it advertises LE commands (0x204b, 0x2031, ...) that come back as
++	 * "Unknown HCI Command".  Every one of them aborts hci_init_sync()
++	 * and leaves hci0 unconfigured, so let the init stages skip them.
++	 */
++	if (soc_type == QCA_WCN3990)
++		hci_set_quirk(hdev, HCI_QUIRK_TOLERATE_UNKNOWN_INIT_CMD);
++
+ 	config.user_baud_rate = baudrate;
+ 
+ 	/* Firmware files to download are based on ROM version.

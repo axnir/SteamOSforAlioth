@@ -1,0 +1,13 @@
+# 这台机器的蓝牙地址。**一行，改完重启 bluetooth.service 生效。**
+#
+# 为什么要有这个文件：WCN3990 的 NVM 里没有出厂 BD 地址，内核在 vendor setup
+# 里读到全零就给控制器打上「地址由属性提供」，而这块板子的 DTS 故意不写
+# local-bd-address（K20 Pro 每台地址不同，DTS 是全机型共用的）。没有地址，内核
+# 就把控制器标成 unconfigured：mgmt 里不出现、bluetoothctl 说没有控制器、
+# hciconfig up 返回 -95。
+#
+# 下面这个值是**我们自己定的**，不是原厂值：/persist/bluetooth 是空的（MIUI 不
+# 往那儿写），WLAN 的 MAC 16:61:04:7f:cf:6a 和它没有可推导的关系，原厂值随
+# Android 的 /data 一起被 erase userdata 抹掉了。它不影响能不能配对，只影响
+# 「别人看到的你叫什么地址」。哪天从别的渠道找回了原厂地址，改这一行就行。
+39:90:21:64:07:01

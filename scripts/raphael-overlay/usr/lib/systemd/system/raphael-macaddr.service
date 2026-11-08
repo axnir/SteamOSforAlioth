@@ -1,0 +1,19 @@
+[Unit]
+Description=raphael: give the WCN3990 the BD address its NVM does not have
+# 具体原因见 /usr/lib/steamos-arm/raphael-macaddr 的注释。
+#
+# 为什么这里不写 WantedBy=multi-user.target：拉起者是
+# bluetooth.service.d/52-raphael-macaddr.conf（Wants= + After=），只挂一条
+# 边。挂 target 的话，bluetooth.target 自身排在 bluetooth.service 之后，
+# 很容易和目标绕成顺序环。
+Before=bluetooth.service
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/steamos-arm/raphael-macaddr
+# 脚本自己最多等 hci0 30 s，再留两次重试的时间。
+TimeoutStartSec=90
+
+# 没有 [Install]：服务由 bluetooth.service 的 drop-in 拉起，不需要 enable。

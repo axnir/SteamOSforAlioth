@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# 给 WCN3990 补一个 BD 地址。开机跑一次，设完就退出。
+#
+# 为什么内核自己搞不定 —— 这颗控制器没有出厂地址：
+#   qca_check_bdaddr() 在 vendor setup 里发一次 Read BD Address，读到全零（或
+#   ROM 的默认值）就给 hdev 打 HCI_QUIRK_USE_BDADDR_PROPERTY，转而去设备树里
+#   找 local-bd-address。这块板子的 DTS **故意没写**（K20 Pro 每台地址不同，
+#   DTS 是全机型共用的），约定由用户态通过 MGMT_OP_SET_PUBLIC_ADDRESS 补。
+#   没人补的后果不是「地址显示成 00:00:00:00:00:00」，而是控制器被内核标成
+#   HCI_UNCONFIGURED：mgmt 里根本不存在，bluetoothctl 报
+#   "No default controller available"，hciconfig 的 up 返回 -95 (-EOPNOTSUPP)。
+#
+# 地址的来源是 /etc/raphael-bdaddr（理由写在那份文件里），这里只负责：
+#   1. 等 hci0 出现（hci_uart_qca 是模块，注册时机不保证早于本服务）；
+#   2. 把它交给 mgmt；
+#   3. 幂等 —— 已经配置好的控制器再设一次会被内核以 -EALREADY/REJECTED 拒绝，
+#      那不是故障。
+#
+# 为什么不常驻：地址一旦设置就被内核记在 hdev 里并立刻拉起设备，没有需要看护
+# 的状态；而每次开机控制器都是未配置的（NVM 里没地址），所以每次开机跑一次。
+#
+# 为什么必须在 bluetooth.service 之前：MGMT_OP_SET_PUBLIC_ADDRESS 对**已上电**
+# 的控制器直接拒绝，而 bluetoothd 一启动就会 AutoEnable。顺序由
+# bluetooth.service.d/52-raphael-macaddr.conf 保证。
+set -uo pipefail
+
+CONF="${RAPHAEL_BDADDR_CONF:-/etc/raphael-bdaddr}"
+INDEX="${RAPHAEL_BDADDR_INDEX:-0}"
+WAIT="${RAPHAEL_BDADDR_WAIT:-30}"
+SYS="/sys/class/bluetooth/hci${INDEX}"
+BTMGMT="${RAPHAEL_BDADDR_BTMGMT:-btmgmt}"
+
+log() { echo "raphael-macaddr: $*" >&2; }
+
+[ -r "$CONF" ] || { log "$CONF 不存在，控制器会一直是 unconfigured"; exit 0; }
+
+# 文件是给人改的，允许解释性注释，所以按 MAC 的形状去捞第一个匹配，而不是
+# 假定「第一行就是地址」。
+addr="$(grep -Eo '([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}' "$CONF" 2>/dev/null | head -n1)"
+if [ -z "$addr" ]; then
+  log "$CONF 里没有 xx:xx:xx:xx:xx:xx 形式的地址"
+  exit 1
+fi
+
+i=0
+while [ ! -d "$SYS" ]; do
+  i=$((i + 1))
+  if [ "$i" -gt "$WAIT" ]; then
+    log "等了 ${WAIT}s 也没有 hci${INDEX}（控制器没注册），放弃"
+    exit 0
+  fi
+  sleep 1
+done
+
+try=1
+while [ "$try" -le 3 ]; do
+  if out="$("$BTMGMT" -i "$INDEX" public-addr "$addr" 2>&1)"; then
+    log "hci${INDEX} public-addr = $addr"
+    exit 0
+  fi
+  # 已经配置过的控制器会回 Rejected / Already Configured —— 地址已经在用，
+  # 当成成功。剩下的（比如控制器还没准备好）重试两次再报。
+  case "$out" in
+    *"Already Configured"*|*"already configured"*|*Rejected*)
+      log "hci${INDEX} 已经配置过，跳过"
+      exit 0
+      ;;
+  esac
+  log "第 ${try} 次设置失败：$(printf '%s' "$out" | tr '\n' ' ')"
+  try=$((try + 1))
+  sleep 2
+done
+
+log "没设上地址，控制器会保持 unconfigured（蓝牙不可用）"
+exit 1
