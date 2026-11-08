@@ -14,3 +14,8 @@ external-and-mods/kernel/device-tree/** linguist-vendored
 scripts/raphael-overlay/** text eol=lf
 scripts/alioth-overlay/** text eol=lf
 *.sh text eol=lf
+
+# 补丁同理，而且是「静默的」失败：CRLF 的 hunk 在 Linux 侧 `patch -p1` 报
+# malformed / "Hunk #N FAILED"，看起来像补丁内容写错，而不是行尾不对。容器
+# 里构建又是直接挂载工作区，所以出问题的正是 checkout 出来的那份。
+*.patch text eol=lf

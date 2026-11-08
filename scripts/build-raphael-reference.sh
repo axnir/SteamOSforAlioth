@@ -153,17 +153,14 @@ initrd /initramfs
 devicetree /dtbs/qcom/sm8150-xiaomi-raphael.dtb
 options root=/dev/sda31 rootfstype=ext4 rw rootwait console=tty0 loglevel=7 ignore_loglevel
 EOF
-cat > "$STAGE/loader/entries/steamos-direct.conf" <<EOF
-title  SteamOS on raphael - no initramfs (recovery)
-linux  /linux.efi
-devicetree /dtbs/qcom/sm8150-xiaomi-raphael.dtb
-options root=/dev/sda31 rootfstype=ext4 rw rootwait console=tty0 loglevel=7
-EOF
+# 曾经还有一个 steamos-direct.conf（无 initramfs 的 "recovery" 项）。阶段 2 把
+# UFS 从内核里移出去之后它就不可能启动了：内核加载不到模块，root=/dev/sda31
+# 永远等不到设备。留着只会让人在开机菜单前犹豫，已删除。
 cp "$REPO/work/boot-fat.img" "$W/boot-cache.img"
 # mtools 原地改写 FAT32（无需 root / loop）
 mcopy -i "$W/boot-cache.img" -s "$STAGE/EFI" :: 2>/dev/null || { mmd -i "$W/boot-cache.img" ::EFI ::EFI/BOOT; mcopy -i "$W/boot-cache.img" -s "$STAGE/EFI" ::; }
 mmd -i "$W/boot-cache.img" ::loader ::loader/entries ::dtbs ::dtbs/qcom 2>/dev/null || true
-mcopy -i "$W/boot-cache.img" -o "$STAGE/loader/entries/steamos.conf" "$STAGE/loader/entries/steamos-direct.conf" ::loader/entries/
+mcopy -i "$W/boot-cache.img" -o "$STAGE/loader/entries/steamos.conf" ::loader/entries/
 mcopy -i "$W/boot-cache.img" -o "$STAGE/loader/loader.conf" ::loader/
 mcopy -i "$W/boot-cache.img" -o "$STAGE/linux.efi" "$STAGE/initramfs" ::
 mcopy -i "$W/boot-cache.img" -o "$STAGE/dtbs/qcom/sm8150-xiaomi-raphael.dtb" ::dtbs/qcom/
@@ -190,6 +187,7 @@ if [ -d "$REPO/scripts/raphael-overlay" ]; then
    done)
   chmod 755 "$TREE/opt/raphael/gadget.sh" 2>/dev/null || true
   chmod 755 "$TREE/opt/raphael/qcom-setup.sh" 2>/dev/null || true
+  chmod 755 "$TREE/opt/raphael/audio-route.sh" 2>/dev/null || true
   mkdir -p "$TREE/etc/systemd/system/sysinit.target.wants"
   ln -sf /etc/systemd/system/raphael-usb-gadget.service \
     "$TREE/etc/systemd/system/sysinit.target.wants/raphael-usb-gadget.service"
@@ -217,11 +215,31 @@ if [ -d "$REPO/scripts/raphael-overlay" ]; then
 
   # 首次开机扩根（照 alioth-firstboot）。哨兵必须由镜像带进来 ——
   # 脚本只删不建，没有它 resize2fs 永远不会跑，Steam 会撞上一个 12 GiB 的根。
-  chmod 755 "$TREE/usr/lib/steamos-arm/raphael-firstboot" 2>/dev/null || true
+  chmod 755 "$TREE"/usr/lib/steamos-arm/raphael-* 2>/dev/null || true
   mkdir -p "$TREE/var/lib"
   touch "$TREE/var/lib/raphael-firstboot-pending"
   ln -sf /etc/systemd/system/raphael-firstboot.service \
     "$TREE/etc/systemd/system/sysinit.target.wants/raphael-firstboot.service"
+
+  # 四个开机就要生效的：
+  #   audio-route   把 MultiMedia1 接到物理后端。**ASoC 的 mixer 状态是易失的**，
+  #                 重启就回到「FE 没有 BE」的默认值，播放直接 EINVAL。以前是
+  #                 手工跑脚本，一重启就没声音，原因就在这。
+  #   game-tune     有 Steam 游戏 scope 就提频
+  #   charge-guard  电池过 40 °C 就压输入电流（驱动不实现 JEITA）
+  #   thermal       温度分档压 CPU 上限频率（内核只有 90 °C 的 hot trip，且
+  #                 没有绑定任何 cooling device，90 °C 之前根本不降频）
+  #
+  # 链接放 /usr/lib/.../multi-user.target.wants，**不放 /etc**：运行时 /etc 是
+  # overlayfs（lower=/etc，upper=/var/lib/overlays/etc/upper），镜像里写进
+  # lower 的 wants 开机时 systemd 读不到 —— journal 里连一条记录都没有，
+  # 之后 daemon-reload 才会冒出来。/usr/lib 是真实 ext4，可靠。
+  mkdir -p "$TREE/usr/lib/systemd/system/multi-user.target.wants"
+  for u in raphael-audio-route raphael-game-tune raphael-charge-guard raphael-thermal; do
+    [ -f "$TREE/usr/lib/systemd/system/$u.service" ] &&
+      ln -sf "/usr/lib/systemd/system/$u.service" \
+        "$TREE/usr/lib/systemd/system/multi-user.target.wants/$u.service"
+  done
   echo "   overlay: $(find "$REPO/scripts/raphael-overlay" -type f | wc -l) 个文件"
 fi
 
@@ -231,6 +249,41 @@ fi
 rm -f "$TREE/usr/lib/systemd/system/efi.mount" \
       "$TREE/usr/lib/systemd/system/esp.mount" \
       "$TREE/usr/lib/systemd/system/home.mount"
+
+# --- InputPlumber：音量键 → Steam / QuickAccess -----------------------------
+# 这台机器只有三个物理键（音量加、音量减、电源）。Deck UI 在纯触摸下没有去
+# Steam 菜单和快捷菜单的路，所以两个音量键改当那两个按钮用 —— 靠 InputPlumber
+# 造一个虚拟 Steam Deck 手柄（`deck-uhid` target），Steam 只认手柄的
+# Guide / QuickAccess，键盘上没有等价物。
+#
+# **二进制和 usr/share 的资源必须一起装**。只装二进制时 InputPlumber 能起来、
+# 也能匹配到 event0/event3，但建不出虚拟手柄，日志只有一句误导性的
+#   Error adding device 'gpio-keys (event0)': Could not read: No such file or directory
+# strace 显示 /dev/uhid 从头到尾没被打开 —— 真正缺的是 profiles/deck-uhid.yaml。
+# 见 docs/raphael.md §30.4。
+#
+# libiio.so.0 是硬依赖（上游用它读手柄的 IIO 传感器），SteamOS 没有；连同
+# libavahi-client/common 放在 /usr/lib/raphael-inputplumber，由 unit 的
+# LD_LIBRARY_PATH 指过去，避免和系统同名库打架。
+IPBIN="$REPO/external-and-mods/InputPlumber/inputplumber-0.81.0-konkr"
+IPROOT="$REPO/external-and-mods/InputPlumber/rootfs"
+IPLIB="$REPO/work/inputplumber-libs"
+if [ -f "$IPBIN" ] && [ -d "$IPROOT/inputplumber" ]; then
+  install -m0755 "$IPBIN" "$TREE/usr/bin/inputplumber"
+  cp -a "$IPROOT/." "$TREE/usr/share/"
+  if [ -d "$IPLIB" ]; then
+    mkdir -p "$TREE/usr/lib/raphael-inputplumber"
+    cp -a "$IPLIB"/*.so* "$TREE/usr/lib/raphael-inputplumber/" 2>/dev/null || true
+  else
+    echo "   警告: work/inputplumber-libs 不存在，inputplumber 会因缺 libiio.so.0 起不来"
+  fi
+  mkdir -p "$TREE/usr/lib/systemd/system/multi-user.target.wants"
+  ln -sf /usr/lib/systemd/system/inputplumber.service \
+    "$TREE/usr/lib/systemd/system/multi-user.target.wants/inputplumber.service"
+  echo "   InputPlumber: $(find "$IPROOT" -type f | wc -l) 个资源文件"
+else
+  echo "   提示: 没有 InputPlumber 二进制/资源，音量键不会映射成 Steam 键"
+fi
 
 # 同样的 GPU 固件在 rootfs 里也放一份（systemd 起来后重新 probe / 用户态查询用）。
 FWDIR="$TREE/usr/lib/firmware/qcom/sm8150/Xiaomi/raphael"
