@@ -2533,3 +2533,684 @@ systemctl is-active inputplumber
 
 然后按音量加 → Steam 菜单，音量减 → 快捷菜单。反了就把
 `raphael_keys.yaml` 里两条 mapping 的 keycode 对调。
+
+## 29. 照 alioth 补的两件：调速器与充电看门狗（2026-11-08 21:10）
+
+「还有什么要做」的答案不能只看验收表 —— alioth 那 12 项 PASS 之后还做了两周
+优化，其中两件对掌机体验影响最大，raphael 一件都没有。这一节记的是差距怎么
+对出来的、以及为什么两份脚本不能逐字抄。
+
+### 29.1 对照结果
+
+| alioth 有 | raphael | 结论 |
+|---|---|---|
+| `alioth-game-tune` | 无 | **移植**，见 29.2 |
+| `alioth-charge-guard` | 无 | **移植**，见 29.3 |
+| UCM2（`ucm2/Xiaomi/Alioth`） | 无 UCM，靠裸 PCM | 待办（§26.1 的 P0 尾巴） |
+| `77-*-access.conf`（nospatial 权限管理器） | 无 | **不抄**：那是为 UCM 节点名 `…HiFi__Speaker__sink` 准备的，我们用 `api.alsa.use-acp=false`，节点是 `…playback.0.0`，不在剥夺列表里，且已出声 |
+| mangoapp | 未验 | 先看 msm 是不是 `card0` |
+| `alioth-write-boot` / `mark-slot-successful` | — | **不适用**：单槽 U-Boot，DTB 走 ESP 外部加载 |
+
+验收表其余未过的项不变：s2idle 待机、蓝牙 BD_ADDR + 手柄、边充边玩温度、
+Game Mode 电量、音量键实测（§26.2）。
+
+### 29.2 `raphael-game-tune`
+
+alioth 实测（`docs/alioth.md`「帧率」）：48.40 → 60.00 fps，瓶颈是**升频爬坡**
+不是算力（performance 下 CPU 占用从 33% 降到 24%）。
+
+**真机实测（2026-11-08 21:10）推翻了动手前的两条预判：**
+
+```
+/sys/class/devfreq/2c00000.gpu
+  available_frequencies   257 345 427 499.2 585 675 MHz
+  available_governors     userspace simple_ondemand     <-- 没有 performance，
+                                                            也没有 msm-adreno-tz
+  min_freq / max_freq     257 MHz / 675 MHz，两个都可写
+```
+
+所以 GPU 那半边**不能照抄 alioth 切 governor**：这台内核根本没编进 performance，
+写进去只会 EINVAL。改成把 `min_freq` 顶到当前 `max_freq` —— simple_ondemand
+算出来的目标频率会被 core clamp 到 `[min,max]`，`min==max` 就等于钉在顶档。
+真机往返验过：写 `675000000` → 2 秒后 `cur_freq=675000000`；写回 `257000000`
+→ 回到 257 MHz。
+
+和 alioth 那份的三处差别，都是 raphael 特有的：
+
+1. **GPU 路径不写死**，按 `/sys/class/devfreq/*gpu*` 自动找；有 `performance`
+   就切 governor（留作前向兼容），没有就退回 `min_freq` 钉顶，两者都没有就只调
+   CPU 并说出来。
+2. **不猜空闲调速器是谁。** 启动时把每个 policy 和 GPU 的原值快照到
+   `/run/raphael-game-tune.orig`，退出时原样写回。alioth 写死 `schedutil` 是它
+   自己 DTS 的默认；抄过来一旦内核默认变了，恢复会把频率钉到一个这台机器不用
+   的调速器上，且没有任何症状。
+3. **不碰亲和。** alioth 量过绑大核是负优化（36.79 vs 48.40 fps），这条一起
+   继承，断言里有一条 grep 守着。
+
+**快照为什么落文件**：服务是 `Restart=on-failure`。只放内存的话，崩溃重启时
+调速器正处在 performance，重新快照会把它当成「原值」，从此永远恢复不回去。
+`/run` 是 tmpfs，一次开机内有效，stop 时删掉。
+
+`--once` 单轮评估、`--status` 打印现状，都用环境变量把路径指到假 sysfs，不必
+在真机上来回切调速器。
+
+### 29.3 `raphael-charge-guard`
+
+`qcom_pm8150b_charger` **不实现 JEITA**（驱动里一个 jeita 字都没有），同一个
+驱动、同一个缺口。但真机（2026-11-08 21:10）有三处和 alioth 不一样：
+
+```
+/sys/class/power_supply/        只有 `battery` 和 `usb`（不是 pm8150b-charger）
+usb/current_max                 -r--r--r--   只读，写进去 Permission denied
+usb/input_current_limit         -rw-r--r--   可写（QTI 的 ICL）
+                                往返 500000 → 1000000 → 500000 验过
+```
+
+三个因此改掉的东西：
+
+1. **节点探测放宽到 `*charger* | usb`**，并要求带 `current_max` 或
+   `input_current_limit`，避免误选 battery。
+2. **闸门优先 `input_current_limit`。** 这里踩了一个很隐蔽的坑：以 root 跑的时候
+   `[ -w ]` 对 0444 的文件**也返回真**，所以手工检查「能写」是假象 —— 第一版
+   上了设备之后每 10 秒一条 `Permission denied`，而人工 `[ -w ]` 检查是通过的。
+   现在看 `stat -c %A` 的权限位。
+3. **满档不取启动值。** 插在电脑 USB 口时 ICL 只有 500 mA（SDP），换个 33 W 头
+   驱动会重新协商成 3 A 左右。如果把 500 mA 当成「满档」记下来，降温恢复会把
+   大电源反压回 500 mA —— 用户看到的是「充电莫名其妙变慢」。改成：进入限流的
+   那一刻记住当时的 ICL，恢复时写回它；同时每轮检查「当前值 != 我们自己最后
+   写的值，且比目标大」—— 那只能是外部换了电源，于是更新记住的值。
+
+第二个改动是断言逼出来的：第一版只看 `cur > target`，从 1.5 A 降到 1.0 A 时把
+自己上一档的值当成了「外部调高」，记住的满档被污染成 1.5 A，37 °C 时恢复到
+1.0 A 而不是 3.3 A。现在状态文件里存两个数（`SAVED` 和我们最后写的 `LAST`），
+`assert-raphael-chargeguard.sh` 里有一条 SDP→DCP 的用例守着。
+
+档位照 alioth：40/43/45 °C → 1.5/1.0/0.5 A，38 °C 以下恢复，中间是迟滞。读不到
+温度按最热档处理 —— 「读不到」不是「不热」。
+
+### 29.4 验证
+
+两个脚本都在假 sysfs 上跑过，不需要真机：
+
+| 场景 | 结果 |
+|---|---|
+| game-tune 有游戏 | `cpu=performance`，GPU 按模式（governor 或 min_freq 顶档） |
+| game-tune 游戏退出 | 回到原值（测试里原值设成 `powersave`，不是写死的 schedutil） |
+| game-tune 服务重启（governor 被留在 performance） | 从 `/run` 快照恢复回原值 |
+| game-tune GPU 没有 performance | 退回 `min_freq` 钉顶，退出放回 257 MHz |
+| game-tune GPU 节点缺失 | 只调 CPU，不崩 |
+| game-tune SIGTERM | 恢复 + 删快照（`timeout -s TERM 3` 实测） |
+| charge-guard 25/35/40.5/42.5/46/39/37 °C | 3.3A→3.3A→1.5A→1.5A→0.5A→保持0.5A→3.3A |
+| charge-guard 读不到温度 | 压到 0.5 A |
+| charge-guard 重启（停在 500 mA） | 按记住的值恢复到 3.3 A |
+| charge-guard SDP→DCP | 记住的值跟着更新成 3 A，降温恢复 3 A 而不是 500 mA |
+
+一个自己踩的坑：`--once` 分支必须排在 `trap ... EXIT` **之后**再 `trap -`，
+否则 `exit 0` 会触发恢复路径，把刚写下去的降档值又放回去 —— 看起来像「什么都
+没发生」。第一版就是这么写的，测试里 7 个温度档全都读回原值。
+
+上面这些场景都固化成了断言脚本（照 `assert-alioth-gametune.sh` /
+`assert-alioth-chargeguard.sh` 的写法，不需要真机）：
+
+```sh
+bash scripts/assert-raphael-gametune.sh     # 14 条
+bash scripts/assert-raphael-chargeguard.sh  # 17 条
+```
+
+`assert-raphael-gametune.sh` 里的「原值」故意设成 `powersave`（不是内核默认的
+`schedutil`）—— 只有这样才分得出「恢复原值」和「恢复写死的 schedutil」。
+
+写断言时又踩了一个 Git Bash 的坑：`mktemp -d` 返回的是
+`C:\Users\…\Temp/tmp.xxx`（`$TMPDIR` 是 Windows 形式），带盘符的路径会被沙盒的
+`rm` 包装器拒绝（`embedded drive prefix`），于是 `mkfake` 的 `rm -rf` 静默失败、
+上一轮的 `app-steam-app*.scope` 留着 —— 断言报「游戏退出后没恢复」，而脚本
+其实是对的。两个脚本都在 `mktemp` 之后补了 `T="$(cd "$T" && pwd)"`。
+`assert-alioth-gametune.sh` / `assert-alioth-chargeguard.sh` 有同样的隐患，只是
+它们没在这台 Windows 上跑过。
+
+### 29.5 部署（2026-11-08 21:15，已在真机上）
+
+`scripts/build-raphael-reference.sh` 已把两个脚本 chmod 755 并链接进
+`multi-user.target.wants`；`scripts/raphael-apply-overlay-live.ps1` 推完会
+`systemctl enable --now` 并打印 `ActiveState`/`ConditionResult`。
+
+真机结果（md5 与仓库逐字一致，两个 unit 都 `active`）：
+
+```
+raphael-game-tune     active   mode=minfreq  governor=simple_ondemand
+                               available="userspace simple_ondemand"
+                               min=257000000 max=675000000  policy0/4/7=schedutil
+raphael-charge-guard  active   闸门=/sys/class/power_supply/usb/input_current_limit
+                               现在=500000（SDP） 限流中=0  电池=36.7°C
+```
+
+端到端（用 `systemd-run --scope --unit=app-steam-app9999-1 sleep 14` 伪造一个
+游戏 scope，不必真起游戏）：
+
+```
+21:25:36  出现 scope  -> policy0/4/7=performance, gpu min_freq=675000000, cur_freq=675000000
+21:25:50  scope 消失  -> policy0/4/7=schedutil,    gpu min_freq=257000000
+```
+
+### 29.6 顺带修掉的：qcom 栈有**两套**进程
+
+`raphael-apply-overlay-live.ps1` 结尾对 qcom 三件套做的是
+`systemctl restart raphael-qrtr-ns raphael-rmtfs raphael-tqftpserv`。真机上这次
+restart 之后 `raphael-rmtfs` 一直停在 `activating`，`NRestarts=170`，每 3 秒：
+
+```
+rmtfs[82411]: ERROR libqrtr: bind(14): Address already in use
+rmtfs[82411]: failed to create qrtr socket
+```
+
+`bind(14)` 里的 14 是 **fd**，不是 service id。先怀疑是 restart 期间旧进程没回收，
+`kill 437` 之后 systemd 下一轮确实绑上了 —— 但继续查进程表，根因更深：
+
+```
+/proc/434  qrtr-ns      <-- setsid 起的，systemd 不知道
+/proc/440  tqftpserv    <-- 同上
+/proc/85788 qrtr-ns     <-- systemd 的
+/proc/85825 rmtfs       <-- systemd 的
+/proc/85828 tqftpserv   <-- systemd 的
+```
+
+`opt/raphael/qcom-setup.sh`（由 gadget.sh 调用）里有一段 `start_stack()`，直接
+`setsid` 起这三个二进制；后来另外又写了三个 systemd unit。**两套并存**：
+`systemctl stop` 只停得掉 systemd 那套，setsid 的孤儿从 19:39 那次开机一直活到
+现在，占着 qrtr 端口 —— 于是 systemd 的 rmtfs 永远绑不上，`Restart=always`
+把它变成每 3 秒一轮的循环。
+
+两处都改了：
+
+1. `start_stack()` 先 `systemctl start`（有依赖顺序、Restart、统一日志），
+   `sleep 1` 后只对 **pidof 查不到**的那几个 `setsid` 兜底 —— 正常情况只有一套。
+2. wlan0 60 秒兜底分支里原来是 `kill` 三个进程再 `start_stack`，同样改成
+   `systemctl stop` → `start` 按依赖顺序，避免又造出孤儿。
+
+真机验证（幂等）：推上去跑一次 `sh /opt/raphael/qcom-setup.sh`，`rc=0`，
+`pidof rmtfs qrtr-ns tqftpserv` 还是原来那 5 个 pid，**没有新起进程**；日志里
+`qcom_rmtfs_mem1` 与 `wlan0` 都是 0 秒就绪。
+
+设备上现有的两个孤儿（434 / 440）要等下次开机才会消失 —— 它们不影响功能，
+WiFi 和 5G 都正常，只是脏。下次重启后 `pidof` 应该只剩 3 个 pid，那才算这件事
+真正收口。
+
+## 30. 第一次重启回归：三个 unit 没起、声音没了、音量键没映射（2026-11-08 21:45）
+
+上一节结尾留了两个孤儿进程要重启才能清掉。用户重启（21:33）之后，三件事同时
+不对了 —— 而且它们的根因**各不相同**，其中两个是结构性的。
+
+### 30.1 症状与判定
+
+| 症状 | 现场证据 | 结论 |
+|---|---|---|
+| 没有声音 | `amixer cget 'QUAT_MI2S_RX Audio Mixer MultiMedia1'` = `values=off`（重启前是 on） | 外放路由没被设，不是 PipeWire 的问题 |
+| 音量键没反应 | `systemctl is-active inputplumber` = `inactive` | 守护进程根本没起来 |
+| 三个守护全没了 | `ActiveState=inactive` + `UnitFileState=enabled` + `ConditionResult=no` + **journal 里一条记录都没有** | 不是启动失败，是**从没被调度** |
+
+顺带确认了正面的两件事：`pidof rmtfs qrtr-ns tqftpserv` = 3 个 pid（孤儿如预期
+消失），5G 开机自动连上（5180 MHz，−26 dBm，866 Mbps）。
+
+### 30.2 声音为什么重启就没了：`audio-route.service` 从来没 enable 过
+
+`raphael-audio-route.service` 从头到尾**没有任何一处 enable 它**：
+`build-raphael-reference.sh` 的 `multi-user.target.wants` 循环里只有
+`raphael-game-tune` / `raphael-charge-guard`，`raphael-apply-overlay-live.ps1`
+的 `systemctl enable` 列表里也没有。
+
+之前「听到声音」是因为当时手工跑过 `/opt/raphael/audio-route.sh speaker`。
+**ASoC 的 mixer 开关是运行时状态，不存进任何地方** —— 内核重新 probe 声卡之后
+就回到 DTS 默认值（FE 没有 BE 连着），播放直接 EINVAL，PipeWire 那边就是
+「有 sink 但没声」。
+
+修法（三处，缺一不可）：
+
+1. `build-raphael-reference.sh`：`chmod 755 /opt/raphael/audio-route.sh` +
+   `multi-user.target.wants` 里加上 `raphael-audio-route`
+2. `raphael-apply-overlay-live.ps1`：`systemctl enable --now` 列表加上它
+3. `audio-route.sh`：加 `wait_ctl`，开机时最多等 30 s 让 mixer 控件出现 ——
+   `sound.target` 变 active 只代表「有一张声卡注册了」，控件是
+   `msm-snd-sm8150` probe 的后半段才挂出来的，中间有几百毫秒到几秒的窗口。
+   手工跑的时候声卡早就绪，看不出这个问题；做成 service 就会踩上。
+
+### 30.3 结构性发现：`/etc` 是 overlay，**运行时 enable 的 wants 链接开机不被读**
+
+这是这一轮最有价值的发现，解释了一整类「明明 enable 了却不开机自启」。
+
+```
+$ findmnt -T /etc/systemd/system
+TARGET SOURCE   FSTYPE  OPTIONS
+/etc   overlay  overlay rw,relatime,lowerdir=/etc,
+                        upperdir=/var/lib/overlays/etc/upper,workdir=/var/lib/overlays/etc/work
+```
+
+SteamOS 的根是只读镜像，`/etc` 用 overlayfs 叠了一层可写 upper。Systemd 解析
+`multi-user.target` 的依赖时，如果 `/etc` 的 overlay 还没合并（或合并的是 lower
+那一层），就看不到 upper 里那些**运行时新增**的 `.wants` 链接；而它不会在之后
+重扫 —— 于是这些 unit 这一整次开机都不存在，journal 里连一行「跳过」都没有。
+
+证据链：
+
+- `/var/lib/overlays/etc/upper/systemd/system/multi-user.target.wants/` 里确有
+  `raphael-audio-route.service`、`raphael-game-tune.service`、
+  `raphael-charge-guard.service`、`inputplumber.service`（说明磁盘上是对的）
+- 但 `systemctl show multi-user.target -p Wants` 只列得出 `raphael-debug-shell.service`
+- **`systemctl daemon-reload` 之后，三条立刻出现在 Wants 里** —— 纯粹的「内存里
+  没有 vs 磁盘上有」
+
+为什么 qcom 三件套（同样在 upper 里）还活着：**它们不是靠 wants 起来的**，
+`opt/raphael/qcom-setup.sh` 自己 `systemctl start` 了它们（§29.6 刚改的）。
+这一点很关键 —— 如果按「wants 生效」去反推，会得出错误结论。
+
+修法：把链接放到 `/usr/lib/systemd/system/multi-user.target.wants/`。那是 root
+上的真实 ext4（`/` 就是 `/dev/loop0`，`/usr` 没有单独 overlay），systemd 一定
+读得到；Valve 自己的 `dbus.service` / `systemd-logind.service` 就在这个目录。
+`enable` 建的 `/etc` 链接留着无妨（换个内核/镜像之后可能又正常）。
+
+> 构建时写进 `$TREE/etc/systemd/system/multi-user.target.wants` 是**有效**的 ——
+> 那时它进的是镜像的 lower 层，开机时 systemd 读 lower 没问题（avahi、
+> debug-shell 这些能起来就是证据）。只有「装好系统之后运行时 enable」才有这个坑。
+
+### 30.4 音量键：配置全对，但内核没有 UHID
+
+InputPlumber 补了两处之后确实起来了（`active`）：
+
+1. **dbus 策略缺失**（新文件 `usr/share/dbus-1/system.d/org.shadowblip.InputPlumber.conf`）。
+   上游 release 包会装它，我们只搬了二进制，于是启动即死：
+   ```
+   Error requesting dbus name: org.freedesktop.DBus.Error.AccessDenied:
+   Request to own name refused by policy
+   ```
+   以 root 跑、`Type=simple`、`Restart=on-failure` → 每秒重启一次，四秒后
+   `Start request repeated too quickly`。补策略 + `systemctl reload dbus-broker` 后正常。
+
+2. 设备匹配也是对的：
+   ```
+   Found a matching input device evdev://event0 in config "/etc/inputplumber/devices.d/02-xiaomi-raphael.yaml"
+   Creating CompositeDevice with config: Xiaomi Redmi K20 Pro
+   ```
+
+然后卡在最后一步：
+```
+Error adding device 'gpio-keys (event0)': Could not read: No such file or directory (os error 2)
+Error adding device 'pm8941_resin (event3)': Could not read: No such file or directory (os error 2)
+```
+
+`/dev/input/event0` 明明在（`crw-rw---- root input`），`/dev/uhid` 不在：
+
+```
+$ ls /sys/class/misc/    # autofs cpu_dma_latency efi_capsule_loader ... watchdog
+$ modprobe uhid
+modprobe: FATAL: Module uhid not found in directory /lib/modules/7.3.0-raphael-steamos
+$ zgrep -i 'UHID\|UINPUT' /proc/config.gz
+# CONFIG_INPUT_UINPUT is not set
+# CONFIG_UHID is not set
+```
+
+`deck-uhid` 这个 target 就是「用 UHID 造一个虚拟 HID 设备」，没有 `/dev/uhid`
+它连第一步都做不到，报的却是误导性的 "Could not read: No such file or directory"
+（读的是 devnode，不是 event0）。
+
+**这不是配置能解决的，要重编内核。** 已在
+`external-and-mods/kernel-sm8150/steamos.config` 里加上：
+
+```
+CONFIG_UHID=y
+CONFIG_INPUT_UINPUT=y
+```
+
+用 `=y` 不用 `=m`：各几十 KB，而 `=m` 又要决定「谁在 InputPlumber 之前 insmod」，
+udev 的模块自动加载晚于 multi-user，靠不住。UHID 是纯软件设备、没有 probe 时序
+风险，和 §13 里 UFS 必须 `=m` 的结论不冲突。
+
+重编之后要换**两样**东西：ESP 上的 `linux.efi`（内核 Image，`losetup -b 512
+/dev/sda29` → mount → 覆盖，不用刷 boot 分区），以及 rootfs 的
+`/usr/lib/modules/7.3.0-raphael-steamos/`（模块树，即使没有新 .ko，版本串一致但
+`modules.dep` 也要同步）。
+
+### 30.5 删掉 `steamos-direct.conf`
+
+用户问「U-Boot 的启动为什么有两个选项」——那不是 U-Boot 的，是 systemd-boot 的
+菜单：`bootcmd=bootefi bootmgr` 立刻把控制权交出去了，U-Boot 自己那个 11 项菜单
+只有 `bootefi` 失败才会出现。
+
+两项来自 ESP 上两个 loader entry。第二项 `steamos-direct.conf` 标题写着
+"no initramfs (recovery)"，但 §13 之后它**不可能启动**：UFS 是模块，没有
+initramfs 就没人 insmod，`root=/dev/sda31` 永远等不到设备。它是阶段 1（内核里
+还编着 UFS）的遗留物。
+
+已删：构建脚本里去掉生成那一段（改成一行注释说明为什么删），设备上从 ESP 删掉
+`loader/entries/steamos-direct.conf` 及其 `.bak`。现在 `loader/entries/` 只剩
+`steamos.conf`（+ 一个 regdom 之前的 `steamos.conf.bak`，systemd-boot 不匹配
+`*.conf` 所以不会显示）。
+
+### 30.6 这一轮之后的设备状态
+
+| 项 | 状态 |
+|---|---|
+| `raphael-audio-route` | `active`，`QUAT_MI2S_RX=on`，外放有声 |
+| `raphael-game-tune` / `charge-guard` | `active` |
+| `inputplumber` | `active` 但建不出虚拟手柄（等 UHID 内核） |
+| qcom 三件套 | `active`，3 个 pid，无孤儿 |
+| 5G | 自动连上，−26 dBm / 866 Mbps |
+| 启动菜单 | 单项 |
+| 开机自启 | 三处修好，**待下次重启验证 /usr/lib 那层链接是否真的被读** |
+
+## 31. 温控：90 °C 之前内核一次都不降频（2026-11-08 22:40）
+
+用户问「为什么这么烫」。不是手感问题 —— 这台机器的内核**没有降频这条路径**。
+
+### 31.1 内核提供了什么、实际绑了什么
+
+```
+thermal_zone5 (cluster0)
+  trip_point_0_type = hot        trip_point_0_temp = 90000
+  trip_point_1_type = critical   trip_point_1_temp = 110000
+
+thermal_zone5/ 下没有任何 cdev* 条目
+cooling_device0..3 = cpufreq-cpu0 / cpufreq-cpu4 / cpufreq-cpu7 / devfreq-2c00000.gpu
+                     —— 四个都在，一个都没被 trip 绑定
+```
+
+`hot` 只发一条通知，`critical` 直接关机。中间 20 °C 是空白：**cluster0 跑到
+79.9 °C 和 40 °C 时的行为完全一样**。Android 那边这段区间是 thermal-engine 在管
+（按外壳温度约 42 °C 持续压频），移植过来没有这个东西，SoC 就一直「能跑多快跑多快」。
+
+真机静置实测（Steam UI 里待着，没开游戏，CPU 35%）：
+
+```
+thermal_zone5  (cluster0)      79.9 °C
+thermal_zone12 (cpu5-bottom)   81.8 °C
+policy0 300000..1785600   policy4 710400..2419200   policy7 825600..2841600
+/sys/class/devfreq/ 只有 2c00000.gpu，governor 只有 userspace simple_ondemand
+```
+
+### 31.2 为什么是「用户态压上限频率」
+
+两条路都没走：改 DTS 加 passive trip 需要重编内核且 cooling map 要重新验证；
+只记录不动作等于什么都没解决。用户态守护能在不动机器的情况下先止住温度。
+
+关键是**只写 `scaling_max_freq`，绝不碰 `scaling_governor`**：
+
+- game-tune（§29）写的是 governor 和 GPU 的 min/max。两个写者抢同一个属性，
+  结果一定是「谁最后写谁赢」，而两边都不知道对方存在。
+- governor 回答「怎么选频」，`max_freq` 回答「能选到多高」。压上限对
+  schedutil 和 performance 都成立 —— 游戏里 game-tune 切到 performance 之后，
+  温控照样限得住。
+- GPU 不归它管：game-tune 在游戏里把 GPU min 顶到 max，这边再动 max 会让两边
+  互相夹掉对方的设定。
+
+档位（`TIER_*`，充电时整体下移 `CHARGE_SHIFT=3000` mC，因为充电本身就多几瓦）：
+
+| 档 | 进入 | 退出 | policy0 | policy4 | policy7 |
+|---|---|---|---|---|---|
+| original | — | — | 1785600 | 2419200 | 2841600 |
+| warm | 78 °C | 72 °C | 1555200 | 1920000 | 2131200 |
+| hot | 84 °C | 79 °C | 1305600 | 1612800 | 1804800 |
+| critical | 88 °C | 84 °C | 1113600 | 1401600 | 1497600 |
+
+三条细节，都是踩过之后才写对的：
+
+1. **进档门槛和退档门槛必须分开**（78 进 / 72 退）。贴着门槛抖的话，每 5 s
+   重写一次 sysfs，每次都是一轮调频决策，温度反而更不稳。
+2. **不往上抬**。挑频是在 `scaling_available_frequencies` 里取 ≤ cap 的最高一档，
+   但取到之后还要和「原值」比：比原值高就用原值。否则降档之后原值被抬高，
+   回不去了。
+3. **原值快照落 `/run/raphael-thermal.orig`**（tmpfs）。`Restart=on-failure`
+   重启时如果按当前值取原值，会把正被压着的档位当成满档，从此再也放不回去 ——
+   和 game-tune 是同一个坑。
+
+传感器只认 `*-bottom-thermal` 与 `cluster0-thermal`（这块板子命中 5 个），
+**故意排除 `gpu-top-thermal`**：那是 SoC 最热点，跟着它压会把 CPU 压得过早，
+而 GPU 在待机时本来就停在 257 MHz。
+
+`--once` 走 `settle_tier`（一次收敛到稳态，给断言用），常驻循环只走 `next_tier`
+（一次一档，不会从 0 直接跳到 critical）。
+
+### 31.3 落地与验证
+
+- `scripts/raphael-overlay/usr/lib/steamos-arm/raphael-thermal` + 同名 `.service`
+- `scripts/assert-raphael-thermal.sh`：18 条断言，用假 sysfs（`RAPHAEL_THERMAL_CPUFREQ`
+  等环境变量把路径指到临时目录），不碰真机
+- 开机自启挂在 `/usr/lib/systemd/system/multi-user.target.wants/`（理由见 §30.3）
+
+断言自己有四个坑，值得记：
+
+- **假 sysfs 的原值不能取顶档**。第一版原值取 1478400（低于 warm 的 1555200），
+  于是「79 °C 该落到 warm」被「不往上抬」规则挡住 —— 脚本是对的，断言是错的。
+  改成 1632000 / 2323200 / 2745600 才区分得出「恢复原值」和「写成最高频」。
+- **`--once` 测不到迟滞**：它每次从 0 档重新评估，无状态。迟滞只能用常驻模式 +
+  改假 zone 里的 `temp` 来验（78 → 76 时不许动）。
+- **固定 `sleep` 会假失败**：Git Bash 下 fork 慢，服务还没动就断言了。改成
+  `wait_maxes()` 轮询。
+- **grep 会命中注释**：断言「脚本里没有写 scaling_governor」第一次失败，命中的
+  是文件头那几句解释。先 `sed 's/#.*//'` 再 grep。
+
+真机结果（服务上线约 1 分钟后）：
+
+```
+raphael-thermal: hottest=79100mC shift=3000mC charging=yes
+raphael-thermal: zones=5
+raphael-thermal:   policy0 max=1555200 orig=1785600
+raphael-thermal:   policy4 max=1920000 orig=2419200
+raphael-thermal:   policy7 max=2131200 orig=2841600
+
+thermal_zone12 (cpu5-bottom): 81.8 °C -> 73.6 °C
+```
+
+## 32. 蓝牙：控制器「不出现」和控制器「撒谎」是两件事（2026-11-08 23:20）
+
+用户问「为什么蓝牙还不行，完全搜不到其他设备」。表面现象是一个
+（`hciconfig` 有 hci0 但 DOWN、`btmgmt info` 是 `Index list with 0 items`），
+底下是两层完全不同的故障，第一层修完才看得见第二层。
+
+### 32.1 第一层：控制器没有 BD 地址，内核把它标成 unconfigured
+
+WCN3990 的 NVM 里没有出厂 BD 地址。`qca_check_bdaddr()`（`btqca.c`）在 vendor
+setup 里读一次 `Read BD Address`，读到全零（或 ROM 的默认值）就给 hdev 打上
+`HCI_QUIRK_USE_BDADDR_PROPERTY`，转而去设备树里找 `local-bd-address`。
+
+那个属性**故意没写**，DTS 里留了注释（`sm8150-xiaomi-raphael.dts:633`）：
+
+> No local-bd-address on purpose: this DTS is shared by every K20 Pro and the
+> factory BD address is per-device. It is provisioned at runtime from the modem
+> NV store (QMI DMS) via MGMT_OP_SET_PUBLIC_ADDRESS; see the raphael-macaddr
+> service in the k20pro-linux repo.
+
+**那个 `raphael-macaddr` 服务从来没被实现过**（`/d/Developer/Repo/linux-raphael`
+里也没有，它是个纯净的主线树）。没人补地址的后果不是「地址显示成
+00:00:00:00:00:00」，而是：
+
+```
+hciconfig hci0  ->  DOWN，Can't init device hci0: Operation not supported (95)
+btmgmt info     ->  Index list with 0 items      # mgmt 里根本没有这个控制器
+```
+
+手动补一次就能验证这条链：
+
+```
+btmgmt -i 0 public-addr 39:90:21:64:07:01
+hciconfig hci0          ->  ACL MTU: 1024:7  SCO MTU: 60:8   # 真的初始化了
+```
+
+`MGMT_OP_SET_PUBLIC_ADDRESS`（`mgmt.c: set_public_address()`）的三个约束决定
+了服务必须怎么写：
+
+- 控制器**已上电**就直接 `MGMT_STATUS_REJECTED`；
+- `hdev->set_bdaddr` 为空是 `NOT_SUPPORTED`（hci_uart 提供了）；
+- 设完如果 `is_configured()`，内核自己清 `HCI_UNCONFIGURED`、打 `HCI_CONFIG`、
+  queue `power_on` —— 也就是**设置动作本身会把控制器拉起来**，走一遍完整的
+  vendor setup + init。
+
+### 32.2 第二层：控制器在 LE 命令位图上撒谎
+
+有了地址，初始化终于往下走了，然后停在这里（`btmon`）：
+
+```
+< HCI Command: LE Read Transmit Power (0x08|0x004b) plen 0
+> HCI Event: Command Complete (0x0e)
+      Status: Unknown HCI Command (0x01)
+```
+
+`LE Read Transmit Power` 在它自己的 `Read Local Supported Commands` 位图里是
+置位的，命令发过去它说不认识。内核把这条当致命错误：
+
+```
+hci_le_read_tx_power_sync()  ->  -EBADRQC  ->  hci_init_stage_sync() 直接 return
+                             ->  hci_init_sync() 失败 -> hci0 保持 DOWN
+```
+
+先按上游惯例加了一个 quirk 绕开它（`HCI_QUIRK_BROKEN_READ_TRANSMIT_POWER`，
+`btbcm`/`btusb` 对同类控制器也这么干），结果**下一条又来了**：
+
+```
+< HCI Command: LE Set Default PHY (0x08|0x0031) plen 3
+      Status: Unknown HCI Command (0x01)
+hci0: Opcode 0x2031 failed: -56
+```
+
+两件事因此定论：
+
+- **不是位图乱码**。`Read Local Supported Commands` 返回 237 条，逐条解码都正常，
+  它是「整齐地撒谎」。所以「再补一个 quirk」这条路不收敛 —— 补完 0x204b 冒出
+  0x2031，后面还有一串。
+- 用户态看到 `38 (ENOSYS)` 和 `56 (EBADRQC)` 都**不要按字面理解**：38 是 mgmt 层
+  把不认识的状态兜底成 ENOSYS，56 是 `bt_to_errno()` 给状态 0x01 的映射。真正的
+  信息在 `btmon` 的 `Status: Unknown HCI Command` 里。
+
+### 32.3 两个补丁
+
+`patches/0003`（已生效，保留）：WCN3990 上置
+`HCI_QUIRK_BROKEN_READ_TRANSMIT_POWER`，在 `qca_uart_setup()` 里、
+`qca_check_bdaddr()` 之后。
+
+`patches/0004`（**尚未编译**）：新增 `HCI_QUIRK_TOLERATE_UNKNOWN_INIT_CMD`，
+在 `hci_init_stage_sync()` 的循环里把 `-EBADRQC` 变成「记一条 info、跳过这一条」，
+并在 `qca_uart_setup()` 里对 `QCA_WCN3990` 打开它。
+
+为什么放在这一层而不是继续加 quirk：
+
+- 状态 0x01 的语义是「控制器不知道这个 opcode」。既然什么都没执行，就没有
+  「重试」和「回滚」可言，跳过是唯一有意义的解释。
+- init stage 的每一条本来就是「有就用、没有就算了」的探测（大部分还额外用
+  capability 位图做过守卫）。位图骗人的时候，唯一的补偿就是别信它。
+- 容忍范围是**整个 init stage 表**（含 BR/EDR 那几张）。只漏 `Unknown HCI Command`
+  一种状态，别的错误照旧致命。
+
+写补丁时的两个实操坑：
+
+- hunk 头必须和真实行数一致。照抄上下文写了 `@@ -995,5 +995,21 @@` 会得到
+  `malformed patch`，得是 `@@ -995,7 +995,23 @@`。
+- 先用 `patch -d <临时副本> -p1 -N --dry-run -s` 干跑，再进 13 分钟的构建。
+
+### 32.4 地址怎么补：`/etc/raphael-bdaddr` + `bluetooth.service` 的 drop-in
+
+新增三样东西：
+
+| 文件 | 作用 |
+|---|---|
+| `etc/raphael-bdaddr` | 一行地址（可带注释），人改的就是这个文件 |
+| `usr/lib/steamos-arm/raphael-macaddr` | oneshot：等 hci0 → `btmgmt public-addr` → 幂等返回 |
+| `usr/lib/systemd/system/bluetooth.service.d/52-raphael-macaddr.conf` | `Wants=` + `After=raphael-macaddr.service` |
+
+三个设计决定：
+
+- **不放 DTS**。DTS 里那句话是对的：地址是每台机器一份，DTS 是全机型共用。
+  放 `/etc` 还多一个好处 —— 改完 `systemctl restart bluetooth` 就生效，不用重编
+  DTB 再换 ESP 上的文件。
+- **不做成 `WantedBy=multi-user.target`**。`bluetooth.target` 自己排在
+  `bluetooth.service` 之后，任何挂到 target 上的 unit 都可能和目标绕成顺序环。
+  挂在 `bluetooth.service` 身上只有一条边：`Wants=raphael-macaddr` +
+  `After=raphael-macaddr`。
+- **顺序必须由 systemd 保证**，不能靠「大概来得及」：bluetoothd 一启动就
+  AutoEnable，而 mgmt 那个 op 对已上电的控制器直接拒绝（§32.1）。
+
+地址本身是**我们自己定的**，不是原厂值。查过的地方：`/persist/bluetooth` 是空的
+（MIUI 不往那儿写），`/persist/properties` 也没有，`bluetooth` 分区只有 QCA
+固件（`crbtfw*.tlv` / `crnv*.bin`），WLAN 的 MAC 是 `16:61:04:7f:cf:6a`
+（`addr_assign_type=0`，所以那是真 MAC，和蓝牙地址没有可推导的关系）。原厂值随
+Android 的 `/data/misc/bluetooth` 一起被 `erase userdata` 抹掉了。
+
+所以固定成 `39:90:21:64:07:01`，理由和「怎么改」都写在
+`etc/raphael-bdaddr` 的注释里。它不影响能不能配对，只影响别人看到的地址。
+
+### 32.5 排障过程里真正花了时间的三个坑
+
+1. **补丁「没生效」其实是模块没换**。`uname -r` 不变
+   （`7.3.0-raphael-steamos`），只换 ESP 上的 `linux.efi` 时，rootfs 里
+   `/usr/lib/modules/.../btqca.ko` 还是旧的。表现是新内核已经起来了
+   （`/proc/version` 里是新的编译时间），错误却一模一样。
+   判据是 md5：设备上 `ef236025de2a2ebcaa31938f3e1affb6`，新编的是
+   `cf8d943bcb5973a209203cb6c45fdfc1`。**Image 和模块必须成对部署。**
+2. **ESP 只剩 253 MB，`cp` 失败之后下一句 `cp` 照样覆盖**。备份
+   `linux.efi.bak-*` 报 `No space left on device`，脚本仍然打印「备份留在 ESP 上」。
+   `linux.efi` 104 MB + 一个 `.bak` 就吃满 208 MB。已改成区分 `BACKUP_OK`，
+   备份失败时明确说「ESP 满了、内核已换、旧 Image 没留」，不再给一条会把人
+   引到错误方向的回滚命令。
+3. **构建入口要 `MSYS_NO_PATHCONV=1`**。Git Bash 会把 `/repo/SteamOSforAlioth/...`
+   改写成 `C:/Program Files/...`，容器里报
+   `No such file or directory`，而且报的是被改写后的那条假路径：
+
+   ```bash
+   MSYS_NO_PATHCONV=1 "/c/Program Files/WSL/wslc" run --rm \
+     --network bridge --dns 223.5.5.5 \
+     -v raphael-work:/work -v "/d/Developer/Repo:/repo" \
+     proxy.vvvv.ee/library/fedora:43 \
+     bash /repo/SteamOSforAlioth/work/wslc-build.sh
+   ```
+
+## 33. 停在这里的状态（2026-11-08 23:25）
+
+**已交付并在真机上生效**：
+
+- 温控守护（§31）：`--status` 显示已在 warm 档压着，`thermal_zone12` 从 81.8 °C
+  降到 73.6 °C；18 条断言全绿；四个守护的 wants 都在 `/usr/lib`，`systemctl show`
+  全是 `active`。
+- 内核对 `LE Read Transmit Power` 的 quirk（0003）已编译、已部署、已验证生效
+  （错误从 38 变成 56，说明它确实跳过 0x204b 走到了 0x2031）。
+
+**已写进仓库但没有编译/没有部署**：
+
+- `patches/0004`（容忍 init 阶段的 `Unknown HCI Command`）—— 补丁本身干跑通过，
+  但内核还没重编。
+- `steamos.config` 里的 `CONFIG_UHID=y` / `CONFIG_INPUT_UINPUT=y`（§30.4，
+  音量键要的）—— 同上，等这一次重编一起带上。
+- `etc/raphael-bdaddr`、`usr/lib/steamos-arm/raphael-macaddr`、`bluetooth.service.d/52-raphael-macaddr.conf`
+  已经在 `scripts/raphael-overlay` 里，`raphael-apply-overlay-live.ps1` 会自动
+  推上去（它按目录递归，不需要改文件清单），但**设备上还没有**。
+
+**下次接着做，顺序不能变**：
+
+```bash
+# 1) 重编内核（13 分钟；0004 改了 patch 集，会重新解包源码，不是增量）
+MSYS_NO_PATHCONV=1 "/c/Program Files/WSL/wslc" run --rm \
+  --network bridge --dns 223.5.5.5 \
+  -v raphael-work:/work -v "/d/Developer/Repo:/repo" \
+  proxy.vvvv.ee/library/fedora:43 \
+  bash /repo/SteamOSforAlioth/work/wslc-build.sh
+
+# 2) 部署 Image + 模块
+#    **必须带 -Module**：内核版本号不变，只换 Image 的话设备照旧加载旧的 .ko，
+#    补丁看起来「完全没生效」（§32.5 第 1 条）。路径相对 output/<ver>/modules/<ver>/；
+#    脚本会打包、解到 /usr/lib/modules/、逐个 md5 比对、再 depmod。
+pwsh -NoProfile -File scripts/raphael-deploy-kernel.ps1 `
+  -Module kernel/drivers/bluetooth/btqca.ko, kernel/drivers/bluetooth/hci_uart.ko
+#    ESP 只有 253 MB，备份失败时看 BACKUP_OK 那行（失败也照样覆盖了 linux.efi）
+
+# 3) 推 overlay（会带上 raphael-macaddr 与 drop-in）
+pwsh -NoProfile -File scripts/raphael-apply-overlay-live.ps1
+
+# 4) 重启，按这个顺序验：
+#    systemctl status raphael-macaddr      -> 应该 "hci0 public-addr = 39:...:01"
+#    dmesg | grep -i "init stage"          -> 应该看到被跳过的 opcode，没有 -56
+#    btmgmt info                           -> 应该是 1 个 index、powered
+#    bluetoothctl scan on                  -> 应该能扫到设备
+```
+
+`deck-uhid` 那条线（§30.4）和这次重编绑在一起：`CONFIG_UHID=y` 生效后
+`/dev/uhid` 才会出现，虚拟手柄才有可能。到时候查的是
+`RUST_LOG=trace` 下 `SteamDeckUhidDevice::poll()` 有没有真的调
+`create_virtual_device()` —— `Output capabilities changed: {}` 是**输出**能力
+（震动/LED），本来就该是空集，别被它带偏。
+
+这一轮的改动已按主题提交（温控 / 游戏提频与充电 / 蓝牙 / InputPlumber / 构建脚本 / 文档）。
