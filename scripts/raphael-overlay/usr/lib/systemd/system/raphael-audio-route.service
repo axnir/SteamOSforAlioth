@@ -1,0 +1,16 @@
+[Unit]
+Description=raphael: route MultiMedia1 to the physical playback backend (TFA9874 / WCD9340)
+# 声卡由 msm-snd-sm8150 注册，card 0 出现之后才能设 mixer。
+Documentation=file:///opt/raphael/audio-route.sh
+After=sound.target
+Wants=sound.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/raphael/audio-route.sh speaker
+# 失败不要挡住开机：路由设不上顶多没声音，别把图形会话拖下水。
+ExecStartPost=/bin/true
+
+[Install]
+WantedBy=multi-user.target

@@ -2325,3 +2325,84 @@ revision 0x0c74`）只说明 I2C 通了，不代表它被使能出声。扬声�
 | 刷新率 60/90 Hz | 未验 | 面板 EA8076 支持 60/90，gamescope 里能不能切 |
 | 触摸方向 | 属性已生效，未目视 | 点一下就知道；反了就换 `0 -1 1 1 0 0`（§24.6） |
 | 干净重刷后可复现 | 大体可以 | overlay 已进 `build-raphael-reference.sh`；但 `fix-dns.sh`、本节新增的东西要等下次重建镜像才进 rootfs |
+
+## 27. 音频：三层故障，逐层拆开（2026-11-08 20:10）
+
+§26 里把可能的原因列了三条。真机上三条**同时成立**，而且有先后依赖，所以要按顺序修。
+
+### 27.1 第一层：wireplumber 被 Frame 的脚本带崩（已修）
+
+```
+wireplumber[988]: default: vraudio-loader: Failed to open vraudiocompositor.so:
+    /usr/lib/ladspa/vraudiocompositor.so: cannot open shared object file
+systemd-coredump[1071]: Process 988 (wireplumber) terminated abnormally with signal 11/SEGV
+wireplumber.service: Main process exited, code=dumped, status=11/SEGV
+```
+
+`/usr/lib/ladspa/vraudiocompositor.so` 在镜像里是软链，指向 `/run/ladspa/vraudiocompositor.so`
+（SteamVR 运行时才铺），VR 没装就是死链。`70-spatial-node-config.conf` 把加载它的
+lua 标成 `required`，于是 wireplumber 每次启动都 SEGV，`wpctl` 里只剩 `Dummy Output`。
+
+修法：`etc/wireplumber/wireplumber.conf.d/75-raphael-no-frame-scripts.conf`，disable
+`steamos.spatial-node-config` 和 `steamos.microphone-tracker`。重启后
+`pgrep -c wireplumber` = 1（之前是崩了重起、一两秒一个新 PID）。
+
+### 27.2 第二层：ACP 找不到 UCM，一个节点都不建（已修，用裸 PCM 绕过）
+
+ACP 是 ALSA 监控里读 UCM 的那一半。这台机器没有 `sm8150_raphael` 的 UCM
+（上游 `alsa-ucm-conf` 只到 sm8250），ACP 没有 profile 可建 → 依然只有 Dummy Output。
+
+`etc/wireplumber/wireplumber.conf.d/76-raphael-alsa.conf` 把
+`api.alsa.use-acp = false`，退回裸 PCM 枚举 + `period-size = 1440`
+（`speaker-test -D hw:0,0` 报的可用区间是 480..16320，Valve 的 256 不行；48 kHz /
+S16LE / 2ch 是 backend fixup 钉死的）。效果：
+
+```
+Sinks:
+  *  68. Built-in Audio Playback   [vol: 0.50]
+```
+
+### 27.3 第三层：FE 没接上 BE —— 内核明说的
+
+```
+MultiMedia1: ASoC: no backend DAIs enabled for MultiMedia1,
+             possibly missing ALSA mixer-based routing or UCM profile
+```
+
+DTS 里 FE（`mm1-dai-link`）只有 `cpu`，FE→BE 是运行时靠 ASoC 的 mixer 开关连的，
+平时这一步由 UCM 的 EnableSequence 做。DTS 里 MultiMedia1 的播放后端只有两条：
+
+| link-name | BE DAI | codec | 用途 |
+|---|---|---|---|
+| `SLIM Playback` | `SLIMBUS_0_RX` | wcd9340 | 耳机 / 听筒 |
+| `TFA9874 Playback` | `QUATERNARY_MI2S_RX` | tfa9874 | 外放 |
+
+对应两个开关（`amixer -c0 controls` 里 numid 实测 237 / 309）：
+
+```
+'SLIMBUS_0_RX Audio Mixer MultiMedia1'
+'QUAT_MI2S_RX Audio Mixer MultiMedia1'
+```
+
+**只开外放那条**。两条同时开 hw_params 会失败
+（`Setting of hwparams failed: Invalid argument`）。
+`/opt/raphael/audio-route.sh speaker|headphone|off` 负责这件事，
+`raphael-audio-route.service`（oneshot、`After=sound.target`）在开机时跑一次。
+
+注意 `amixer sset '<带空格的名字>' 1` 在 busybox 下会回 `Invalid command!`，
+必须用 `amixer -c0 cset "name='...'" 1` 这种形式 —— 脚本里就是这么写的。
+
+### 27.4 现状与还差什么
+
+现在：wireplumber 稳定、有真实 sink、`speaker-test -D hw:0,0` 能连续播完、
+`pw-cat -p --raw` 经 PipeWire 播 4 秒无报错。tfa9874 驱动是绑上的
+（`/sys/bus/i2c/drivers/tfa9874`，dmesg 有 `TFA9874 detected, revision 0x0c74`）。
+
+还差的：
+
+1. **耳朵验收**：以上只证明「数据送到了 PCM」，不证明 TFA9874 真的被使能。
+2. **耳机这条路没验**：`SLIMBUS_0_RX` 那次 hw_params 失败过，说明 wcd9340 这条
+   BE 还需要额外配置（大概率是 codec 侧的 port/clock，UCM 里本来就有）。
+3. **UCM 还是要写**。现在靠「裸 PCM + 手动 mixer」能出声，但没有音量硬件控制、
+   没有耳机插拔切换、没有多设备 profile。厂商 `alsa-xiaomi-raphael.deb` 的五个
+   文件（见 §26.1）拿到就一步到位；拿不到就按 DTS 手写一份最小 UCM。
