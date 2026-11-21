@@ -1,6 +1,7 @@
 /dts-v1/;
 
 #include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/leds/common.h>
 #include <dt-bindings/arm/qcom,ids.h>
 #include <dt-bindings/clock/qcom,dispcc-sm8250.h>
 #include <dt-bindings/clock/qcom,gcc-sm8250.h>
@@ -11,6 +12,8 @@
 #include "pm8150b.dtsi"
 #include "pm8150l.dtsi"
 #include "pm8009.dtsi"
+#include <dt-bindings/sound/qcom,q6asm.h>
+#include <dt-bindings/sound/qcom,q6dsp-lpass-ports.h>
 
 /*
  * Delete following upstream (sm8250.dtsi) reserved
@@ -342,6 +345,34 @@
 		charge-full-design-microamp-hours = <4410000>;
 		energy-full-design-microwatt-hours = <17060000>;
 		voltage-max-design-microvolt = <4350000>;
+		/* 厂商的正常温度限流；PM8150B 那条路径按这个值走。 */
+		constant-charge-current-max-microamp = <2000000>;
+	};
+
+	wcd938x: audio-codec {
+		compatible = "qcom,wcd9385-codec";
+
+		pinctrl-0 = <&wcd_default>;
+		pinctrl-names = "default";
+
+		qcom,mbhc-buttons-vthreshold-microvolt = <75000 150000 237000 500000 500000 500000 500000 500000>;
+		qcom,mbhc-headset-vthreshold-microvolt = <2600000>;
+		qcom,mbhc-headphone-vthreshold-microvolt = <75000>;
+		qcom,micbias1-microvolt = <1800000>;
+		qcom,micbias2-microvolt = <2700000>;
+		qcom,micbias3-microvolt = <1800000>;
+		qcom,micbias4-microvolt = <1800000>;
+		qcom,rx-device = <&wcd_rx>;
+		qcom,tx-device = <&wcd_tx>;
+
+		reset-gpios = <&tlmm 32 GPIO_ACTIVE_LOW>;
+
+		vdd-buck-supply = <&vreg_s4a_1p8>;
+		vdd-rxtx-supply = <&vreg_s4a_1p8>;
+		vdd-io-supply = <&vreg_s4a_1p8>;
+		vdd-mic-bias-supply = <&vreg_bob>;
+
+		#sound-dai-cells = <1>;
 	};
 };
 
@@ -929,6 +960,61 @@
 		bias-pull-down;
 	};
 
+	/*
+	 * AW8697 的 IRQ 脚（gpio118）。控制器本体在 i2c11 上，见文件末尾。
+	 * 驱动还不在这棵树里：mainline 7.2.8 只有 aw86927（不同一代，只认
+	 * awinic,aw86927），参考移植也没带驱动补丁。节点先按厂商 overlay
+	 * 写好，驱动进来就能直接用。
+	 */
+	haptics_irq_default: haptics-irq-default-state {
+		pins = "gpio118";
+		function = "gpio";
+		drive-strength = <2>;
+		input-enable;
+		bias-pull-up;
+	};
+
+	tert_mi2s_suspend: tert-mi2s-suspend-state {
+		sck-pins {
+			pins = "gpio133";
+			function = "mi2s2_sck";
+			drive-strength = <2>;
+			bias-pull-down;
+			input-enable;
+		};
+
+		data0-pins {
+			pins = "gpio134";
+			function = "mi2s2_data0";
+			drive-strength = <2>;
+			bias-pull-down;
+			input-enable;
+		};
+
+		data1-pins {
+			pins = "gpio137";
+			function = "mi2s2_data1";
+			drive-strength = <2>;
+			bias-pull-down;
+			input-enable;
+		};
+
+		ws-pins {
+			pins = "gpio135";
+			function = "mi2s2_ws";
+			drive-strength = <2>;
+			bias-pull-down;
+			input-enable;
+		};
+	};
+
+	wcd_default: wcd-default-state {
+		pins = "gpio32";
+		function = "gpio";
+		drive-strength = <16>;
+		output-low;
+	};
+
 	wlan_en_state: wlan-default-state {
 		wlan-en {
 			pins = "gpio20";
@@ -1155,3 +1241,460 @@
 	vdds-supply = <&vreg_l5a_0p88>;
 	status = "okay";
 };
+&i2c15 {
+	status = "okay";
+
+	top_spkr: tfa9874@34 {
+		compatible = "nxp,tfa9874";
+		reg = <0x34>;
+		reset-gpios = <&tlmm 91 GPIO_ACTIVE_HIGH>;
+		vddd-supply = <&vreg_s4a_1p8>;
+		sound-channel = <0>;
+		sound-name-prefix = "Top Speaker";
+		#sound-dai-cells = <0>;
+	};
+
+	bottom_spkr: tfa9874@35 {
+		compatible = "nxp,tfa9874";
+		reg = <0x35>;
+		reset-gpios = <&tlmm 99 GPIO_ACTIVE_HIGH>;
+		vddd-supply = <&vreg_s4a_1p8>;
+		sound-channel = <1>;
+		sound-name-prefix = "Bottom Speaker";
+		#sound-dai-cells = <0>;
+	};
+};
+
+&lpass_tlmm {
+	dmic23_active: dmic23-active-state {
+		clk-pins {
+			pins = "gpio8";
+			function = "dmic2_clk";
+			drive-strength = <8>;
+			output-high;
+		};
+
+		data-pins {
+			pins = "gpio9";
+			function = "dmic2_data";
+			drive-strength = <8>;
+			input-enable;
+		};
+	};
+
+	dmic23_sleep: dmic23-sleep-state {
+		clk-pins {
+			pins = "gpio8";
+			function = "dmic2_clk";
+			drive-strength = <2>;
+			bias-disable;
+			output-low;
+		};
+
+		data-pins {
+			pins = "gpio9";
+			function = "dmic2_data";
+			drive-strength = <2>;
+			bias-pull-down;
+			input-enable;
+		};
+	};
+};
+
+&q6afedai {
+	dai@20 {
+		reg = <TERTIARY_MI2S_RX>;
+		qcom,sd-lines = <1>;
+	};
+
+	dai@21 {
+		reg = <TERTIARY_MI2S_TX>;
+		qcom,sd-lines = <0>;
+	};
+
+	dai@104 {
+		reg = <DISPLAY_PORT_RX>;
+	};
+
+	dai@110 {
+		reg = <VA_CODEC_DMA_TX_0>;
+	};
+
+	dai@113 {
+		reg = <RX_CODEC_DMA_RX_0>;
+	};
+
+	dai@120 {
+		reg = <TX_CODEC_DMA_TX_3>;
+	};
+
+	dai@122 {
+		reg = <TX_CODEC_DMA_TX_4>;
+	};
+
+	dai@136 {
+		reg = <USB_RX>;
+	};
+};
+
+&q6asmdai {
+	dai@0 {
+		reg = <MSM_FRONTEND_DAI_MULTIMEDIA1>;
+	};
+
+	dai@1 {
+		reg = <MSM_FRONTEND_DAI_MULTIMEDIA2>;
+	};
+
+	dai@2 {
+		reg = <MSM_FRONTEND_DAI_MULTIMEDIA3>;
+	};
+
+	dai@3 {
+		reg = <MSM_FRONTEND_DAI_MULTIMEDIA4>;
+	};
+
+	dai@4 {
+		reg = <MSM_FRONTEND_DAI_MULTIMEDIA5>;
+	};
+
+	dai@5 {
+		reg = <MSM_FRONTEND_DAI_MULTIMEDIA6>;
+	};
+
+	dai@6 {
+		reg = <MSM_FRONTEND_DAI_MULTIMEDIA7>;
+	};
+
+	dai@7 {
+		reg = <MSM_FRONTEND_DAI_MULTIMEDIA8>;
+	};
+};
+
+&rxmacro {
+	status = "okay";
+};
+
+&sound {
+	compatible = "qcom,sm8250-sndcard";
+	model = "OnePlus 8 Pro";
+	audio-routing =
+		"AMIC2", "MIC BIAS2",
+		"TX DMIC0", "MIC BIAS1",
+		"TX DMIC1", "MIC BIAS1",
+		"TX DMIC2", "MIC BIAS3",
+		"TX DMIC3", "MIC BIAS4",
+		"TX DMIC4", "MIC BIAS4",
+		"TX DMIC5", "MIC BIAS4",
+		"DMIC1", "MIC BIAS1",
+		"DMIC2", "MIC BIAS1",
+		"DMIC3", "MIC BIAS3",
+		"DMIC4", "MIC BIAS3",
+		"DMIC5", "MIC BIAS4",
+		"DMIC6", "MIC BIAS4",
+		"IN1_HPHL", "HPHL_OUT",
+		"IN2_HPHR", "HPHR_OUT",
+		"IN3_AUX", "AUX_OUT",
+		"TX SWR_ADC0", "ADC1_OUTPUT",
+		"TX SWR_ADC1", "ADC2_OUTPUT",
+		"TX SWR_ADC2", "ADC3_OUTPUT",
+		"TX SWR_ADC3", "ADC4_OUTPUT",
+		"TX SWR_DMIC0", "DMIC1_OUTPUT",
+		"TX SWR_DMIC1", "DMIC2_OUTPUT",
+		"TX SWR_DMIC2", "DMIC3_OUTPUT",
+		"TX SWR_DMIC3", "DMIC4_OUTPUT",
+		"TX SWR_DMIC4", "DMIC5_OUTPUT",
+		"TX SWR_DMIC5", "DMIC6_OUTPUT",
+		"TX SWR_DMIC6", "DMIC7_OUTPUT",
+		"TX SWR_DMIC7", "DMIC8_OUTPUT",
+		"RX_TX DEC0_INP", "TX DEC0 MUX",
+		"RX_TX DEC1_INP", "TX DEC1 MUX",
+		"RX_TX DEC2_INP", "TX DEC2 MUX",
+		"RX_TX DEC3_INP", "TX DEC3 MUX",
+		"VA DMIC0", "VA MIC BIAS1",
+		"VA DMIC1", "VA MIC BIAS1",
+		"VA DMIC2", "VA MIC BIAS3",
+		"VA DMIC3", "VA MIC BIAS4",
+		"VA DMIC4", "VA MIC BIAS4",
+		"VA DMIC5", "VA MIC BIAS4",
+		"VA SWR_ADC0", "ADC1_OUTPUT",
+		"VA SWR_ADC1", "ADC2_OUTPUT",
+		"VA SWR_ADC2", "ADC3_OUTPUT",
+		"VA SWR_ADC3", "ADC4_OUTPUT",
+		"VA SWR_MIC0", "DMIC1_OUTPUT",
+		"VA SWR_MIC1", "DMIC2_OUTPUT",
+		"VA SWR_MIC2", "DMIC3_OUTPUT",
+		"VA SWR_MIC3", "DMIC4_OUTPUT",
+		"VA SWR_MIC4", "DMIC5_OUTPUT",
+		"VA SWR_MIC5", "DMIC6_OUTPUT",
+		"VA SWR_MIC6", "DMIC7_OUTPUT",
+		"VA SWR_MIC7", "DMIC8_OUTPUT";
+	pinctrl-0 = <&tert_mi2s_active>;
+	pinctrl-1 = <&tert_mi2s_suspend>;
+	pinctrl-names = "default", "sleep";
+
+	mm1-dai-link {
+		link-name = "MultiMedia1";
+
+		cpu {
+			sound-dai = <&q6asmdai MSM_FRONTEND_DAI_MULTIMEDIA1>;
+		};
+	};
+
+	mm2-dai-link {
+		link-name = "MultiMedia2";
+
+		cpu {
+			sound-dai = <&q6asmdai MSM_FRONTEND_DAI_MULTIMEDIA2>;
+		};
+	};
+
+	mm3-dai-link {
+		link-name = "MultiMedia3";
+
+		cpu {
+			sound-dai = <&q6asmdai MSM_FRONTEND_DAI_MULTIMEDIA3>;
+		};
+	};
+
+	mm4-dai-link {
+		link-name = "MultiMedia4";
+
+		cpu {
+			sound-dai = <&q6asmdai MSM_FRONTEND_DAI_MULTIMEDIA4>;
+		};
+	};
+
+	mm5-dai-link {
+		link-name = "MultiMedia5";
+
+		cpu {
+			sound-dai = <&q6asmdai MSM_FRONTEND_DAI_MULTIMEDIA5>;
+		};
+	};
+
+	mm6-dai-link {
+		link-name = "MultiMedia6";
+
+		cpu {
+			sound-dai = <&q6asmdai MSM_FRONTEND_DAI_MULTIMEDIA6>;
+		};
+	};
+
+	mm7-dai-link {
+		link-name = "MultiMedia7";
+
+		cpu {
+			sound-dai = <&q6asmdai MSM_FRONTEND_DAI_MULTIMEDIA7>;
+		};
+	};
+
+	mm8-dai-link {
+		link-name = "MultiMedia8";
+
+		cpu {
+			sound-dai = <&q6asmdai MSM_FRONTEND_DAI_MULTIMEDIA8>;
+		};
+	};
+
+	speaker-dai-link {
+		link-name = "Speaker Playback";
+
+		codec {
+			sound-dai = <&top_spkr>, <&bottom_spkr>;
+		};
+
+		cpu {
+			sound-dai = <&q6afedai TERTIARY_MI2S_RX>;
+		};
+
+		platform {
+			sound-dai = <&q6routing>;
+		};
+	};
+
+	/*
+	 * No usb-dai-link here. The reference DTS has one, but its codec side
+	 * is <&q6usbdai USB_RX> and mainline 7.2.8's sm8250.dtsi has no
+	 * q6usbdai label at all (only q6afedai / q6asmdai), so dtc aborts
+	 * with "Reference to non-existent node or label q6usbdai". USB-C
+	 * audio belongs to the DisplayPort batch; add both together then.
+	 */
+
+	va-dai-link {
+		link-name = "VA Capture";
+
+		codec {
+			sound-dai = <&vamacro 0>;
+		};
+
+		cpu {
+			sound-dai = <&q6afedai VA_CODEC_DMA_TX_0>;
+		};
+
+		platform {
+			sound-dai = <&q6routing>;
+		};
+	};
+
+	wcd-playback-dai-link {
+		link-name = "WCD Playback";
+
+		codec {
+			sound-dai = <&wcd938x 0>, <&swr1 0>, <&rxmacro 0>;
+		};
+
+		cpu {
+			sound-dai = <&q6afedai RX_CODEC_DMA_RX_0>;
+		};
+
+		platform {
+			sound-dai = <&q6routing>;
+		};
+	};
+
+	wcd-capture-dai-link {
+		link-name = "WCD Capture";
+
+		codec {
+			sound-dai = <&wcd938x 1>, <&swr2 0>, <&txmacro 0>;
+		};
+
+		cpu {
+			sound-dai = <&q6afedai TX_CODEC_DMA_TX_3>;
+		};
+
+		platform {
+			sound-dai = <&q6routing>;
+		};
+	};
+};
+
+&swr1 {
+	status = "okay";
+
+	wcd_rx: codec@0,4 {
+		compatible = "sdw20217010d00";
+		reg = <0 4>;
+		qcom,rx-port-mapping = <1 2 3 4 5>;
+	};
+};
+
+&swr2 {
+	status = "okay";
+
+	wcd_tx: codec@0,3 {
+		compatible = "sdw20217010d00";
+		reg = <0 3>;
+		qcom,tx-port-mapping = <2 2 3 4>;
+	};
+};
+
+&tert_mi2s_active {
+	data1-pins {
+		pins = "gpio137";
+		function = "mi2s2_data1";
+		drive-strength = <8>;
+		bias-disable;
+		output-high;
+	};
+};
+
+&txmacro {
+	status = "okay";
+};
+
+&vamacro {
+	pinctrl-0 = <&dmic01_active>, <&dmic23_active>;
+	pinctrl-1 = <&dmic01_sleep>, <&dmic23_sleep>;
+	pinctrl-names = "default", "sleep";
+	vdd-micb-supply = <&vreg_bob>;
+	qcom,dmic-sample-rate = <2400000>;
+};
+
+/*
+ * 振动：AWINIC AW8697 在 QUP i2c11 的 0x5a，reset gpio72，IRQ gpio118。
+ * 170 Hz / drive level 54 是 OnePlus 驱动里 LRA0619 的调音值。
+ *
+ * **驱动不在 mainline 7.2.8**（只有 aw86927，另一代芯片，compatible 也不
+ * 同），参考移植只给了 DTS 没有驱动。所以这个节点现在不会 probe，等驱动
+ * 补进来；参数按厂商 overlay 原样保留，届时不需要再改。
+ */
+&i2c11 {
+	status = "okay";
+
+	haptics@5a {
+		compatible = "awinic,aw8697";
+		reg = <0x5a>;
+		interrupts-extended = <&tlmm 118 IRQ_TYPE_EDGE_FALLING>;
+		reset-gpios = <&tlmm 72 GPIO_ACTIVE_HIGH>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&haptics_irq_default>;
+		awinic,f0-preset = <1700>;
+		awinic,f0-coefficient = <260>;
+		awinic,f0-calibration-percent = <7>;
+		awinic,drive-level = <54>;
+		awinic,f0-detection-play-time = <5>;
+		awinic,f0-detection-wait-time = <3>;
+		awinic,f0-detection-repeat = <2>;
+		awinic,f0-detection-trace = <15>;
+		awinic,boost-debug = /bits/ 8 <0x30 0xeb 0xd4>;
+		awinic,tset = /bits/ 8 <0x12>;
+		awinic,r-spare = /bits/ 8 <0x68>;
+		awinic,bemf-upper-threshold = <4104>;
+		awinic,bemf-lower-threshold = <1016>;
+	};
+};
+
+/*
+ * 闪光灯：PM8150L 的两个通道。驱动在树里
+ * （drivers/leds/flash/leds-qcom-flash.c，compatible qcom,spmi-flash-led，
+ * pm8150l.dtsi 里已经写了），只需要打开。
+ *
+ * 电流上限用厂商 device tree 的值（068 = 1500 mA 闪光、500 mA 手电、
+ * 1280 ms），不是保守的 500/100/200；参考移植的 0079 就是把这组从保守值
+ * 换成厂商值。
+ */
+&pm8150l_flash {
+	status = "okay";
+
+	led-0 {
+		function = LED_FUNCTION_FLASH;
+		color = <LED_COLOR_ID_WHITE>;
+		function-enumerator = <0>;
+		led-sources = <1>;
+		led-max-microamp = <500000>;
+		flash-max-microamp = <1500000>;
+		flash-max-timeout-us = <1280000>;
+	};
+
+	led-1 {
+		function = LED_FUNCTION_FLASH;
+		color = <LED_COLOR_ID_WHITE>;
+		function-enumerator = <1>;
+		led-sources = <2>;
+		led-max-microamp = <500000>;
+		flash-max-microamp = <1500000>;
+		flash-max-timeout-us = <1280000>;
+	};
+};
+
+/*
+ * 充电：PM8150B 的充电器。**驱动不在 mainline 7.2.8**
+ * （drivers/power/supply/ 里只有 smbb/smbx，没有 qcom_pm8150b_charger.c；
+ * 参考移植的 0068–0085/0165–0166 全是对那个驱动打的补丁，本体没给）。
+ * 节点先写好，驱动进来即用。
+ *
+ * qcom,fuel-gauge 指向 i2c16 上那颗 bq27541（smart_battery，DTS 里原本
+ * 就有），充电是否充满由电量计决定，与厂商行为一致。
+ *
+ * 电量计本身是可以工作的：CONFIG_BATTERY_BQ27XXX_I2C 打开后
+ * /sys/class/power_supply 里会出现 bms，能读电压、电流、容量。
+ */
+&pm8150b_charger {
+	status = "okay";
+	monitored-battery = <&battery>;
+	power-supplies = <&pm8150b_typec>;
+	qcom,fuel-gauge = <&smart_battery>;
+};
+
