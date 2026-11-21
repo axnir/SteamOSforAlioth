@@ -95,14 +95,27 @@ EOF
 # which is where the upstream patch puts it, and a silent miss produces a
 # Makefile hunk that is not there at all -- the driver then builds into
 # nothing and the panel simply never probes.
-awk '
-  /^obj-\$\(CONFIG_DRM_PANEL_SAMSUNG_ATNA33XC20\)/ && !done {
-    print "obj-$(CONFIG_DRM_PANEL_SAMSUNG_AMS678UW01) += panel-samsung-ams678uw01.o"
-    done = 1
-  }
-  { print }
-' "$work/a/$REL_PANEL/Makefile" >"$work/b/$REL_PANEL/Makefile"
-grep -q 'CONFIG_DRM_PANEL_SAMSUNG_AMS678UW01' "$work/b/$REL_PANEL/Makefile" \
+#
+# The Makefile hunk is written by hand instead of coming out of diff(1),
+# because it needs context **after** the insertion point only. Our own
+# 0017 (samsung,ams667xx01) inserts a line at the same spot, so in the tree
+# the kernel is actually built from, the line above the anchor is AMS667XX01
+# and not AMS639RQ08. A 3-before/3-after hunk matches the pristine tarball
+# and fails there -- which is exactly how the first real build of this kernel
+# died (patch: "1 out of 1 hunk FAILED", Makefile.rej), after the same patch
+# had passed a standalone dry run on a clean 7.2.8. Context after the anchor
+# is untouched by 0017, so this hunk applies to both trees.
+mf_anchor_line="$(grep -n '^obj-\$(CONFIG_DRM_PANEL_SAMSUNG_ATNA33XC20)' \
+  "$work/a/$REL_PANEL/Makefile" | head -1 | cut -d: -f1)"
+[[ -n "$mf_anchor_line" ]] || die "no ATNA33XC20 anchor in the panel Makefile"
+{
+  printf -- '--- a/%s/Makefile\n' "$REL_PANEL"
+  printf -- '+++ b/%s/Makefile\n' "$REL_PANEL"
+  printf -- '@@ -%d,3 +%d,4 @@\n' "$mf_anchor_line" "$mf_anchor_line"
+  printf -- '+obj-$(CONFIG_DRM_PANEL_SAMSUNG_AMS678UW01) += panel-samsung-ams678uw01.o\n'
+  sed -n "${mf_anchor_line},$((mf_anchor_line + 2))p" "$work/a/$REL_PANEL/Makefile" | sed 's/^/ /'
+} >"$work/makefile.hunk"
+grep -q 'CONFIG_DRM_PANEL_SAMSUNG_AMS678UW01' "$work/makefile.hunk" \
   || die "could not find an anchor line in the panel Makefile"
 
 cp "$SRC_C" "$work/b/$REL_PANEL/$C_NAME"
@@ -117,6 +130,19 @@ header="$(awk '/^---$/{exit} {print}' "$PATCH" 2>/dev/null || true)"
 
 sed -E 's/^(---|\+\+\+) ([^\t]+)\t.*$/\1 \2/; /^diff -Naur /d' \
   "$work/raw.patch" >"$work/clean.patch"
+
+# Splice the hand-written Makefile hunk in where diff(1) would have put it
+# (after Kconfig, before the new driver), so the patch still reads in the
+# order a reviewer expects.
+awk -v hunk="$work/makefile.hunk" '
+  /^--- a\/drivers\/gpu\/drm\/panel\/panel-samsung-ams678uw01\.c$/ && !done {
+    while ((getline l < hunk) > 0) print l
+    close(hunk)
+    done = 1
+  }
+  { print }
+' "$work/clean.patch" >"$work/clean2.patch"
+mv -f "$work/clean2.patch" "$work/clean.patch"
 
 if [[ -n "$header" ]]; then
   { printf '%s\n---\n' "$header"; cat "$work/clean.patch"; } >"$work/new.patch"

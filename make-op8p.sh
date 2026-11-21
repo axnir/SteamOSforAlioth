@@ -172,7 +172,13 @@ payload="$(stage_payload)"
 # Reproducible: without SOURCE_DATE_EPOCH the header's os_version carries
 # today's date, so an unchanged kernel yields a different image and a
 # different checksum tomorrow.
-export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(stat -f %m "$img" 2>/dev/null || stat -c %Y "$img")}"
+#
+# GNU stat first, BSD second. The other order looks harmless and is not:
+# GNU stat accepts `-f` as "file system status", prints a block of prose to
+# stdout and exits 0, so the `||` fallback never runs and the variable ends
+# up holding "  File: ...\nBlock size: ..." -- which the packer then feeds to
+# int(). Cost: one failed packing run on Windows (2026-11-21).
+export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(stat -c %Y "$img" 2>/dev/null || stat -f %m "$img")}"
 
 case "$PACK" in
   gzip)
@@ -217,9 +223,9 @@ rm -f "$payload"
 
 echo
 echo "镜像:  ${OUT}/${name}"
-echo "大小:  $(stat -f %z "${OUT}/${name}" 2>/dev/null || stat -c %s "${OUT}/${name}") 字节"
+echo "大小:  $(stat -c %s "${OUT}/${name}" 2>/dev/null || stat -f %z "${OUT}/${name}") 字节"
 echo "打包:  $PACK  (header $([[ $PACK == v2 ]] && echo v2 || echo v0), page $PAGESIZE)"
-echo "DTB:   $DTB_NAME ($(stat -f %z "$dtb" 2>/dev/null || stat -c %s "$dtb") 字节)"
+echo "DTB:   $DTB_NAME ($(stat -c %s "$dtb" 2>/dev/null || stat -f %z "$dtb") 字节)"
 echo "cmdline: $cmdline"
 echo
 echo "刷机:  ./flash-op8p.sh --test    （写非活动槽，当前活动槽是 \$(fastboot getvar current-slot)）"

@@ -76,7 +76,7 @@ fi
 [[ -n "$IMG" && -f "$IMG" ]] || die "没有镜像（先跑 ./make-op8p.sh）"
 IMG="$(cd "$(dirname "$IMG")" && pwd)/$(basename "$IMG")"
 
-say "镜像 $IMG ($(stat -f %z "$IMG" 2>/dev/null || stat -c %s "$IMG") 字节)"
+say "镜像 $IMG ($(stat -c %s "$IMG" 2>/dev/null || stat -f %z "$IMG") 字节)"
 
 # --- talk to the phone -----------------------------------------------------
 

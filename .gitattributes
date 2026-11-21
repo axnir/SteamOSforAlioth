@@ -14,3 +14,11 @@ external-and-mods/kernel/device-tree/** linguist-vendored
 external-and-mods/kernel-sm8250/drivers/*.c   text eol=lf
 external-and-mods/kernel-sm8250/patches/*.patch text eol=lf
 external-and-mods/kernel-sm8250/bindings/*.yaml text eol=lf
+
+# Same reason, one level up. A CRLF device tree still parses (dtc tolerates
+# it) but every line moves, so a patch hunk that quotes it fails; and a CRLF
+# steamos.config fails silently -- build.sh's `case "$val" in y)` never
+# matches "y\r", so the option is dropped without a WARN. Both were observed
+# on this tree before these two rules existed.
+external-and-mods/kernel-sm8250/dts/*.dts     text eol=lf
+external-and-mods/kernel-sm8250/*.config      text eol=lf
