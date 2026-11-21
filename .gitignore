@@ -116,3 +116,5 @@ work/
 # binary is produced by the command in docs/op8p/README.md and is only
 # bundled into the initramfs when present (build.sh checks -x).
 external-and-mods/kernel-common/initramfs/drmtest
+
+.workbuddy
