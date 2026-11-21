@@ -347,17 +347,22 @@ docs/                      the write-ups
 make-op8p.sh               --gzip | --v2   (boot image; DTB appended or in a v2 slot)
 flash-op8p.sh              --boot | --test  (writes boot_<inactive> and ERASES dtbo_<inactive>)
 external-and-mods/kernel-sm8250/dts/sm8250-oneplus-instantnoodlep.dts
-external-and-mods/kernel-sm8250/patches/0029-drm-panel-add-the-samsung-ana6706-panel.patch
+external-and-mods/kernel-sm8250/patches/0029-drm-panel-add-the-samsung-ams678uw01-panel.patch
+external-and-mods/kernel-sm8250/drivers/panel-samsung-ams678uw01.c   (the patch is generated from this)
 external-and-mods/kernel-common/mkbootimg-v2.py, mkdtbo.py
 external-and-mods/kernel-common/initramfs/drmtest.c
 scripts/assert-op8p-flash.sh
+scripts/assert-op8p-panel.sh    display path: driver flags, patch, DTS, config
+scripts/regen-op8p-panel-patch.sh
 docs/op8p/                 hardware inventory, port log, driver assessment
 ```
 
 `docs/op8p/` documents a second device in progress — an OnePlus 8 Pro that
 boots the same kernel. It is not a finished port: the kernel runs and reaches a
 USB shell, but the panel is not lit yet. Read `docs/op8p/README.md` §17 for the
-`erase dtbo` rule and §18 for where the display work stopped.
+`erase dtbo` rule and §18 for where the display work stopped, then
+`docs/op8p/reference-nura-port.md` for why the panel driver is now the one from
+another instantnoodlep port rather than a hand-written one.
 
 Three pieces come from the upstream project this is forked from, kept because
 the build genuinely needs them: `external-and-mods/kernel-common` (the build

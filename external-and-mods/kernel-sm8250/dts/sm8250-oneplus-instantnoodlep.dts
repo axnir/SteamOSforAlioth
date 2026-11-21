@@ -2,6 +2,8 @@
 
 #include <dt-bindings/gpio/gpio.h>
 #include <dt-bindings/arm/qcom,ids.h>
+#include <dt-bindings/clock/qcom,dispcc-sm8250.h>
+#include <dt-bindings/clock/qcom,gcc-sm8250.h>
 #include <dt-bindings/regulator/qcom,rpmh-regulator.h>
 #include <dt-bindings/phy/phy.h>
 #include "sm8250.dtsi"
@@ -75,6 +77,24 @@
 			height = <2376>;
 			stride = <(1080 * 4)>;
 			format = "a8r8g8b8";
+
+			/*
+			 * The clocks and the MDSS GDSC are here because
+			 * dispcc probes: without them the bootloader's
+			 * framebuffer loses its clocks at that moment and the
+			 * picture freezes before msm takes over. Same set as
+			 * upstream's sm8250-oneplus-common.dtsi.
+			 */
+			clocks = <&dispcc DISP_CC_MDSS_AHB_CLK>,
+				 <&gcc GCC_DISP_HF_AXI_CLK>,
+				 <&gcc GCC_DISP_SF_AXI_CLK>,
+				 <&dispcc DISP_CC_MDSS_VSYNC_CLK>,
+				 <&dispcc DISP_CC_MDSS_MDP_CLK>,
+				 <&dispcc DISP_CC_MDSS_BYTE0_CLK>,
+				 <&dispcc DISP_CC_MDSS_BYTE0_INTF_CLK>,
+				 <&dispcc DISP_CC_MDSS_PCLK0_CLK>,
+				 <&dispcc DISP_CC_MDSS_ESC0_CLK>;
+			power-domains = <&dispcc MDSS_GDSC>;
 		};
 	};
 
@@ -1033,10 +1053,11 @@
 	status = "disabled";
 };
 /*
- * Display: Samsung ANA6706 on DSI0.
+ * Display: Samsung AMS678UW01 (Qualcomm's vendor tree calls the same panel
+ * ANA6706) on DSI0.
  *
- * Every value below was read off the running phone (2026-10-25), not from a
- * vendor .dtsi:
+ * Every board fact below was read off the running phone (2026-10-25), not
+ * from a vendor .dtsi:
  *
  *   panel-supply-entries  vddi 1.8V (post-on 2ms), vddr 1.3V (post-off 1ms),
  *                         vci 3.0V
@@ -1046,52 +1067,61 @@
  *   bl-pmic-control-type  bl_ctrl_dcs, bl-max 2047, default 360
  *   mdss-dsi-reset-sequence  <10 5 20>
  *
- * status = "okay": phase 1 booted with it "disabled" and msm-mdss failed
- * with -ETIMEDOUT after a 12 s deferred-probe wait, because DSI had no
- * panel to attach and nothing to wait for. Enabling it is the next step:
- * the DCS init sequence is in patches/0029 and the driver compiles.
+ * The driver is patches/0029 (samsung,ams678uw01), taken from darknagel's
+ * instantnoodlep port where it lights this panel on mainline at
+ * 1440x3168@120 -- see docs/op8p/reference-nura-port.md. It replaces a
+ * hand-written ANA6706 driver that got every software-side indicator green
+ * and the screen still black.
  *
- * Whether the Pixelworks Iris coprocessor can be bypassed is what this
- * boot tests -- the pinctrl exposes iris_abyp_ready and the vendor DT's
- * pxlw,dsi-display-primary-active points straight at this panel node,
- * which is evidence for a bypass but not proof. docs/op8p/README.md
- * section 18 lists what each outcome would mean.
+ * The Iris coprocessor question is settled: that port does not touch it at
+ * all and its panel lights, and reading gpio112 on this phone returned 1,
+ * meaning the bootloader had already put Iris into analog bypass. There is
+ * deliberately no iris-abyp-ready property here any more.
  *
- * If this turns out not to work, set it back to "disabled": phase 1 still
- * reaches a shell over USB that way, which is the fallback we measured.
+ * Do not set this back to "disabled": phase 1 booted that way and msm-mdss
+ * failed with -ETIMEDOUT after a 12 s deferred-probe wait, because DSI had
+ * no panel to attach.
  */
 &mdss_dsi0 {
 	vdda-supply = <&vreg_l9a_1p2>;
 	status = "okay";
 
+	/*
+	 * Driver and node shape are taken from darknagel's instantnoodlep port,
+	 * where this panel is lit on mainline at 1440x3168@120. The panel is
+	 * AMS678UW01 to the upstream driver and ANA6706 in Qualcomm's vendor
+	 * tree -- same 6.78" 1440x3168 DSC panel, two names.
+	 */
 	panel@0 {
-		compatible = "oneplus,ana6706";
+		compatible = "samsung,ams678uw01";
 		reg = <0>;
 
-		vddi-supply = <&vreg_l12a_1p8>;
-		vddr-supply = <&vreg_l9a_1p2>;
+		/*
+		 * vdd (3.3 V) is the rail the upstream port uses and this
+		 * board did not reference anywhere before -- which is why it
+		 * stays regulator-always-on below. vddio is l12a, not the
+		 * upstream l14a: l12a is the rail that was already powering this
+		 * panel's I/O when DCS reads answered in earlier bring-up.
+		 *
+		 * vddr (1.2 V) is deliberately absent: it is the same PMIC LDO
+		 * as the DSI vdda above, so referencing it here would only
+		 * duplicate a consumer.
+		 */
+		vdd-supply = <&vreg_l11c_3p3>;
+		vddio-supply = <&vreg_l12a_1p8>;
 		vci-supply = <&vreg_l17a_3p0>;
-		px_v18r-supply = <&vreg_l10a_1p8>;
+		px-v18r-supply = <&vreg_l10a_1p8>;
 
 		reset-gpios = <&tlmm 75 GPIO_ACTIVE_LOW>;
 
 		/*
-		 * There is a third power control the regulator list does not
-		 * cover: gpio8 drives the panel VOUT enable. Without it pulled
-		 * high the panel receives no supply, and the failure looks like
-		 * nothing at all -- no picture, no backlight, while every
-		 * software check passes: DSI talks both ways, get_power_mode
-		 * answers, err_count stays 0. The supply that does reach the
-		 * panel through vddi is enough for its low-voltage side to
-		 * respond to DCS reads, which is why the link looked healthy.
+		 * gpio8 drives the panel VOUT enable and is not a regulator: it
+		 * is a switch on a rail, and without it pulled high the panel
+		 * gets no supply while every software check still passes -- DSI
+		 * talks both ways, get_power_mode answers, err_count stays 0.
 		 *
 		 * gpio66 carries TE and must be muxed to mdp_vsync rather than
-		 * used as a plain GPIO, or the host never sees the tear signal
-		 * a command-mode panel relies on.
-		 *
-		 * Both, and the reset line's drive strength, are taken from
-		 * postmarketOS' sm8250-oneplus-common.dtsi, which is the only
-		 * OnePlus tree in that fork that configures this panel power.
+		 * used as a plain GPIO.
 		 */
 		pinctrl-names = "default", "sleep";
 		pinctrl-0 = <&panel_reset_default &panel_vout_default &panel_vsync>;
@@ -1100,23 +1130,6 @@
 		/* Physical mounting: long edge vertical. 90 not 270 -- see the
 		 * driver's get_orientation comment. */
 		rotation = <90>;
-
-		/*
-		 * DSC packetisation. The vendor DT says two slices go into one
-		 * DSI packet; without this the host assumes one and the panel
-		 * decodes half a line as a whole line, which is the two-stripe
-		 * garbling seen on hardware. patch 0030 makes the host read it.
-		 */
-		qcom,mdss-dsc-slice-per-pkt = <2>;
-
-		/*
-		 * Iris analog-bypass ready, input only. The Pixelworks chip sits
-		 * between the DSI host and the panel; it passes data through
-		 * only once its ABYP logic reports ready on this line. Reading
-		 * it is the cheapest way to find out whether Iris is in the way:
-		 * 1 means transparent, 0 means it is still holding the link.
-		 */
-		iris-abyp-ready-gpios = <&tlmm 112 GPIO_ACTIVE_HIGH>;
 
 		status = "okay";
 

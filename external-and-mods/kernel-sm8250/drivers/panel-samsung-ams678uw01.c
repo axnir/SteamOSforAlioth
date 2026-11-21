@@ -1,0 +1,480 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Samsung AMS678UW01 6.78" 1440x3168 AMOLED DSC command mode panel,
+ * found in the OnePlus 8 Pro (instantnoodlep).
+ *
+ * Initial driver generated with linux-mdss-dsi-panel-driver-generator from the
+ * vendor device tree (Copyright (c) 2013, The Linux Foundation; Oplus).
+ *
+ * The panel has four vendor timings: 1080x2376 and 1440x3168 (panel internal
+ * scaling), each at 60 and 120 Hz. The DSC configuration differs between them,
+ * so one mode is selected at probe time via the "mode" module parameter.
+ *
+ * Taken from darknagel's oneplus-instantnoodlep-nura-unofficial port
+ * (kernel-patches/0002), where it drives this exact panel on mainline at
+ * 1440x3168@120. Only the supply list differs: that device tree feeds the
+ * panel from two rails, this one describes four (see ams678uw01_supplies),
+ * so all four are named here rather than dropping the ones upstream does
+ * not know about. Nothing else is changed from the tested version -- if a
+ * register sequence looks wrong, it is wrong upstream too, report it there.
+ */
+
+#include <linux/backlight.h>
+#include <linux/delay.h>
+#include <linux/device-id/of.h>
+#include <linux/gpio/consumer.h>
+#include <linux/module.h>
+#include <linux/regulator/consumer.h>
+
+#include <video/mipi_display.h>
+
+#include <drm/display/drm_dsc.h>
+#include <drm/display/drm_dsc_helper.h>
+#include <drm/drm_mipi_dsi.h>
+#include <drm/drm_modes.h>
+#include <drm/drm_panel.h>
+#include <drm/drm_probe_helper.h>
+
+static unsigned int mode = 3;
+module_param(mode, uint, 0444);
+MODULE_PARM_DESC(mode, "Panel mode: 0=1080x2376@60, 1=1080x2376@120, 2=1440x3168@60, 3=1440x3168@120 (default)");
+
+/* Samsung specific DSC PPS (register 0x9e), taken from the vendor device tree */
+static const u8 ams678uw01_pps_fhd[] = {
+	0x11, 0x00, 0x00, 0x89, 0x30, 0x80, 0x09, 0x48,
+	0x04, 0x38, 0x00, 0x48, 0x02, 0x1c, 0x02, 0x1c,
+	0x02, 0x00, 0x02, 0x52, 0x00, 0x20, 0x06, 0x3b,
+	0x00, 0x07, 0x00, 0x0f, 0x01, 0xb1, 0x01, 0x6a,
+	0x18, 0x00, 0x10, 0xf0, 0x03, 0x0c, 0x20, 0x00,
+	0x06, 0x0b, 0x0b, 0x33, 0x0e, 0x1c, 0x2a, 0x38,
+	0x46, 0x54, 0x62, 0x69, 0x70, 0x77, 0x79, 0x7b,
+	0x7d, 0x7e, 0x01, 0x02, 0x01, 0x00, 0x09, 0x40,
+	0x09, 0xbe, 0x19, 0xfc, 0x19, 0xfa, 0x19, 0xf8,
+	0x1a, 0x38, 0x1a, 0x78, 0x1a, 0xb6, 0x2a, 0xb6,
+	0x2a, 0xf4, 0x2a, 0xf4, 0x4b, 0x34, 0x63, 0x74,
+};
+
+static const u8 ams678uw01_pps_qhd60[] = {
+	0x11, 0x00, 0x00, 0xab, 0x30, 0xa0, 0x0c, 0x60,
+	0x05, 0xa0, 0x00, 0x10, 0x02, 0xd0, 0x03, 0x84,
+	0x01, 0x9a, 0x02, 0x68, 0x00, 0x19, 0x01, 0xd1,
+	0x00, 0x0e, 0x00, 0x09, 0x04, 0xcd, 0x05, 0xd6,
+	0x16, 0x00, 0x10, 0xec, 0x07, 0x10, 0x20, 0x00,
+	0x06, 0x0f, 0x0f, 0x33, 0x0e, 0x1c, 0x2a, 0x38,
+	0x46, 0x54, 0x62, 0x69, 0x70, 0x77, 0x79, 0x7b,
+	0x7d, 0x7e, 0x02, 0x02, 0x22, 0x00, 0x2a, 0x40,
+	0x32, 0xbe, 0x3a, 0xfc, 0x3a, 0xfa, 0x3a, 0xf8,
+	0x3b, 0x38, 0x3b, 0x78, 0x3b, 0x76, 0x4b, 0xb6,
+	0x4b, 0xb4, 0x4b, 0xf4, 0x5b, 0xf4, 0x7c, 0x34,
+};
+
+static const u8 ams678uw01_pps_qhd120[] = {
+	0x12, 0x00, 0x00, 0xab, 0x30, 0x80, 0x0c, 0x60,
+	0x05, 0xa0, 0x00, 0x60, 0x02, 0xd0, 0x02, 0xd0,
+	0x02, 0x00, 0x02, 0xc2, 0x00, 0x20, 0x09, 0x62,
+	0x00, 0x0a, 0x00, 0x0f, 0x01, 0x44, 0x00, 0xcc,
+	0x18, 0x00, 0x10, 0xf0, 0x07, 0x10, 0x20, 0x00,
+	0x06, 0x0f, 0x0f, 0x33, 0x0e, 0x1c, 0x2a, 0x38,
+	0x46, 0x54, 0x62, 0x69, 0x70, 0x77, 0x79, 0x7b,
+	0x7d, 0x7e, 0x02, 0x02, 0x22, 0x00, 0x2a, 0x40,
+	0x2a, 0xbe, 0x3a, 0xfc, 0x3a, 0xfa, 0x3a, 0xf8,
+	0x3b, 0x38, 0x3b, 0x78, 0x3b, 0xb6, 0x4b, 0xb6,
+	0x4b, 0xf4, 0x4b, 0xf4, 0x6c, 0x34, 0x84, 0x74,
+};
+
+struct ams678uw01_desc {
+	struct drm_display_mode mode;
+	u16 slice_width;
+	u16 slice_height;
+	u8 bits_per_component;
+	u8 bits_per_pixel;
+	const u8 *pps;
+	u8 scaler;	/* register 0xba: 0x02 = 1080x2376, 0x03 = 1440x3168 */
+	u8 refresh;	/* register 0x60: 0x20 = 120 Hz, 0x02 = 1080x2376 scaling */
+	bool fhd_120hz_te;
+};
+
+#define AMS678UW01_MODE(hd, hfp, hpw, hbp, vd, vfp, vpw, vbp, hz)		\
+	{									\
+		.clock = ((hd) + (hfp) + (hpw) + (hbp)) *			\
+			 ((vd) + (vfp) + (vpw) + (vbp)) * (hz) / 1000,		\
+		.hdisplay = (hd),						\
+		.hsync_start = (hd) + (hfp),					\
+		.hsync_end = (hd) + (hfp) + (hpw),				\
+		.htotal = (hd) + (hfp) + (hpw) + (hbp),				\
+		.vdisplay = (vd),						\
+		.vsync_start = (vd) + (vfp),					\
+		.vsync_end = (vd) + (vfp) + (vpw),				\
+		.vtotal = (vd) + (vfp) + (vpw) + (vbp),				\
+		.width_mm = 71,							\
+		.height_mm = 157,						\
+		.type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED,		\
+	}
+
+static const struct ams678uw01_desc ams678uw01_descs[] = {
+	{	/* 1080x2376 @ 60 Hz (vendor timing@0) */
+		.mode = AMS678UW01_MODE(1080, 64, 8, 48, 2376, 1100, 188, 1100, 60),
+		.slice_width = 540, .slice_height = 72,
+		.bits_per_component = 8, .bits_per_pixel = 8,
+		.pps = ams678uw01_pps_fhd, .scaler = 0x02, .refresh = 0x02,
+	},
+	{	/* 1080x2376 @ 120 Hz (vendor timing@1) */
+		.mode = AMS678UW01_MODE(1080, 64, 8, 48, 2376, 2, 2, 8, 120),
+		.slice_width = 540, .slice_height = 72,
+		.bits_per_component = 8, .bits_per_pixel = 8,
+		.pps = ams678uw01_pps_fhd, .scaler = 0x02, .refresh = 0x22,
+		.fhd_120hz_te = true,
+	},
+	{	/* 1440x3168 @ 60 Hz (vendor timing@3) */
+		.mode = AMS678UW01_MODE(1440, 80, 8, 80, 3168, 180, 12, 180, 60),
+		.slice_width = 720, .slice_height = 16,
+		.bits_per_component = 10, .bits_per_pixel = 10,
+		.pps = ams678uw01_pps_qhd60, .scaler = 0x03, .refresh = 0x00,
+	},
+	{	/* 1440x3168 @ 120 Hz (vendor timing@2) */
+		.mode = AMS678UW01_MODE(1440, 88, 8, 56, 3168, 8, 8, 8, 120),
+		.slice_width = 720, .slice_height = 96,
+		.bits_per_component = 10, .bits_per_pixel = 8,
+		.pps = ams678uw01_pps_qhd120, .scaler = 0x03, .refresh = 0x20,
+	},
+};
+
+struct ams678uw01 {
+	struct drm_panel panel;
+	struct mipi_dsi_device *dsi;
+	struct drm_dsc_config dsc;
+	const struct ams678uw01_desc *desc;
+	struct regulator_bulk_data *supplies;
+	struct gpio_desc *reset_gpio;
+};
+
+/*
+ * Supply names follow this board's device tree. The upstream port names only
+ * vdd (3.3 V) and vddio (1.8 V); the vendor panel-supply-entries additionally
+ * list vddr, vci and the Pixelworks Iris rail, and the rails are referenced
+ * nowhere else, so naming all of them is what keeps them switched on.
+ */
+static const struct regulator_bulk_data ams678uw01_supplies[] = {
+	{ .supply = "vdd" },
+	{ .supply = "vddio" },
+	{ .supply = "vci" },		/* 3.0 V, panel analog */
+	{ .supply = "px-v18r" },	/* 1.8 V, Iris bridge between DSI and panel */
+};
+
+static inline struct ams678uw01 *to_ams678uw01(struct drm_panel *panel)
+{
+	return container_of_const(panel, struct ams678uw01, panel);
+}
+
+static void ams678uw01_reset(struct ams678uw01 *ctx)
+{
+	gpiod_set_value_cansleep(ctx->reset_gpio, 0);
+	usleep_range(10000, 11000);
+	gpiod_set_value_cansleep(ctx->reset_gpio, 1);
+	usleep_range(2000, 3000);
+	gpiod_set_value_cansleep(ctx->reset_gpio, 0);
+	usleep_range(10000, 11000);
+}
+
+static void ams678uw01_write_pps(struct mipi_dsi_multi_context *dsi_ctx, const u8 *pps)
+{
+	u8 buf[89];
+
+	buf[0] = 0x9e;
+	memcpy(&buf[1], pps, 88);
+	mipi_dsi_dcs_write_buffer_multi(dsi_ctx, buf, sizeof(buf));
+}
+
+static int ams678uw01_on(struct ams678uw01 *ctx)
+{
+	const struct ams678uw01_desc *desc = ctx->desc;
+	struct mipi_dsi_multi_context dsi_ctx = { .dsi = ctx->dsi };
+
+	ctx->dsi->mode_flags |= MIPI_DSI_MODE_LPM;
+
+	mipi_dsi_dcs_exit_sleep_mode_multi(&dsi_ctx);
+	mipi_dsi_usleep_range(&dsi_ctx, 11000, 12000);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x09);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb5, 0x08);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x22);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf5, 0x65);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x38);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf5, 0x0f);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x56);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf5, 0xc4);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x03);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xcb, 0xff, 0xff);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf7, 0x0f);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
+	mipi_dsi_usleep_range(&dsi_ctx, 11000, 12000);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
+	mipi_dsi_compression_mode_multi(&dsi_ctx, true);
+	mipi_dsi_dcs_write_var_seq_multi(&dsi_ctx, 0xba, desc->scaler);
+	ams678uw01_write_pps(&dsi_ctx, desc->pps);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf7, 0x0f);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
+	mipi_dsi_dcs_set_tear_on_multi(&dsi_ctx, MIPI_DSI_DCS_TEAR_MODE_VBLANK);
+	mipi_dsi_dcs_set_column_address_multi(&dsi_ctx, 0x0000,
+					      desc->mode.hdisplay - 1);
+	mipi_dsi_dcs_set_page_address_multi(&dsi_ctx, 0x0000,
+					    desc->mode.vdisplay - 1);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x05);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb9, 0x07, 0x02, 0x40, 0x23);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x0a);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xfb, 0x00);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x54);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb5, 0x48);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0x99, 0x40);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x5c);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb1, 0x03);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
+	mipi_dsi_msleep(&dsi_ctx, 111);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x0b);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb1, 0x01);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x02);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb5, 0x13);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, MIPI_DCS_WRITE_CONTROL_DISPLAY,
+				     0x28);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0x5a, 0x5a);
+	mipi_dsi_dcs_write_var_seq_multi(&dsi_ctx, 0x60, desc->refresh);
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf7, 0x0f);
+	if (desc->fhd_120hz_te) {
+		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb9, 0x01);
+		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb0, 0x01);
+		mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xb9, 0x0c, 0x54, 0x00, 0x0b);
+	}
+	mipi_dsi_dcs_write_seq_multi(&dsi_ctx, 0xf0, 0xa5, 0xa5);
+	mipi_dsi_dcs_set_display_on_multi(&dsi_ctx);
+
+	return dsi_ctx.accum_err;
+}
+
+static int ams678uw01_off(struct ams678uw01 *ctx)
+{
+	struct mipi_dsi_multi_context dsi_ctx = { .dsi = ctx->dsi };
+
+	ctx->dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
+
+	mipi_dsi_dcs_set_display_off_multi(&dsi_ctx);
+	mipi_dsi_usleep_range(&dsi_ctx, 10000, 11000);
+	mipi_dsi_dcs_enter_sleep_mode_multi(&dsi_ctx);
+	mipi_dsi_msleep(&dsi_ctx, 120);
+
+	return dsi_ctx.accum_err;
+}
+
+static int ams678uw01_prepare(struct drm_panel *panel)
+{
+	struct ams678uw01 *ctx = to_ams678uw01(panel);
+	struct device *dev = &ctx->dsi->dev;
+	struct drm_dsc_picture_parameter_set pps;
+	int ret;
+
+	ret = regulator_bulk_enable(ARRAY_SIZE(ams678uw01_supplies), ctx->supplies);
+	if (ret < 0) {
+		dev_err(dev, "Failed to enable regulators: %d\n", ret);
+		return ret;
+	}
+
+	ams678uw01_reset(ctx);
+
+	ret = ams678uw01_on(ctx);
+	if (ret < 0) {
+		dev_err(dev, "Failed to initialize panel: %d\n", ret);
+		gpiod_set_value_cansleep(ctx->reset_gpio, 1);
+		regulator_bulk_disable(ARRAY_SIZE(ams678uw01_supplies), ctx->supplies);
+		return ret;
+	}
+
+	drm_dsc_pps_payload_pack(&pps, &ctx->dsc);
+
+	ret = mipi_dsi_picture_parameter_set(ctx->dsi, &pps);
+	if (ret < 0) {
+		dev_err(panel->dev, "failed to transmit PPS: %d\n", ret);
+		return ret;
+	}
+
+	return 0;
+}
+
+static int ams678uw01_unprepare(struct drm_panel *panel)
+{
+	struct ams678uw01 *ctx = to_ams678uw01(panel);
+	struct device *dev = &ctx->dsi->dev;
+	int ret;
+
+	ret = ams678uw01_off(ctx);
+	if (ret < 0)
+		dev_err(dev, "Failed to un-initialize panel: %d\n", ret);
+
+	gpiod_set_value_cansleep(ctx->reset_gpio, 1);
+	regulator_bulk_disable(ARRAY_SIZE(ams678uw01_supplies), ctx->supplies);
+
+	return 0;
+}
+
+static int ams678uw01_get_modes(struct drm_panel *panel,
+				struct drm_connector *connector)
+{
+	struct ams678uw01 *ctx = to_ams678uw01(panel);
+
+	return drm_connector_helper_get_modes_fixed(connector, &ctx->desc->mode);
+}
+
+static const struct drm_panel_funcs ams678uw01_panel_funcs = {
+	.prepare = ams678uw01_prepare,
+	.unprepare = ams678uw01_unprepare,
+	.get_modes = ams678uw01_get_modes,
+};
+
+static int ams678uw01_bl_update_status(struct backlight_device *bl)
+{
+	struct mipi_dsi_device *dsi = bl_get_data(bl);
+	u16 brightness = backlight_get_brightness(bl);
+	int ret;
+
+	dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
+
+	ret = mipi_dsi_dcs_set_display_brightness_large(dsi, brightness);
+	if (ret < 0)
+		return ret;
+
+	dsi->mode_flags |= MIPI_DSI_MODE_LPM;
+
+	return 0;
+}
+
+static int ams678uw01_bl_get_brightness(struct backlight_device *bl)
+{
+	struct mipi_dsi_device *dsi = bl_get_data(bl);
+	u16 brightness;
+	int ret;
+
+	dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
+
+	ret = mipi_dsi_dcs_get_display_brightness_large(dsi, &brightness);
+	if (ret < 0)
+		return ret;
+
+	dsi->mode_flags |= MIPI_DSI_MODE_LPM;
+
+	return brightness;
+}
+
+static const struct backlight_ops ams678uw01_bl_ops = {
+	.update_status = ams678uw01_bl_update_status,
+	.get_brightness = ams678uw01_bl_get_brightness,
+};
+
+static struct backlight_device *
+ams678uw01_create_backlight(struct mipi_dsi_device *dsi)
+{
+	struct device *dev = &dsi->dev;
+	const struct backlight_properties props = {
+		.type = BACKLIGHT_RAW,
+		.brightness = 2047,
+		.max_brightness = 2047,
+	};
+
+	return devm_backlight_device_register(dev, dev_name(dev), dev, dsi,
+					      &ams678uw01_bl_ops, &props);
+}
+
+static int ams678uw01_probe(struct mipi_dsi_device *dsi)
+{
+	struct device *dev = &dsi->dev;
+	struct ams678uw01 *ctx;
+	int ret;
+
+	ctx = devm_drm_panel_alloc(dev, struct ams678uw01, panel,
+				   &ams678uw01_panel_funcs,
+				   DRM_MODE_CONNECTOR_DSI);
+	if (IS_ERR(ctx))
+		return PTR_ERR(ctx);
+
+	ret = devm_regulator_bulk_get_const(dev, ARRAY_SIZE(ams678uw01_supplies),
+					    ams678uw01_supplies, &ctx->supplies);
+	if (ret < 0)
+		return dev_err_probe(dev, ret, "Failed to get regulators\n");
+
+	ctx->reset_gpio = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
+	if (IS_ERR(ctx->reset_gpio))
+		return dev_err_probe(dev, PTR_ERR(ctx->reset_gpio),
+				     "Failed to get reset-gpios\n");
+
+	if (mode >= ARRAY_SIZE(ams678uw01_descs))
+		return dev_err_probe(dev, -EINVAL, "invalid mode %u\n", mode);
+	ctx->desc = &ams678uw01_descs[mode];
+	dev_info(dev, "using mode %ux%u@%d\n", ctx->desc->mode.hdisplay,
+		 ctx->desc->mode.vdisplay, drm_mode_vrefresh(&ctx->desc->mode));
+
+	ctx->dsi = dsi;
+	mipi_dsi_set_drvdata(dsi, ctx);
+
+	dsi->lanes = 4;
+	dsi->format = MIPI_DSI_FMT_RGB888;
+	dsi->mode_flags = MIPI_DSI_MODE_VIDEO_BURST |
+			  MIPI_DSI_MODE_NO_EOT_PACKET |
+			  MIPI_DSI_CLOCK_NON_CONTINUOUS;
+
+	ctx->panel.prepare_prev_first = true;
+
+	ctx->panel.backlight = ams678uw01_create_backlight(dsi);
+	if (IS_ERR(ctx->panel.backlight))
+		return dev_err_probe(dev, PTR_ERR(ctx->panel.backlight),
+				     "Failed to create backlight\n");
+
+	ret = devm_drm_panel_add(dev, &ctx->panel);
+	if (ret)
+		return ret;
+
+	/* This panel only supports DSC; unconditionally enable it */
+	dsi->dsc = &ctx->dsc;
+
+	ctx->dsc.dsc_version_major = 1;
+	ctx->dsc.dsc_version_minor = 1;
+
+	ctx->dsc.slice_height = ctx->desc->slice_height;
+	ctx->dsc.slice_width = ctx->desc->slice_width;
+	ctx->dsc.slice_count = ctx->desc->mode.hdisplay / ctx->dsc.slice_width;
+	ctx->dsc.bits_per_component = ctx->desc->bits_per_component;
+	ctx->dsc.bits_per_pixel = ctx->desc->bits_per_pixel << 4; /* 4 fractional bits */
+	ctx->dsc.block_pred_enable = true;
+
+	return devm_mipi_dsi_attach(dev, dsi);
+}
+
+static const struct of_device_id ams678uw01_of_match[] = {
+	{ .compatible = "samsung,ams678uw01" },
+	{ /* sentinel */ }
+};
+MODULE_DEVICE_TABLE(of, ams678uw01_of_match);
+
+static struct mipi_dsi_driver ams678uw01_driver = {
+	.probe = ams678uw01_probe,
+	.driver = {
+		.name = "panel-samsung-ams678uw01",
+		.of_match_table = ams678uw01_of_match,
+	},
+};
+module_mipi_dsi_driver(ams678uw01_driver);
+
+MODULE_AUTHOR("Timo");
+MODULE_DESCRIPTION("DRM driver for Samsung AMS678UW01 DSC cmd mode panel (OnePlus 8 Pro)");
+MODULE_LICENSE("GPL");

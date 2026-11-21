@@ -881,3 +881,63 @@ DTB           128,761 B
 
 如果视频模式下变成花屏/条纹，说明通路通了、只是时序或 DSC 参数还差一点，
 那比现在的全黑更接近目标。
+
+---
+
+# 第五轮（2026-11-21）：不修了，换成一块已经点亮的实现
+
+用户给了另一份移植：
+`https://github.com/darknagel/oneplus-instantnoodlep-nura-unofficial`。
+它是同一台机器、同一块屏，在 **mainline + 自己写的面板驱动** 上把
+1440×3168@120 跑起来了（不是 simpledrm）。分析见
+[`reference-nura-port.md`](reference-nura-port.md)。
+
+## 为什么换，而不是继续修
+
+四轮下来，我们那版驱动把面板从「完全不响应」推到了「自报完全醒着」：
+
+```
+iris abyp-ready gpio = 1        Iris 放行
+power_mode = 0x9c               sleep_out / booster / display_on 全置位
+vsync 持续增长 / underrun 0     帧被消费
+err_count 0                     链路无错
+```
+
+**屏幕仍然全黑。** 剩下能调的都是「在一个已经全部正确的状态里猜哪个数不对」，
+而旁边有一份在同一块屏上已经出图的实现。继续调的期望收益低于直接换掉：
+换掉之后如果还黑，问题就锁定在内核/DPU/ABL，而不是面板的寄存器序列 ——
+这本身是一条结论。
+
+## 换了什么
+
+| 项 | 之前（0029 + 0030） | 现在（0029） |
+|---|---|---|
+| 驱动 | 自己写的 `panel-oneplus-ana6706.c`，953 行 | `panel-samsung-ams678uw01.c`，480 行（darknagel 的，几乎原样） |
+| compatible | `oneplus,ana6706`（自造） | `samsung,ams678uw01`（有 upstream binding） |
+| 模式 | 命令模式（第四轮改成 video burst，未上机） | **video burst + CLOCK_NON_CONTINUOUS**，LPM 只在 on/off 里切换 |
+| DSC | 逐字段解 PPS 的 RC 参数 | 只填几何，RC 交给 `drm_dsc_pps_payload_pack()`；PPS 双发（0x9e + DTYPE_PPS） |
+| 时序 | 4 组，只暴露 1080×2376@120 | 4 组，`mode` 模块参数在 probe 时选一组（默认 1440×3168@120） |
+| 稳压器 | vddi / vddr / vci / px_v18r | vdd(3.3V) / vddio / vci / px-v18r |
+| `vddd-gpio`(24) | 未配，列为嫌疑 | **不需要**，那份实现也没配 |
+| Iris | 读 gpio112，准备做 lightup | **完全不管**，也不需要管 |
+| 0030 slice_per_pkt | 有 | **删了**；它不在那份能亮的实现里 |
+| simple-framebuffer | 无时钟 | 带 dispcc 时钟 + `MDSS_GDSC`（否则 dispcc probe 后画面冻住） |
+
+驱动源码是唯一真相：`external-and-mods/kernel-sm8250/drivers/panel-samsung-ams678uw01.c`，
+binding 在 `bindings/samsung,ams678uw01.yaml`，补丁由
+`scripts/regen-op8p-panel-patch.sh` 生成，规则由
+`scripts/assert-op8p-panel.sh` 守着（39 条，全绿）。
+
+## 上机看什么
+
+1. `dmesg | grep -i ams678` —— 有没有 `using mode 1440x3168@120`，probe 有没有报错
+2. 屏幕有没有输出（花屏也算进展）
+3. `cat /sys/kernel/debug/dri/0/encoder-0/status` —— `vsync` 在不在涨
+4. 如果还是黑：把 `mode` 换成 1（1080×2376@120，与上一轮同尺寸）再试一次，
+   两者的差别只有 DSC 几何和 porch，能区分「几何配错」和「整条链路没通」
+
+## 还没做的
+
+- `0077`/`0078` 两个 DSI PHY 补丁（PLL bias 引用、digital top 供电）——
+  如果换驱动后仍黑，这是下一个该看的，不是面板侧
+- 1440 模式下的 gamescope 缩放（先让屏幕亮，再谈原生分辨率）

@@ -1996,3 +1996,36 @@ external-and-mods/kernel-sm8250/patches/0029-...patch              ← 由脚本
 丢了 `module_mipi_dsi_driver()` 导致驱动编译通过但从不 probe。
 
 从现在起**不再手工编辑补丁**。
+
+---
+
+## 22. 面板驱动已换成上游那份（2026-11-21）
+
+**§21.6 里"唯一的真相是 `drivers/panel-oneplus-ana6706.c`"这句话已经作废。**
+那个文件删了，`patches/0029` 现在是另一个驱动。
+
+原因和过程见 [`display-findings.md`](display-findings.md) 第五轮、
+[`reference-nura-port.md`](reference-nura-port.md)：
+
+- 手写那版四轮之后，面板自报 `power_mode 0x9c`（sleep_out/booster/display_on
+  全置位）、`err_count 0`、`vsync` 在涨、`underrun 0`，屏幕全黑；
+- darknagel 的 instantnoodlep/Nura 移植在同一块屏上用 mainline 跑出了
+  1440×3168@120，驱动 480 行、有 upstream binding；
+- 换掉之后，如果还黑，问题就不在面板寄存器序列，而在内核/DPU/ABL ——
+  这本身就是一条结论。
+
+现在的文件：
+
+```
+external-and-mods/kernel-sm8250/drivers/panel-samsung-ams678uw01.c   ← 唯一真相
+external-and-mods/kernel-sm8250/bindings/samsung,ams678uw01.yaml
+external-and-mods/kernel-sm8250/patches/0029-drm-panel-add-the-samsung-ams678uw01-panel.patch
+scripts/regen-op8p-panel-patch.sh    从上面两个文件生成补丁
+scripts/assert-op8p-panel.sh         39 条断言，守显示路径不被改坏
+```
+
+`patches/0030`（slice_per_pkt）随旧驱动一起删了：那份能亮的实现里没有它，
+`qcom,mdss-dsc-slice-per-pkt` 这个属性现在在 DTS 里也没有了 —— 留着就是一个
+没人读的死属性。
+
+下次上机按 `display-findings.md` 第五轮末尾那四条判据看。
