@@ -2153,8 +2153,162 @@ sync; reboot -f
 
 ### 23.8 下一步
 
-1. 写 `--install`：把 rootfs 装进 userdata，之后音频/传感器/摄像头才有验证基础。
+1. ~~写 `--install`~~ 已实现（见 §24）。装完之后音频/传感器/摄像头才有验证基础。
 2. 补 `qcom_pm8150b_charger.c`（约 2000 行 + 8 个修正）与 `aw8697.c`。
 3. 音频 UCM：参考移植的 pmaports 补丁是 Alpine 包定义，SteamOS 侧要重写成
    wireplumber 配置。
+
+---
+
+## 24. `--install`：把 SteamOS 装进 userdata（2026-11-21）
+
+### 24.1 两条命令
+
+```
+./make-op8p.sh --install     → work/steamos-op8p/userdata.img
+./flash-op8p.sh --install    → fastboot flash userdata（确认词 ERASE）
+```
+
+`make-op8p.sh --install` 只是入口，真正干活的是
+`scripts/make-op8p-rootfs.sh`，它在**容器里**跑：这台 Windows 没有
+`mkfs.ext4`，也没有 `unsquashfs`，而 Valve 的 rootfs 是个 RAUC bundle，
+需要用 `unsquashfs` 解出 caibx、再按 casync chunk 从远端重组。容器里
+`dnf` 装齐依赖（注意 repodata 缓存会坏，脚本先清 `/var/cache/libdnf5`）。
+
+### 24.2 两个刻意的限制
+
+**不用 loop mount。** 这个容器没有 `CAP_SYS_ADMIN`，`mount` 一律失败。所以
+镜像是用 `mke2fs -d <目录>` 直接灌进去的。它保留 uid/gid、权限、符号链接、
+硬链接，但**不保留 xattr** —— 也就是说 `security.capability` 会丢，
+`ping` 之类靠 setcap 拿权限的程序起来没有 caps。以后用一个首启 unit 把
+少数几个重新 `setcap` 一遍。
+
+**镜像只有内容 + 1 GiB 余量。** 首启靠 `/etc/fstab` 里的
+`x-systemd.growfs` 长到整个 userdata（100 多 GB），所以写进分区的文件
+看起来只有几个 GB。fstab 用 UUID 找设备（`systemd-fsck@root` 需要一个
+fstab 条目才存在）。
+
+### 24.3 装了什么
+
+| 内容 | 说明 |
+|---|---|
+| Valve 的 aarch64 rootfs | 与 alioth 同源（`work/steamos-20261002.6232440`） |
+| `steamos-overlay` | 设备无关：inputplumber、sdl2、wireplumber 通用配置 |
+| `op8p-overlay` | 设备特定：串口 getty、usb0 网络（见下） |
+| `/lib/modules/7.2.8-sm8250-steamos` | 内核模块（`=m` 的那一半） |
+| `/lib/firmware` | 固件（ADSP/CDSP/GPU/WiFi/BT） |
+
+`op8p-overlay` 现在只有两件事，都是"没有它就进不去"的：
+
+- **串口 getty**：`serial-getty@ttyGS0` 的 wants 链接 + `--autologin root`
+  的 drop-in。ttyGS0 是 USB gadget 的 console，插数据线就能登，不依赖
+  网络也不依赖屏幕。链接必须在容器里建 —— Windows 工作区建不了 symlink。
+- **usb0 静态地址**：`172.16.42.1/24`（`usb0.nmconnection`，权限必须 600，
+  NetworkManager 对别的权限是静默忽略）。与 initramfs 的 usb_shell 同网段，
+  宿主机那边的 `172.16.42.2` 不用改。
+
+### 24.4 与 Android 的关系
+
+`--install` 只写 userdata，不碰 `super`、`abl`、两个槽的 `boot`/`dtbo`，
+也不参与槽位逻辑（userdata 没有 A/B）。所以：
+
+- Linux 起不来：`fastboot --set-active=<Linux 槽以外的槽>` 就回 Android
+- 但 Android 的 `/data` 已经变成 SteamOS 的 `/`，里面的数据回不来
+
+---
+
+## 25. Steam 图形会话跑起来（2026-11-21 深夜）
+
+目标只是「屏幕上出现 Steam UI」。实际卡了一整晚，因为**九个独立故障串在一条链上**，
+每修好一个才露出下一个。按暴露顺序记下来，下次从任意一条直接跳。
+
+### 25.1 启动链
+
+```
+sddm (autologin steamos)
+  └─ gamescope-session.service          Type=notify, TimeoutStartSec=45
+       └─ /usr/lib/steamos/gamescope-session     算参数，exec gamescope
+            └─ gamescope --backend drm --prefer-output DSI-1
+                 └─ /usr/lib/steamos/gamescope-onready     发 READY、拉 steam.service
+                      └─ steam.service → /usr/share/deckard/RUNSTEAM.sh
+                           └─ steamrtarm64/steam
+```
+
+判据（别数进程，看这三条）：
+
+| 判据 | 期望 |
+|---|---|
+| `pgrep -a steamwebhelper` | 8 个 |
+| `steam_output.log` 里的 `[Gamescope WSI] Created swapchain` | 有 |
+| `/tmp/.X11-unix/X0` | 存在 |
+
+### 25.2 九个故障（按暴露顺序）
+
+| # | 现象 | 根因 | 修法 |
+|---|---|---|---|
+| 1 | `sddm-helper exited with 126` | shebang 变成 `#!/bin/bash\r` | 脚本去 CR（见 25.3） |
+| 2 | `pam_systemd: Failed to create session: Connection timed out`，登录卡 90 秒 | `home.mount` 依赖 `/dev/disk/by-partsets/shared/home`，userdata 没有那个 partset | `ln -sf /dev/null /etc/systemd/system/home.mount` |
+| 3 | 整个图形会话不跑 | `/usr/lib/steamos/panel-modes` CRLF → python3 退出 127，`set -e` 一路带走 | 去 CR |
+| 4 | gamescope 起来了但没有子进程 | `gamescope-onready` CRLF，`exec` 直接失败 | 去 CR（`/usr/lib/steamos/*` 全量 18 个文件） |
+| 5 | 日志停在 `pipewire: stream state changed: connecting`，46 秒一轮重启 | ADSP 固件缺失 → 没有声卡 → pipewire 有 socket 无 sink → gamescope 的音频流建立连接永不返回 | `PIPEWIRE_RUNTIME_DIR=/run/gamescope-nopipewire`（**指向不存在的目录**），让连接立即失败 |
+| 6 | gamescope 起不来，Vulkan 无设备 | `a650_zap.mdt` 缺（msm 编进内核，1.3 秒就 probe；root 3.6 秒才挂载） | 本机签名的 zap 四件套塞进 initramfs |
+| 7 | `steam.service` 起不来，屏幕纯黑 | 镜像自带 `steam.tar.zst`，但**没有任何东西解它** | 首启 `op8p-steam-client.service` |
+| 8 | `Job steam.service/start failed with result 'dependency'` | mask 掉 `steamvr.service` 后 `Wants=` 无法满足 | drop-in 里把 `Wants=`/`After=` 置空 |
+| 9 | 45 秒被杀，无限重启 | `systemctl --user` 每次要几十秒才应答，而 READY 在脚本末尾才发 | READY 提到最前 + 三处 `--no-block` + 超时 45 秒 |
+
+第 5 条的反证值得单独记：把 `XDG_RUNTIME_DIR` 指到一个**没有 pipewire socket**
+的目录，gamescope 打印 `pw_context_connect failed` /
+`Warning: failed to setup PipeWire, screen capture won't be available` 之后
+照常 spawn 子进程。也就是说它只在「连得上但连不通」时死等，这是绕过方案的依据。
+
+### 25.3 CRLF 是这台机器的系统性风险
+
+`core.autocrlf=true`，加上一批**没有 `.sh` 后缀**的脚本（`gamescope-session`、
+`gamescope-onready`、`steamos-select-branch`、`panel-modes`），每次 checkout 都可能
+把 shebang 变成 `#!/bin/bash\r`。`.gitattributes` 现在对 `steamos-overlay/**` 和
+`op8p-overlay/**` 全树 `eol=lf`。
+
+已经实测过的两种死法：
+
+- bash：`/bin/bash^M: bad interpreter`，sddm-helper 退出 126
+- python：`python3\r: not found`，退出 127
+
+### 25.4 落地位置（重建镜像即生效，不需要再手工改设备）
+
+| 改动 | 落在哪 |
+|---|---|
+| `PIPEWIRE_RUNTIME_DIR` 绕过 | `steamos-overlay/usr/lib/steamos/gamescope-session` |
+| READY 提前 + 三处 `--no-block` | `steamos-overlay/usr/lib/steamos/gamescope-onready` |
+| `TimeoutStartSec=45` | `steamos-overlay/usr/lib/systemd/user/gamescope-session.service` |
+| 去掉 steamvr 依赖 | `op8p-overlay/etc/systemd/user/steam.service.d/99-no-steamvr.conf` |
+| 首启解压 Steam 客户端 | `op8p-overlay/usr/lib/steamos-arm/op8p-steam-client` + 同名 `.service` |
+| `home.mount` / `steamvr.service` mask | `scripts/make-op8p-rootfs.sh`（Windows 建不了 symlink，在容器里建） |
+| 全树 LF | `.gitattributes` |
+
+### 25.5 还没通的
+
+- **音频**：`adsp.mbn` / `cdsp.mbn` / `slpi.mbn` 三个都不在，`/proc/asound/cards`
+  为空，三个 remoteproc 全 `offline`。可照 GPU zap 的做法，从 `super` 的
+  `vendor_a` 里取。
+- **振动**：驱动已写（`aw8697.c` + 0031 补丁），但没进这次的内核构建。
+- **充电**：`qcom_pm8150b_charger.c` 仍缺，只有 bq27541 电量计。
+- **电量计数值失真**：`capacity=3947`、`TEMP=-2082`、`HEALTH=Dead`，寄存器读到了
+  但没做单位换算与校准。
+- **WiFi 未连**：硬件全通（见 25.6），只差 SSID 与口令。
+- **蓝牙**：`hci0 UP RUNNING`、有 MAC、`errors:0`，扫描与配对未验证。
+
+### 25.6 WiFi 是 rfkill 软阻塞，不是驱动问题
+
+`wlan0` 一直 `DOWN`，但 ath11k 的 probe 是干净的（`qca6390 hw2.0`、
+`fw_version 0x10121492`、`Generated MAC_ADDR`）。真正的开关是：
+
+```
+phy0: Wireless LAN   Soft blocked: yes
+```
+
+`rfkill unblock wlan` 之后立刻扫到 9 个 AP。状态保存在
+`/var/lib/systemd/rfkill/platform-1c00000.pcie-pci-0000:01:00.0:wlan`，
+已写回 `0`；`NetworkManager.state` 里 `WirelessEnabled=true`。
+**下次开机会不会自动恢复 unblocked，还没验证过。**
+
 

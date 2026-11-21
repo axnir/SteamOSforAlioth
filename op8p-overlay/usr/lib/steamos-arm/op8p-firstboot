@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# 首次开机：把根文件系统扩到整个 userdata 分区，成功后删掉哨兵。
+#
+# 照 raphael-firstboot（11-07 真机验过的那份），去掉一个 op8p 不需要的参数：
+# raphael 的根是 initramfs 里的 loop0，长度比嵌套 GPT 的 p2 多 34 个扇区，
+# 所以 resize2fs 必须显式给上限，否则会盖掉尾部的 backup GPT。
+# op8p 没有嵌套 GPT —— 根就是 userdata 分区本身（root=PARTLABEL=userdata），
+# 所以不带上限地 resize2fs 正好扩到分区末尾。
+#
+# 顺序是这个脚本的全部要点：
+#   哨兵在？ -- 不在就什么都不做
+#   resize2fs
+#   删哨兵   <-- 只有成功才走到这里
+# 任何中断（掉电、SIGKILL、resize2fs 失败）都落在「哨兵还在」，下次开机重来。
+#
+# 它与 fstab 里的 x-systemd.growfs 不重复：那个在挂载时扩，扩成功就完事；
+# 这个是不依赖 mount 时序的兜底，也是「真的扩过了」的凭证（哨兵被删掉）。
+set -euo pipefail
+
+SENTINEL=/var/lib/op8p-firstboot-pending
+log() { echo "op8p-firstboot: $*"; }
+
+[[ -e "$SENTINEL" ]] || { log "哨兵不在，已经跑过了"; exit 0; }
+
+dev="$(findmnt -no SOURCE -T /)"
+[[ -b "$dev" ]] || { log "根设备 '$dev' 不是块设备，放弃（哨兵保留）"; exit 1; }
+
+log "根设备 $dev，可见 $(( $(blockdev --getsize64 "$dev") / 1024 / 1024 )) MiB"
+resize2fs "$dev"
+rm -f "$SENTINEL"
+log "完成：根现有 $(dumpe2fs -h "$dev" 2>/dev/null | awk -F: '/^Block count:/{gsub(/ /,"",$2);print $2}') 个 4K 块"

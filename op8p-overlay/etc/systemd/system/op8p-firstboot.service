@@ -1,0 +1,19 @@
+[Unit]
+Description=op8p first boot: grow the root filesystem to the whole userdata partition
+# 哨兵不在就根本不启动；脚本自己也会再查一次（两道都要，ConditionPathExists
+# 只在启动时算一次）。
+ConditionPathExists=/var/lib/op8p-firstboot-pending
+# 根是 initramfs 挂好再 switch_root 的，所以 local-fs.target 之后根已经可写。
+DefaultDependencies=no
+After=local-fs.target
+Before=sysinit.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/steamos-arm/op8p-firstboot
+# 刻意不设 SuccessExitStatus：失败要在 systemctl --failed 里看得见。
+# 它拦不住开机（WantedBy 是弱依赖），哨兵还在，下次开机自然重试。
+
+[Install]
+WantedBy=sysinit.target

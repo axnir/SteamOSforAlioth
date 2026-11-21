@@ -1,0 +1,21 @@
+[Unit]
+Description=op8p: extract the bundled Steam ARM64 client into /home/steamos
+# The client tarball ships inside the rootfs but nothing unpacks it, so Steam
+# cannot start (see the script for the full chain). Runs once, ever.
+ConditionPathExists=!/home/steamos/.local/share/Steam/steamrtarm64/steam
+DefaultDependencies=no
+# The root filesystem must be grown first: 705 MB of client on a 12 GiB ext4
+# still fits, but the order keeps firstboot's resize2fs authoritative.
+After=local-fs.target op8p-firstboot.service
+Before=sysinit.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/steamos-arm/op8p-steam-client
+# No SuccessExitStatus on purpose: a broken tarball must show up in
+# `systemctl --failed`. It cannot block boot (WantedBy is a weak dependency),
+# and the Condition re-arms on the next boot.
+
+[Install]
+WantedBy=sysinit.target

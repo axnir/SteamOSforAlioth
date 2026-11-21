@@ -413,4 +413,13 @@ env | grep -E '^(STEAM_DISPLAY_REFRESH_LIMITS|STEAM_USE_MANGOAPP|STEAM_MANGOAPP_
 
 echo >&2 "gamescope-session: output=$OUTPUT panel=${PANEL_W}x${PANEL_H} nested=${W}x${H}@${REFRESH_HZ} max=${MAX_HZ} mangoapp=${MANGOAPP} kms_rotation=${KMS_ROTATION} ignore_touch=${GAMESCOPE_IGNORE_TOUCH:-} bottom=${GAMESCOPE_LEASE_CONNECTOR:-none} orientation=${PANEL_ORIENT:-auto}"
 
+# Gamescope 3.16 sets up its audio stream synchronously before it spawns the
+# client. When PipeWire is reachable but has no sink to connect to — the case on
+# every port whose ADSP firmware is still missing — the stream sits in
+# "connecting" forever: no child is started, no READY is sent, and the unit is
+# killed on TimeoutStartSec in a loop. Pointing PIPEWIRE_RUNTIME_DIR at an empty
+# directory makes pw_context_connect fail immediately, which gamescope treats as
+# a warning and carries on. The directory is deliberately not created.
+export PIPEWIRE_RUNTIME_DIR=/run/gamescope-nopipewire
+
 exec gamescope "${GAMESCOPE_ARGS[@]}" -- /usr/lib/steamos/gamescope-onready ${WATCH_SERVICE:-}

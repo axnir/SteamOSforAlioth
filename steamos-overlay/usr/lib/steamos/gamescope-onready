@@ -35,6 +35,18 @@ unset XDG_SESSION_TYPE || true
 # duplicate ("Invalid environment assignments"), and XDG_CURRENT_DESKTOP is
 # in both lists. That one duplicate kept every STEAM_GAMESCOPE_* flag and
 # ENABLE_GAMESCOPE_WSI away from Steam, so its frame limiter did nothing.
+if [[ -n "${GAMESCOPE_READY_NOTIFY_SOCKET:-}" ]]; then
+  export NOTIFY_SOCKET="$GAMESCOPE_READY_NOTIFY_SOCKET"
+fi
+
+# READY goes out before the first systemctl --user call below. The user manager
+# can take tens of seconds to answer one call on these ports, and with
+# Type=notify the unit is killed on TimeoutStartSec long before the notify block
+# at the bottom of this script is reached.
+if [[ -n "${NOTIFY_SOCKET:-}" ]]; then
+  systemd-notify --ready >/dev/null 2>&1 || true
+fi
+
 inherit=()
 declare -A seen=()
 for v in DISPLAY GAMESCOPE_WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP \
@@ -71,9 +83,11 @@ xhost + >/dev/null 2>&1 || true
 echo 'Xft.dpi: 144' | xrdb -merge >/dev/null 2>&1 || true
 
 # Game Mode does not always reach user default.target. Start the sink
-# before Steam so splash/UI audio has a speaker route.
-systemctl --user start pipewire.service pipewire-pulse.service wireplumber.service >/dev/null 2>&1 || true
-systemctl --user start sm8550-audio-pipewire.service sm8550-volume-keys.service >/dev/null 2>&1 || true
+# before Steam so splash/UI audio has a speaker route. --no-block: these units
+# can sit in "activating" for minutes on a box without a sound card, and the
+# blocking form would hold the whole session here.
+systemctl --user --no-block start pipewire.service pipewire-pulse.service wireplumber.service >/dev/null 2>&1 || true
+systemctl --user --no-block start sm8550-audio-pipewire.service sm8550-volume-keys.service >/dev/null 2>&1 || true
 
 # gamescope came up: hardware (KMS) rotation, if enabled, works here.
 rm -f "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/gamescope-kms-rotation.tries" 2>/dev/null || true
@@ -83,7 +97,7 @@ if [[ -n "${GAMESCOPE_READY_NOTIFY_SOCKET:-}" ]]; then
   systemd-notify --ready >/dev/null 2>&1 || true
 fi
 
-systemctl --user start steam.service >/dev/null 2>&1 || true
+systemctl --user --no-block start steam.service >/dev/null 2>&1 || true
 
 WATCH_SERVICE="${1:-}"
 if [[ -n "${WATCH_SERVICE}" && "${WATCH_SERVICE}" != "steam.service" ]]; then

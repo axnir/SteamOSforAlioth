@@ -1,0 +1,14 @@
+[connection]
+id=usb0
+type=ethernet
+interface-name=usb0
+autoconnect=true
+# 没有 DHCP：gadget 那头不跑服务器，手配一个固定地址就够了。
+# 与 initramfs 的 usb_shell 用同一个网段（172.16.42.1/24），这样宿主机的
+# 172.16.42.2 不用改就能用；换到正式系统之后 ssh 也在这个地址上。
+[ipv4]
+method=manual
+address1=172.16.42.1/24
+
+[ipv6]
+method=ignore

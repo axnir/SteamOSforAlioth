@@ -29,3 +29,18 @@ external-and-mods/kernel-sm8250/*.config      text eol=lf
 # exactly what happened to scripts/fetch-steamos-rootfs.sh while building
 # the rootfs image on Windows.
 *.sh                                          text eol=lf
+
+# The overlay trees are consumed by Linux at runtime: shell scripts with no
+# .sh suffix (gamescope-session, gamescope-onready, steamos-select-branch),
+# systemd units, python helpers. core.autocrlf=true turns a checkout into
+# CRLF, and every one of those failure modes was observed on the device:
+#   - `#!/bin/bash\r` -> sddm-helper exits 126, the graphical session never runs
+#   - python3 dies on the shebang ("gamescope-onready" 127, panel-modes 127)
+#   - unit files get glued lines (`ConditionPathExists=...m1[Service]`)
+# Keep both trees LF in the index *and* in the worktree, whatever the checkout
+# side is configured to do.
+steamos-overlay/**                            text eol=lf
+op8p-overlay/**                               text eol=lf
+
+# The attribute file itself is read by git on every checkout.
+.gitattributes                                text eol=lf

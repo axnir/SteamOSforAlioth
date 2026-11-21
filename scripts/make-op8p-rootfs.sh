@@ -66,6 +66,45 @@ for o in steamos-overlay op8p-overlay; do
   rsync -aHAX --numeric-ids "${ROOT}/${o}/" "${R}/"
 done
 
+# systemd 的 wants 链接：工作区在 Windows 上，建不了 symlink（overlay 里
+# 那个链接是空的），所以在容器里补。串口 getty 是这台机器唯一的无依赖
+# 调试口 —— 屏幕和网络都还没验证的时候，必须能登进去。
+mkdir -p "${R}/usr/lib/systemd/system/multi-user.target.wants"
+ln -sf /usr/lib/systemd/system/serial-getty@.service \
+  "${R}/usr/lib/systemd/system/multi-user.target.wants/serial-getty@ttyGS0.service"
+# 首启扩根：同样的理由在容器里建链接（overlay 在 Windows 上建不出 symlink）。
+mkdir -p "${R}/etc/systemd/system/sysinit.target.wants"
+ln -sf /etc/systemd/system/op8p-firstboot.service \
+  "${R}/etc/systemd/system/sysinit.target.wants/op8p-firstboot.service"
+chmod 755 "${R}/usr/lib/steamos-arm/op8p-firstboot"
+
+# 首启解压 Steam 客户端：镜像自带 /usr/lib/steam/steam.tar.zst，但没有任何
+# 东西去解它。不解的话 steam.service 的 ExecStartPre（往 ~/.local/share/Steam
+# 拷 RUNSTEAM.sh）直接失败，gamescope 没有可合成的客户端，屏幕停在 fbcon 的黑帧。
+mkdir -p "${R}/etc/systemd/system/sysinit.target.wants"
+ln -sf /etc/systemd/system/op8p-steam-client.service \
+  "${R}/etc/systemd/system/sysinit.target.wants/op8p-steam-client.service"
+chmod 755 "${R}/usr/lib/steamos-arm/op8p-steam-client"
+
+# SteamOS 的 /home 是独立分区（/dev/disk/by-partsets/shared/home），这里的
+# userdata 没有那个 partset。不屏蔽的话 home.mount 永远起不来，pam_systemd
+# 每次登录都卡到 90 秒超时（"Failed to create session: Connection timed out"），
+# 图形会话根本拉不起来。/home 本来就在根分区上，屏蔽即可。
+mkdir -p "${R}/etc/systemd/system"
+ln -sf /dev/null "${R}/etc/systemd/system/home.mount"
+
+# 没有 VR 硬件，steamvr.service 在 RUNSTEAM.sh 建好 ~/.steam/sdkarm64 之前就
+# dlopen steamclient.so，注定失败。只 mask 不行：Wants= 指向 masked unit 会让
+# steam.service 以 "result 'dependency'" 失败。真正的修复在
+# op8p-overlay/etc/systemd/user/steam.service.d/99-no-steamvr.conf（清空
+# Wants=/After=），mask 只是防止别的东西把它拉起来。
+mkdir -p "${R}/etc/systemd/user"
+ln -sf /dev/null "${R}/etc/systemd/user/steamvr.service"
+
+# NetworkManager 只加载 600 的连接配置，别的权限它直接忽略（不报错）。
+NM="${R}/etc/NetworkManager/system-connections/usb0.nmconnection"
+[[ -f "$NM" ]] && chmod 600 "$NM"
+
 # 3. kernel modules and firmware. Both are =m/=y mixtures: without the
 #    modules the phone boots to a shell with no display server, no audio.
 [[ -d "${KOUT}/modules/7.2.8-sm8250-steamos" ]] || die "没有已编译的模块（先构建内核）"
@@ -93,21 +132,43 @@ cat >"${R}/etc/fstab" <<EOF
 UUID=${ROOT_UUID}  /  ext4  defaults,noatime,commit=30,x-systemd.growfs  0 1
 EOF
 
-# 5. the image. Content plus slack; never smaller than 2 GiB even for an
-#    empty tree, because ext4 needs room for its own metadata.
+# SteamOS 的 /etc 是 overlayfs（lower 在只读的 /usr，upper 在
+# /var/lib/overlays/etc）。upper 里如果本来就有一份 fstab，它会盖住我们刚
+# 写的那份，首启就找不到根 —— alioth 的镜像两处都写，这里照做。
+mkdir -p "${R}/var/lib/overlays/etc/upper"
+cp -a "${R}/etc/fstab" "${R}/var/lib/overlays/etc/upper/fstab"
+
+# 每台机器要有自己的 D-Bus / 网络身份：不清空的话所有刷了这份镜像的机器
+# 是同一个 machine-id。alioth 的镜像也做这一步。
+: >"${R}/etc/machine-id"
+[[ -f "${R}/var/lib/overlays/etc/upper/machine-id" ]] \
+  && : >"${R}/var/lib/overlays/etc/upper/machine-id"
+
+# 首启哨兵：op8p-firstboot.service 见不到它就什么都不做。放在镜像里而不是
+# 首启时创建 —— 中断（掉电、SIGKILL）必须落在「哨兵还在」，下次开机重来。
+mkdir -p "${R}/var/lib"
+touch "${R}/var/lib/op8p-firstboot-pending"
+
+# 5. the image. 尺寸照 11-07 raphael 那次成功的配方：内容约 9.5 GiB，固定
+#    12 GiB（余量约 2.7 GiB）。mkfs.ext4 -d 在灌数据阶段还要写 journal 和
+#    目录块，余量给足就没有"跑到 98% 报 No space left"这种收尾失败。
 used_mib="$(du -sm "${R}" | cut -f1)"
 if [[ $SIZE_MIB == 0 ]]; then
-  SIZE_MIB=$(( used_mib + 1024 ))
-  (( SIZE_MIB < 3072 )) && SIZE_MIB=3072
+  SIZE_MIB=12288
+  # 内容涨到 3/4 以上时警告：那时候 12 GiB 的余量已经不够，别再硬灌。
+  if (( used_mib > 9216 )); then
+    say "警告：内容 ${used_mib} MiB，已超过 12 GiB 镜像的 3/4，请用 --size-mib 调大"
+  fi
 fi
 say "内容 ${used_mib} MiB，镜像 ${SIZE_MIB} MiB"
 mkdir -p "$OUT"
 rm -f "$IMG"
 truncate -s "${SIZE_MIB}M" "$IMG"
 
-# -d populates without mounting. -m 1 keeps 1% for root. The label is what
-# the initramfs and the recovery instructions both refer to.
-mkfs.ext4 -q -F -L steamos -U "$ROOT_UUID" -m 1 -d "$R" "$IMG"
+# -d populates without mounting. -b 4096 显式给（raphael 那次也是显式给的）。
+# -m 1 keeps 1% for root. The label is what the initramfs and the recovery
+# instructions both refer to.
+mkfs.ext4 -q -F -L steamos -U "$ROOT_UUID" -b 4096 -m 1 -d "$R" "$IMG"
 e2fsck -f -y "$IMG" >/dev/null 2>&1 || true
 
 say "写出 ${IMG}"

@@ -27,6 +27,8 @@
 #
 # Usage:
 #   ./make-op8p.sh [--v2] [--debug] [--out DIR]
+#   ./make-op8p.sh --install     # 造 work/steamos-op8p/userdata.img（SteamOS 根）
+#   ./make-op8p.sh --verify      # 只读校验上面那个镜像，不刷机
 set -euo pipefail
 
 PORT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -41,12 +43,14 @@ OUT="${STEAMOS_WORK:-${PORT_ROOT}/work}/steamos-op8p"
 PACK=gzip
 QUIET=0
 INSTALL=0
+VERIFY=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --gzip)  PACK=gzip ;;
     --v2)    PACK=v2 ;;
     --quiet) QUIET=1 ;;
     --install) INSTALL=1 ;;
+    --verify)  VERIFY=1 ;;
     --out)   OUT="$2"; shift ;;
     *) echo "make-op8p: 不认识的参数: $1" >&2; exit 2 ;;
   esac
@@ -74,14 +78,102 @@ if [[ $INSTALL == 1 ]]; then
   # MSYS_NO_PATHCONV=1 关掉了自动转换，直接传会挂成空目录（第一次就是这样，
   # 容器里报 "No such file or directory"）。
   WIN_ROOT="$(cygpath -w "$PORT_ROOT" 2>/dev/null || printf '%s' "$PORT_ROOT")"
+  # 整棵树放在容器的 /scratch 里，不放 /repo：/repo 是 Windows 目录，DrvFs
+  # 不保留 Unix 权限位，restore 出来的 bash 会是 -rw-r--r--，mkfs -d 装进
+  # 镜像后系统起不来。只有最终的 userdata.img 写回 /repo（单个文件，权限
+  # 无关）。代价是容器要能放下 rootfs + 镜像两份，约 20 GB。
   MSYS_NO_PATHCONV=1 "$WSLC" run --rm --dns 223.5.5.5 \
     -v "${WIN_ROOT}:/repo" "$WSLC_IMAGE" bash -c '
       set -e
-      dnf install -y squashfs-tools rsync e2fsprogs util-linux python3 curl >/dev/null 2>&1
-      if [ ! -x /repo/work/rootfs/usr/bin/bash ]; then
-        bash /repo/scripts/fetch-steamos-rootfs.sh
+      # 缓存的 repodata 会坏，而且这条线路上 metadata 本身也会被截断
+      # （"Unable to read zchunk lead"），所以清缓存 + 重试，不能一次定生死。
+      ok=0
+      for i in 1 2 3 4 5; do
+        rm -rf /var/cache/libdnf5 /var/cache/dnf
+        if dnf install -y squashfs-tools rsync e2fsprogs btrfs-progs util-linux \
+             python3 python3-requests python3-zstandard curl; then
+          ok=1; break
+        fi
+        echo "make-op8p: dnf 第 $i 次失败，重试" >&2
+        sleep 3
+      done
+      [[ $ok == 1 ]] || { echo "make-op8p: 容器里装依赖失败（重试 5 次）" >&2; exit 1; }
+      mkdir -p /scratch
+      export SCRATCH=/scratch
+      IMG="$(ls /repo/work/steamos-*/rootfs.img 2>/dev/null | head -1)"
+      echo "make-op8p: IMG=[$IMG]"
+      if [ -z "$IMG" ]; then
+        bash /repo/scripts/fetch-steamos-rootfs.sh /scratch/rootfs
+      else
+        rm -rf /scratch/rootfs
+        mkdir -p /scratch/rootfs
+        # 参数照 11-07 raphael 那次真机验过的配方：-i 跳过打不开的文件、
+        # -m 恢复属主与权限（不加它 /usr/bin/bash 会落成 644，系统起不来）、
+        # -S 保留 sparse、-x 不搬 btrfs 自己的 xattr（目标文件系统不支持）。
+        # 不用 -v：十万行日志会把进程拖死（11-21 踩过）。
+        btrfs restore -i -m -S -x "$IMG" /scratch/rootfs >/scratch/restore.log 2>&1 || true
+        files=$(find /scratch/rootfs -type f 2>/dev/null | wc -l)
+        echo "make-op8p: restore size=$(du -sh /scratch/rootfs 2>/dev/null | cut -f1) files=$files"
+        # 判据用「bash 能执行 + 文件数够」，不数日志里的 ERROR —— restore 会
+        # 对 symlink 目录报无害错误，数它没有意义。
+        [ -x /scratch/rootfs/usr/bin/bash ] || {
+          tail -5 /scratch/restore.log
+          echo "make-op8p: restore 没有产出可执行的 /usr/bin/bash" >&2; exit 1; }
+        [ "$files" -ge 185000 ] || {
+          echo "make-op8p: 只恢复出 $files 个文件（应 ≥185000），树不完整" >&2; exit 1; }
       fi
-      bash /repo/scripts/make-op8p-rootfs.sh
+      mkdir -p /scratch/work
+      # 树和镜像都放容器本地：DrvFs 不保留 Unix 权限位，往 /repo 里造等于
+      # 把刚恢复好的属主和 execute 位再丢一次。最后只搬一个文件出去。
+      # KERNEL_OUT 必须显式给：STEAMOS_WORK 改成 /scratch 之后，脚本会去
+      # /scratch/work/kernel-sm8250 找模块，那里没有东西（11-21 第一次跑就
+      # 撞在 "没有已编译的模块" 上）。
+      STEAMOS_WORK=/scratch/work \
+      KERNEL_OUT=/repo/work/kernel-sm8250/output/current \
+      STEAMOS_SRC_ROOTFS=/scratch/rootfs \
+      STEAMOS_ROOTFS=/scratch/rootfs-op8p \
+        bash /repo/scripts/make-op8p-rootfs.sh
+      OUT_IMG=/scratch/work/steamos-op8p/userdata.img
+      [ -s "$OUT_IMG" ] || { echo "make-op8p: 没有产出 $OUT_IMG" >&2; exit 1; }
+      echo "make-op8p: 搬回 Windows（单个文件，几分钟）"
+      mkdir -p /repo/work/steamos-op8p
+      cp "$OUT_IMG" /repo/work/steamos-op8p/userdata.img
+      a=$(sha256sum "$OUT_IMG" | cut -d" " -f1)
+      b=$(sha256sum /repo/work/steamos-op8p/userdata.img | cut -d" " -f1)
+      echo "make-op8p: sha256 容器内 $a"
+      echo "make-op8p: sha256 磁盘上 $b"
+      [ "$a" = "$b" ] || { echo "make-op8p: 搬回来的文件和源不一致" >&2; exit 1; }
+      echo "make-op8p: 镜像完成 $OUT_IMG"
+    '
+  exit $?
+fi
+
+# --verify checks the finished userdata.img without booting it: superblock,
+# fstab UUID, executable bits (the btrfs-restore -m trap), overlay files,
+# modules/firmware, then a read-only e2fsck. Same reason as --install it runs
+# in the container: Windows has no debugfs/e2fsck.
+if [[ $VERIFY == 1 ]]; then
+  WSLC="${WSLC:-/c/Program Files/WSL/wslc}"
+  WSLC_IMAGE="${WSLC_IMAGE:-proxy.vvvv.ee/library/fedora:43}"
+  IMG_WIN="$(cygpath -w "${OUT}/userdata.img" 2>/dev/null || printf '%s' "${OUT}/userdata.img")"
+  [[ -s "${OUT}/userdata.img" ]] || die "没有 ${OUT}/userdata.img —— 先跑 ./make-op8p.sh --install"
+  if command -v dumpe2fs >/dev/null 2>&1; then
+    exec bash "${PORT_ROOT}/scripts/verify-op8p-userdata.sh" "${OUT}/userdata.img"
+  fi
+  [[ -x "$WSLC" ]] || die "--verify 需要 e2fsprogs（Linux）或 wslc（Windows）—— 两个都没有"
+  WIN_ROOT="$(cygpath -w "$PORT_ROOT" 2>/dev/null || printf '%s' "$PORT_ROOT")"
+  MSYS_NO_PATHCONV=1 "$WSLC" run --rm --dns 223.5.5.5 \
+    -v "${WIN_ROOT}:/repo" "$WSLC_IMAGE" bash -c '
+      set -e
+      ok=0
+      for i in 1 2 3; do
+        rm -rf /var/cache/libdnf5 /var/cache/dnf
+        if dnf install -y e2fsprogs util-linux >/dev/null; then ok=1; break; fi
+        echo "make-op8p: dnf 第 $i 次失败，重试" >&2
+        sleep 3
+      done
+      [[ $ok == 1 ]] || { echo "make-op8p: 容器里装 e2fsprogs 失败" >&2; exit 1; }
+      bash /repo/scripts/verify-op8p-userdata.sh /repo/work/steamos-op8p/userdata.img
     '
   exit $?
 fi
@@ -219,8 +311,39 @@ case "$PACK" in
     withdtb="${OUT}/Image.gz-dtb"
     cat "$payload" "$dtb" >"$withdtb"
     name=boot-op8p-gzip.img
+    # GPU microcode has to be reachable *before* the root is mounted.
+    #
+    # msm is built into the Image (CONFIG_DRM_MSM=y), so its probe runs in
+    # the initramfs at ~1.3 s; the ext4 root is mounted at ~3.6 s. The a650
+    # firmware lives on the root filesystem, so every early probe fails:
+    #
+    #   Direct firmware load for qcom/a650_sqe.fw failed with error -2
+    #   adreno: Unable to load a650_zap.mdt
+    #   msm_dpu: gpu hw init failed: -2
+    #   TU: could not get GPU ID (VK_ERROR_INITIALIZATION_FAILED)
+    #   gamescope: Failed to create backend.
+    #
+    # ...and with no Vulkan device gamescope never enables the panel, so the
+    # screen stays black. FW_BUILTIN=0 in soc.env is right for ROCKNIX's
+    # flow, not this one.
+    #
+    # The kernel unpacks the built-in initramfs first and any ramdisk from
+    # the boot image after it, so a small ramdisk carrying just these three
+    # files is enough. Built by the container step that writes it; absent
+    # that file the packing stays exactly as before.
+    rd_arg=()
+    if [[ ! -f "${OUT}/gpu-fw-ramdisk.cpio.gz" ]]; then
+      # 缺了它 GPU 一定起不来（见上面那串日志），所以先尝试现做一份。
+      # 做不出来就明确告警 —— 静默跳过的结果是一块全黑的屏幕。
+      bash "${PORT_ROOT}/scripts/make-op8p-gpu-ramdisk.sh" "${OUT}" \
+        || echo "make-op8p: WARNING 没有 gpu-fw-ramdisk.cpio.gz，GPU 在 initramfs 阶段拿不到 zap，屏幕必黑" >&2
+    fi
+    if [[ -f "${OUT}/gpu-fw-ramdisk.cpio.gz" ]]; then
+      rd_arg=(--ramdisk "${OUT}/gpu-fw-ramdisk.cpio.gz")
+    fi
     python3 "${KCOMMON}/mkbootimg-v0.py" \
       --kernel "$withdtb" \
+      ${rd_arg[@]+"${rd_arg[@]}"} \
       --cmdline "$cmdline" \
       --pagesize "$PAGESIZE" \
       --kernel-addr "$KERNEL_ADDR" \

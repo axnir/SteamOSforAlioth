@@ -74,12 +74,59 @@ log "解包 rootfs.img → ${R}"
 mnt="${WORKDIR}/.rootfs-ro"
 mkdir -p "${mnt}" "${R}"
 # 已挂着就先卸，否则重跑会 rsync 出一棵空树。
-mountpoint -q "${mnt}" && sudo umount "${mnt}"
-sudo mount -o loop,ro "${img}" "${mnt}"
-trap 'sudo umount "${mnt}" 2>/dev/null || true' EXIT
-sudo rsync -aHAX --filter="-x btrfs.*" --numeric-ids "${mnt}/" "${R}/"
-sudo umount "${mnt}"
-trap - EXIT
+mountpoint -q "${mnt}" && sudo umount "${mnt}" 2>/dev/null || true
+
+# 优先走挂载 + rsync：它保留 xattr、属主、稀疏文件和硬链接，是唯一"完整"
+# 的方式。但构建容器没有 CAP_SYS_ADMIN，mount 一定失败（lo 设备都没有），
+# 所以在那种环境里退到 debugfs 的 rdump —— 它逐文件复制，保 mode/属主/
+# 时间戳，**不保 xattr**，10 GiB 的树要跑十几分钟，但不需要任何特权。
+if mount -o loop,ro "${img}" "${mnt}" 2>/dev/null; then
+  trap 'sudo umount "${mnt}" 2>/dev/null || umount "${mnt}" 2>/dev/null || true' EXIT
+  rsync -aHAX --filter="-x btrfs.*" --numeric-ids "${mnt}/" "${R}/"
+  umount "${mnt}" 2>/dev/null || sudo umount "${mnt}"
+  trap - EXIT
+else
+  # 不能挂载时按文件系统类型分派。Valve 这份 rootfs.img 是 **btrfs**
+  # （debugfs 会直接报 "contains a btrfs file system"），所以主路径是
+  # btrfs restore —— 它不需要任何特权，也不需要 loop 设备。
+  fstype="$(blkid -o value -s TYPE "${img}" 2>/dev/null || true)"
+  [[ -n "$fstype" ]] || fstype="$(file -b "${img}" 2>/dev/null | grep -io 'btrfs\|ext[234]' | head -1)"
+  log "不能 loop 挂载（容器无 CAP_SYS_ADMIN），文件系统是 ${fstype:-unknown}，走离线恢复"
+  rm -rf "${R}"
+  mkdir -p "${R}"
+  case "$fstype" in
+    btrfs)
+      command -v btrfs >/dev/null || die "没有 btrfs 工具 —— 装 btrfs-progs"
+      # -m 是必须的：没有它 restore 只写内容，属主和权限全部落成默认值
+      # （/usr/bin/bash 变成 644），树看起来完整但系统起不来。这是走了
+      # 一整轮弯路才发现的 —— 表现是"restore rc=0、18 万个文件、bash 存在
+      # 但没有 x 位"。
+      LOGD="${SCRATCH:-/tmp}/btrfs-restore.log"
+      btrfs restore -v -m "${img}" "${R}" >"$LOGD" 2>&1 || true
+      errs="$(grep -c '^ERROR' "$LOGD" 2>/dev/null || true)"
+      log "btrfs restore 报错 ${errs:-0} 条"
+      if [[ ! -x "${R}/usr/bin/bash" ]]; then
+        tail -8 "$LOGD" >&2
+        die "restore 没有产出 /usr/bin/bash（完整日志在容器内 $LOGD）"
+      fi
+      # 已知且无害的一条：/usr/lib/xorg/modules 是符号链接，restore 会
+      # 报 "mkdir ... Not a directory" 然后跳过它下面的内容。
+      if grep -q 'Not a directory' "$LOGD" 2>/dev/null; then
+        log "注意：xorg/modules 是 symlink，restore 跳过了它（SteamOS 图形不依赖这条路径）"
+      fi
+      ;;
+    ext4|ext3|ext2|"")
+      command -v debugfs >/dev/null || die "没有 debugfs —— e2fsprogs 没装成"
+      if ! debugfs -R "rdump / ${R}" "${img}" >"${WORKDIR}/debugfs-rdump.log" 2>&1; then
+        tail -5 "${WORKDIR}/debugfs-rdump.log" >&2
+        die "debugfs rdump 失败（完整日志 ${WORKDIR}/debugfs-rdump.log）"
+      fi
+      ;;
+    *)
+      die "不认识的 rootfs 文件系统：${fstype}"
+      ;;
+  esac
+fi
 
 [[ -x "${R}/usr/bin/bash" ]] || die "解包后的 rootfs 里没有 /usr/bin/bash"
 log "完成: ${R}"

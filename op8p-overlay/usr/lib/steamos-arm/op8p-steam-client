@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# 首次开机：把 rootfs 自带的 Steam ARM64 客户端解开。
+#
+# 为什么必须做：/usr/bin/steam 只是个 41 字节的 wrapper，指向
+# /usr/lib/steam/bin_steam.sh，而它找的是 bootstraplinux_steamrtarm64.tar.xz
+# —— 镜像里根本没有这个文件，只有 steam.tar.zst。deckard 的 RUNSTEAM.sh 注释
+# 里写着"客户端由 apply-overlays / install-steam-client-arm64 解开"，可那个
+# 脚本既不在镜像里也不在仓库里。
+#
+# 不解开的直接后果（2026-11-21 实测）：steam.service 的 ExecStartPre 要往
+# ~/.local/share/Steam 里拷 RUNSTEAM.sh，目录不存在 → cp 失败 → 服务起不来；
+# gamescope 没有客户端可合成，CRTC 上一直是 fbcon 的帧 → 屏幕纯黑。
+#
+# 包内结构以 ./ubuntu12_32/、./steamrtarm64/ 开头，即包根就是 STEAMROOT。
+set -euo pipefail
+
+CLIENT=/usr/lib/steam/steam.tar.zst
+DEST=/home/steamos/.local/share/Steam
+SENTINEL="$DEST/steamrtarm64/steam"
+
+log() { echo "op8p-steam-client: $*"; }
+
+if [[ ! -f "$CLIENT" ]]; then
+  log "$CLIENT 不在，跳过（这不是错误）"
+  exit 0
+fi
+if [[ -e "$SENTINEL" ]]; then
+  log "客户端已存在，跳过"
+  exit 0
+fi
+
+mkdir -p "$DEST"
+log "解压 $(du -h "$CLIENT" | cut -f1) 到 $DEST"
+
+if command -v zstd >/dev/null 2>&1; then
+  tar --zstd -xf "$CLIENT" -C "$DEST"
+else
+  # 老一点的 tar 不认 --zstd，退回管道。
+  zstd -dc "$CLIENT" | tar -x -C "$DEST"
+fi
+
+chown -R 1000:1000 "$DEST"
+
+# 解压"成功"但客户端主体不在 = 包换了结构，必须让它失败，下次开机重来。
+[[ -x "$SENTINEL" ]] || { log "解压后 $SENTINEL 不存在，包结构不对" >&2; exit 1; }
+log "完成：$(du -sh "$DEST" | cut -f1)"
