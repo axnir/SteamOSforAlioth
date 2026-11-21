@@ -111,3 +111,4 @@ _agent_*
 
 # 内核与镜像构建产物（约 40GB）
 work/
+.workbuddy
