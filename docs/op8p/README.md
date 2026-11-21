@@ -2029,3 +2029,132 @@ scripts/assert-op8p-panel.sh         39 条断言，守显示路径不被改坏
 没人读的死属性。
 
 下次上机按 `display-findings.md` 第五轮末尾那四条判据看。
+
+---
+
+## 23. 真机点亮，以及音频/电源/振动/闪光灯的搬运（2026-11-21）
+
+### 23.1 1440×3168@120 点亮了
+
+换成 darknagel 那份驱动后第一次上机就出图。判据全部来自真机，不是推断：
+
+| 判据 | 实测值 |
+|---|---|
+| 面板驱动 probe | `panel-samsung-ams678uw01 ae94000.dsi.0: using mode 1440x3168@120` |
+| 帧缓冲 | `/proc/fb` = `0 msmdrmfb`，`virtual_size` = `1440,3168`，32 bpp |
+| connector | `card0-DSI-1` status=`connected`，enabled |
+| 背光 | `ae94000.dsi.0` 2047/2047（满） |
+| 编码器 | vsync 15954 → 16049，**underrun 0** |
+| 画面 | 往 `/dev/fb0` 写 4 MB 随机数 → 屏幕出现噪点；填纯白 → 整屏均匀白，无条纹、无花屏、无偏色 |
+
+**`DSI PLL(0) lock failed, status=0x00000000` 是假警报**，早就在
+`driver-work-assessment.md` 里定过性：`dsi_7nm_pll_save_state()` 在 probe 时
+只读状态、PLL 本就未启用。不要再被这一行带去查 PHY。`0077`/`0078` 不需要。
+
+一个还没解释的细节：`encoder-0/status` 报 `mode: INTF_MODE_CMD`，而驱动给的是
+`MIPI_DSI_MODE_VIDEO_BURST`。功能上没问题，但要么这是 DPU 侧对 DSI video 的
+既有命名，要么模式真被切成了 cmd —— 下次可以用 `intf_cfg` 核对。
+
+### 23.2 触摸也通了
+
+`s6sy761` 在 i2c13 的 0x48，抓 `/dev/input/event2` 拿到 7 个 `EV_ABS`：
+`TRACKING_ID=0`、`POSITION_X=783`、`POSITION_Y=1378`、`TOUCH_MAJOR=11`、
+`PRESSURE=43`，中断计数 4 → 11。驱动、上电、中断、evdev 四层全通，不需要补丁。
+
+两个别被带偏的点：
+
+- `s6sy761: the axis have not been set` 是驱动自己的检查顺序 bug（在
+  `input_mt_init_slots()` 之前查 `ABS_X`），参考移植的 kernel `0069` 就是修这个，
+  与功能无关。
+- 触摸节点里没有 `reset-gpios` 不要紧：mainline s6sy761 不支持这个属性，它的
+  上电是 regulator + I2C 读 `BOOT_STATUS` 确认进入 application 模式。
+
+### 23.3 音频：DTS 与驱动都搬进来了，但还听不到
+
+参考移植 `0005` 的 448 行 DTS 已合入（`work/op8p-dts/merge-audio.sh`，
+git 忽略）：wcd938x（SoundWire）、tert MI2S pinctrl（`mi2s2_*`）、
+`tfa9874@34/@35`（i2c15，reset gpio91/99）、`&sound` 的五组前端 dai-link、
+rxmaco/txmacro/vamacro/swr1/swr2。
+
+**拓扑判断修正**：不是"WCD938x 模拟输出"，是 **tertiary MI2S**；顶部扬声器
+兼听筒（参考的 pmaports 补丁原话 "the top speaker is the earpiece"）。
+`qcom,wsa-max-devs = 0` 的旧说法作废。
+
+驱动：mainline 7.2.8 只有 `tfa989x.c`（TFA1：9890/9895/9897）和 `tfa9879.c`，
+都不认 **TFA9874**。用的是 `howtocuddle/xiaomi_raphael` 的 `tfa9872.c`
+（317 行，compatible 含 `nxp,tfa9874`，DSP bypass、不需要厂商 container 固件、
+没有硬件音量控制），与参考移植同源。落成 `drivers/tfa987x.c` +
+`patches/0030` + `scripts/regen-op8p-tfa987x-patch.sh`。
+
+config：ROCKNIX 的 `linux.aarch64.conf` 已经给了 QDSP6/SM8250 machine/
+WCD938X/SoundWire（全 `=m`），缺的是 LPASS RX/TX/VA macro 与 TFA987X，
+已补进 `kernel-sm8250/steamos.config`。
+
+**现在仍然不会响**，原因不是配置：设备停在 initramfs，ADSP 固件在 rootfs 的
+`/lib/firmware`，而 `SND_SOC_QDSP6` 那一串是 `=m`，没有 rootfs 就没有 modprobe。
+出声要等 userdata 装好。
+
+### 23.4 电源 / 振动 / 闪光灯：两个能工作，两个缺驱动
+
+| 项 | 状态 | 说明 |
+|---|---|---|
+| 电量计 bq27541（i2c16 0x55） | 可用 | DTS 节点本来就有，只差 `CONFIG_BATTERY_BQ27XXX(_I2C)`，现已打开 |
+| 闪光灯 PM8150L 两通道 | 可用 | `leds-qcom-flash` 在树里，厂商值 1500 mA / 1280 ms |
+| 充电器 PM8150B | 只有节点 | **`qcom_pm8150b_charger.c` 不在 mainline 7.2.8** |
+| 振动 AW8697 | 只有节点 | 树里只有 `aw86927`，另一代芯片 |
+
+两个缺口的共同点：参考移植的补丁**都是对驱动本体的修改**，驱动没随仓库提供
+（充电 8 个补丁 0068–0085/0165–0166，振动只有 DTS 0074）。节点已按厂商
+overlay 原样写好，驱动补进来即用。
+
+### 23.5 四个静默失败的坑
+
+1. **0029 的 Makefile hunk 只能在干净 7.2.8 上打。** 本项目自己的 0017
+   （ams667xx01）在同一个位置插过一行，真实构建树里锚点的上一行已是
+   `AMS667XX01`，patch 直接 FAILED。改成只用插入点之后的三行上下文。
+   "离线验证通过"是因为那次只单独打了 0029。
+2. **参考 DTS 的 `usb-dai-link` 引用 `&q6usbdai`，7.2.8 的 `sm8250.dtsi`
+   没有这个标签**，dtc 直接 abort。已删，USB-C 音频与 DP 一起做时再加。
+3. **`drivers/leds/flash/Kconfig` 整个包在 `if LEDS_CLASS_FLASH` 里。**
+   只写 `CONFIG_LEDS_QCOM_FLASH=y` 时这个符号在 Kconfig 里不存在，`.config`
+   里连 `# ... is not set` 都没有，build.sh 也不打 WARN。必须两个一起开。
+4. **GNU `stat -f` 不是格式化。** `stat -f %m` 打印一段文件系统信息并退出 0，
+   `||` 后备永不触发，`SOURCE_DATE_EPOCH` 变成多行散文，`mkbootimg` 用
+   `int()` 解析直接抛异常。三处改成 `-c` 优先。
+
+### 23.6 当前产物
+
+```
+work/kernel-sm8250/output/current/boot/Image                 35,883,520 B
+work/kernel-sm8250/output/current/dtbs/...instantnoodlep.dtb   135,980 B
+work/steamos-op8p/boot-op8p-gzip.img                         15,167,488 B
+```
+
+断言：`assert-op8p-panel.sh`（39 条）、`assert-op8p-audio.sh`（40 条）、
+`assert-op8p-power.sh`（22 条）、`assert-op8p-flash.sh`，全部通过。
+
+刷 `boot_a`（非活动槽）后可以直接验证三件不需要 rootfs 的事：屏幕回归、
+`/sys/class/power_supply/bms` 的电压容量、`/sys/class/leds/white:flash` 手电。
+
+### 23.7 上机时用到的两条操作
+
+**回到 Android 不必按键**：Linux 里 `poweroff -f` 与 sysrq `o` 都不生效
+（USB 一直挂着），正确做法是写 `misc`（`/dev/sda3`）：
+
+```
+dd if=/dev/zero of=/dev/sda3 bs=512 count=1 conv=notrunc
+printf "boot-fastboot" | dd of=/dev/sda3 bs=1 seek=0 conv=notrunc
+sync; reboot -f
+```
+
+**ABL 认 `boot-fastboot`，不认 `bootonce-bootloader`**（后者是 AOSP 老名字，
+试过一次，重启后照样进 Linux）。进 fastboot 后
+`fastboot --set-active=<原槽>` 即可回 Android。
+
+### 23.8 下一步
+
+1. 写 `--install`：把 rootfs 装进 userdata，之后音频/传感器/摄像头才有验证基础。
+2. 补 `qcom_pm8150b_charger.c`（约 2000 行 + 8 个修正）与 `aw8697.c`。
+3. 音频 UCM：参考移植的 pmaports 补丁是 Alpine 包定义，SteamOS 侧要重写成
+   wireplumber 配置。
+

@@ -40,11 +40,13 @@ OUT="${STEAMOS_WORK:-${PORT_ROOT}/work}/steamos-op8p"
 
 PACK=gzip
 QUIET=0
+INSTALL=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --gzip)  PACK=gzip ;;
     --v2)    PACK=v2 ;;
     --quiet) QUIET=1 ;;
+    --install) INSTALL=1 ;;
     --out)   OUT="$2"; shift ;;
     *) echo "make-op8p: 不认识的参数: $1" >&2; exit 2 ;;
   esac
@@ -52,6 +54,37 @@ while [[ $# -gt 0 ]]; do
 done
 
 die() { echo "make-op8p: $*" >&2; exit 1; }
+
+# --install builds the rootfs image instead of the boot image. It needs
+# e2fsprogs (mkfs.ext4) and, the first time, squashfs-tools (unsquashfs, to
+# unpack Valve's RAUC bundle) -- neither exists on a Windows box, so it runs
+# in the same container the kernel build uses. Both steps are idempotent:
+# the download skips what is already there, the copy skips with --skip-copy.
+if [[ $INSTALL == 1 ]]; then
+  WSLC="${WSLC:-/c/Program Files/WSL/wslc}"
+  WSLC_IMAGE="${WSLC_IMAGE:-proxy.vvvv.ee/library/fedora:43}"
+  if command -v mkfs.ext4 >/dev/null 2>&1 && command -v unsquashfs >/dev/null 2>&1; then
+    [[ -x "${PORT_ROOT}/work/rootfs/usr/bin/bash" ]] \
+      || bash "${PORT_ROOT}/scripts/fetch-steamos-rootfs.sh"
+    exec bash "${PORT_ROOT}/scripts/make-op8p-rootfs.sh"
+  fi
+  [[ -x "$WSLC" ]] || die "--install 需要 mkfs.ext4+unsquashfs（Linux）或 wslc（Windows）—— 两个都没有"
+  echo "make-op8p: 在容器里做 rootfs（首次会下几 GB 的 Valve 官方 rootfs，可以中断重跑）"
+  # -v 要 Windows 路径：PORT_ROOT 是 Git Bash 的 /d/... 形式，而
+  # MSYS_NO_PATHCONV=1 关掉了自动转换，直接传会挂成空目录（第一次就是这样，
+  # 容器里报 "No such file or directory"）。
+  WIN_ROOT="$(cygpath -w "$PORT_ROOT" 2>/dev/null || printf '%s' "$PORT_ROOT")"
+  MSYS_NO_PATHCONV=1 "$WSLC" run --rm --dns 223.5.5.5 \
+    -v "${WIN_ROOT}:/repo" "$WSLC_IMAGE" bash -c '
+      set -e
+      dnf install -y squashfs-tools rsync e2fsprogs util-linux python3 curl >/dev/null 2>&1
+      if [ ! -x /repo/work/rootfs/usr/bin/bash ]; then
+        bash /repo/scripts/fetch-steamos-rootfs.sh
+      fi
+      bash /repo/scripts/make-op8p-rootfs.sh
+    '
+  exit $?
+fi
 
 img="${KOUT}/boot/Image"
 dtb="${KOUT}/dtbs/${DTB_NAME}.dtb"

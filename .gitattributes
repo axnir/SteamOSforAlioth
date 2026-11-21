@@ -22,3 +22,10 @@ external-and-mods/kernel-sm8250/bindings/*.yaml text eol=lf
 # on this tree before these two rules existed.
 external-and-mods/kernel-sm8250/dts/*.dts     text eol=lf
 external-and-mods/kernel-sm8250/*.config      text eol=lf
+
+# Shell scripts run inside build containers, which mount this working tree.
+# A CRLF checkout therefore hands `set -euo pipefail\r` to a Linux bash and
+# every such script dies at line 1 with "invalid option name" -- that is
+# exactly what happened to scripts/fetch-steamos-rootfs.sh while building
+# the rootfs image on Windows.
+*.sh                                          text eol=lf

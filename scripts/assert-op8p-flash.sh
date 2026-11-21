@@ -110,8 +110,16 @@ printf '%s\n' "$body" | grep -q 'expect_size boot_a' \
 echo "== 禁止整机写操作 =="
 printf '%s\n' "$body" | grep -qE 'fastboot +(-w|--wipe|erase userdata|format userdata)' \
   && bad "出现了整机/用户数据写操作" || ok "没有 -w / erase userdata"
-printf '%s\n' "$body" | grep -qE 'fastboot +flash +userdata' \
-  && bad "出现了 flash userdata" || ok "没有 flash userdata"
+# flash userdata 只允许出现在 --install 分支里。它曾经是全局禁止的（那时
+# --install 还没实现）；现在它存在，但仍然必须被 ERASE + TTY 守着，而且
+# 不能被别的模式顺带执行到。
+awk '/== --install/,/^fi$/' "$FLASH" | grep -q 'fastboot flash userdata' \
+  && ok "flash userdata 在 --install 分支里" || bad "flash userdata 不在 install 分支"
+if awk '/== --install/{on=1} /^fi$/{on=0} !on' "$FLASH" | grep -q 'flash userdata'; then
+  bad "install 分支之外也有 flash userdata"
+else
+  ok "install 之外没有任何路径能写 userdata"
+fi
 
 echo "== 确认必须来自 TTY =="
 printf '%s\n' "$body" | grep -q '\[\[ ! -t 0 \]\]' \
@@ -143,6 +151,37 @@ grep -q 'CMDLINE_QUIET=' "$ROOT/external-and-mods/kernel-common/cmdline.sh" \
   && grep -q 'console=ttyGS0 console=tty0 loglevel=7' "$ROOT/external-and-mods/kernel-common/cmdline.sh" \
   && ok "CMDLINE_QUIET=0 分支会输出 console=ttyGS0/tty0 loglevel=7" \
   || bad "cmdline.sh 的静音/详细分支不符合预期"
+
+echo "== install：唯一会毁数据的模式"
+# 这三个是 --install 的全部安全属性。它们各自都曾经在别人的脚本里缺过，
+# 结果都是"一句话下去，Android 的数据没了"。
+grep -q -- '--install' "$ROOT/flash-op8p.sh" && ok "--install 模式存在" \
+  || bad "flash-op8p.sh 没有 --install"
+grep -q 'read -r -p "输入 ERASE 继续: "' "$ROOT/flash-op8p.sh" \
+  && ok "确认词是 ERASE（不是 YES）" || bad "确认词不是 ERASE"
+grep -q '\[\[ "\$ans" == ERASE \]\]' "$ROOT/flash-op8p.sh" \
+  && ok "ERASE 之后才继续" || bad "确认词没有真的拦住"
+grep -q '必须来自 TTY' "$ROOT/flash-op8p.sh" \
+  && ok "非 TTY 时拒绝（echo ERASE | 不能刷）" || bad "没有 TTY 检查"
+awk '/== --install/,/^fi$/' "$ROOT/flash-op8p.sh" | grep -q '不可逆' \
+  && ok "提示里写明了不可逆" || bad "install 提示没说不可逆"
+grep -q 'fastboot flash userdata' "$ROOT/flash-op8p.sh" \
+  && ok "写的是 userdata 分区" || bad "没有 flash userdata"
+# 它不该碰 super / abl：Android 能刷回去全靠这一点。
+awk '/== --install/,/^fi$/' "$ROOT/flash-op8p.sh" | grep -q 'flash super' \
+  && bad "install 会写 super —— Android 就回不去了" || ok "不碰 super"
+
+echo "== rootfs 镜像的生成"
+RFS="$ROOT/scripts/make-op8p-rootfs.sh"
+[[ -f "$RFS" ]] && ok "scripts/make-op8p-rootfs.sh 存在" || bad "缺 rootfs 生成脚本"
+grep -q 'mkfs.ext4' "$RFS" && ok "用 mkfs.ext4 造文件系统" || bad "没有 mkfs.ext4"
+# 这个容器没有 CAP_SYS_ADMIN，任何 loop mount 都会失败，所以必须是 -d。
+grep -q 'mkfs.ext4 .*-d ' "$RFS" && ok "用 -d 灌目录（不 loop 挂载）" \
+  || bad "不是 mkfs.ext4 -d，容器里跑不了"
+grep -q 'x-systemd.growfs' "$RFS" \
+  && ok "fstab 带 x-systemd.growfs（首启扩到全分区）" || bad "没有 growfs，装完只有几 GB"
+grep -q 'lib/modules' "$RFS" && ok "会装内核模块" || bad "没装模块（起来也是个壳）"
+grep -q 'firmware' "$RFS" && ok "会装固件" || bad "没装固件"
 
 echo
 if [[ $fail == 0 ]]; then

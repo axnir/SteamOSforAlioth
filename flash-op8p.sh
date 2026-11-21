@@ -52,7 +52,7 @@ die() { echo "flash-op8p: $*" >&2; exit 1; }
 say() { echo "flash-op8p: $*" >&2; }
 
 MODE="${1:-}"
-[[ -n "$MODE" ]] || die "用法: $0 --boot|--test [--img FILE]"
+[[ -n "$MODE" ]] || die "用法: $0 --boot|--test|--install [--img FILE]"
 shift
 
 IMG=""
@@ -66,17 +66,20 @@ done
 
 command -v fastboot >/dev/null || die "没有 fastboot"
 
-# Pick the image: an explicit --img, else the gzip packing (the one that
+# Pick the boot image: an explicit --img, else the gzip packing (the one that
 # matches what ROCKNIX and alioth have both proven), else v2.
-if [[ -z "$IMG" ]]; then
-  for c in boot-op8p-gzip.img boot-op8p-v2.img; do
-    [[ -f "${IMG_DIR}/${c}" ]] && IMG="${IMG_DIR}/${c}" && break
-  done
-fi
-[[ -n "$IMG" && -f "$IMG" ]] || die "没有镜像（先跑 ./make-op8p.sh）"
-IMG="$(cd "$(dirname "$IMG")" && pwd)/$(basename "$IMG")"
+# --install writes userdata.img instead and needs no boot image.
+if [[ "$MODE" != --install ]]; then
+  if [[ -z "$IMG" ]]; then
+    for c in boot-op8p-gzip.img boot-op8p-v2.img; do
+      [[ -f "${IMG_DIR}/${c}" ]] && IMG="${IMG_DIR}/${c}" && break
+    done
+  fi
+  [[ -n "$IMG" && -f "$IMG" ]] || die "没有镜像（先跑 ./make-op8p.sh）"
+  IMG="$(cd "$(dirname "$IMG")" && pwd)/$(basename "$IMG")"
 
-say "镜像 $IMG ($(stat -c %s "$IMG" 2>/dev/null || stat -f %z "$IMG") 字节)"
+  say "镜像 $IMG ($(stat -c %s "$IMG" 2>/dev/null || stat -f %z "$IMG") 字节)"
+fi
 
 # --- talk to the phone -----------------------------------------------------
 
@@ -156,7 +159,54 @@ if [[ "$MODE" == --boot ]]; then
   exit 0
 fi
 
-[[ "$MODE" == --test ]] || die "用法: $0 --boot|--test"
+[[ "$MODE" == --test ]] || [[ "$MODE" == --install ]] \
+  || die "用法: $0 --boot|--test|--install"
+
+# ---------------------------------------------------------------------------
+# --install: the root filesystem, into userdata.
+#
+# This is the only mode that destroys user data, so it has its own
+# confirmation word. ERASE, not YES: the difference between "write another
+# boot image" and "the phone's /data is gone" should be a word you have to
+# think about for a second.
+#
+# It is also the only mode that does not care about slots. userdata has no
+# A/B copy -- there is one /data and it is about to become /.
+# ---------------------------------------------------------------------------
+if [[ "$MODE" == --install ]]; then
+  UIMG="${IMG_DIR}/userdata.img"
+  [[ -s "$UIMG" ]] || die "没有 $UIMG —— 先跑 ./make-op8p.sh --install"
+  usz="$(stat -c %s "$UIMG" 2>/dev/null || stat -f %z "$UIMG")"
+
+  cat <<EOF
+
+即将执行（不可逆）：
+  fastboot flash userdata   $UIMG
+  （${usz} 字节）
+
+userdata 是 Android 的 /data：照片、聊天记录、应用数据，写下去就没了，
+没有任何恢复手段。super（Android 系统本体）、abl、两个槽的 boot/dtbo
+都不动 —— 所以 Android 还能刷回去，但里面的数据回不来。
+
+首启之后 SteamOS 会把这个文件系统长到整个分区（x-systemd.growfs），
+所以镜像本身只有几个 GB，装完是 100 多 GB。
+
+Linux 起不来时回到 Android：
+  fastboot --set-active=${active} && fastboot reboot
+
+EOF
+
+  [[ -t 0 ]] || die "确认必须来自 TTY（检测到非交互 stdin）—— 请直接运行本脚本"
+  read -r -p "输入 ERASE 继续: " ans
+  [[ "$ans" == ERASE ]] || die "已取消"
+
+  say "=> fastboot flash userdata"
+  fastboot flash userdata "$UIMG" || die "flash userdata 失败"
+  say "完成。"
+  say "启动 Linux：fastboot --set-active=${inactive} && fastboot reboot"
+  say "回到 Android：fastboot --set-active=${active} && fastboot reboot"
+  exit 0
+fi
 
 # Writing the slot the phone is running from would replace the only system
 # that currently boots. Refuse, and say what to do instead.
