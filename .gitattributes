@@ -6,3 +6,11 @@ external-and-mods/lsfg-vk/** linguist-vendored
 external-and-mods/kernel/vendor/** linguist-vendored
 external-and-mods/kernel/reference/** linguist-vendored
 external-and-mods/kernel/device-tree/** linguist-vendored
+
+# These three are consumed by Linux tools, not by Windows ones: the driver is
+# compiled, the patch is fed to patch(1), the binding is parsed by dt-schema.
+# core.autocrlf=true would hand them CRLF after a checkout, which patch(1)
+# matches against the wrong lines and dt-schema rejects.
+external-and-mods/kernel-sm8250/drivers/*.c   text eol=lf
+external-and-mods/kernel-sm8250/patches/*.patch text eol=lf
+external-and-mods/kernel-sm8250/bindings/*.yaml text eol=lf
