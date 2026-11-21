@@ -962,9 +962,8 @@
 
 	/*
 	 * AW8697 的 IRQ 脚（gpio118）。控制器本体在 i2c11 上，见文件末尾。
-	 * 驱动还不在这棵树里：mainline 7.2.8 只有 aw86927（不同一代，只认
-	 * awinic,aw86927），参考移植也没带驱动补丁。节点先按厂商 overlay
-	 * 写好，驱动进来就能直接用。
+	 * 驱动是 patches/0031（上游还没合入的 aw8697 series），它自己校准
+	 * LRA 谐振，只读 compatible/reg/IRQ/reset。
 	 */
 	haptics_irq_default: haptics-irq-default-state {
 		pins = "gpio118";
@@ -1614,11 +1613,11 @@
 
 /*
  * 振动：AWINIC AW8697 在 QUP i2c11 的 0x5a，reset gpio72，IRQ gpio118。
- * 170 Hz / drive level 54 是 OnePlus 驱动里 LRA0619 的调音值。
  *
- * **驱动不在 mainline 7.2.8**（只有 aw86927，另一代芯片，compatible 也不
- * 同），参考移植只给了 DTS 没有驱动。所以这个节点现在不会 probe，等驱动
- * 补进来；参数按厂商 overlay 原样保留，届时不需要再改。
+ * 驱动来自 patches/0031（上游 2026-09 的 aw8697 series，还没合入
+ * mainline），它在 probe 时自己校准 LRA 谐振、自己扫频，**不读下面的
+ * awinic,* 参数**。那些值是厂商 overlay 里的原样，留着的唯一理由是
+ * 万一以后换成读参数的驱动，不用再翻一遍设备树。
  */
 &i2c11 {
 	status = "okay";

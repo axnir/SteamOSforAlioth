@@ -76,10 +76,28 @@ awk '
 grep -qx 'CONFIG_LEDS_QCOM_FLASH=y' "$CONF" && ok "LEDS_QCOM_FLASH 是 =y" \
   || bad "LEDS_QCOM_FLASH 没开（节点不会 probe）"
 
+echo "== 振动驱动（patches/0031）"
+# 驱动本身。上游有 aw86927（另一代、寄存器不同），没有 aw8697；这份是
+# 2026-09 还没合入的 series，所以在 patches/ 里。
+AH="$MOD/drivers/aw8697.c"
+AHP="$MOD/patches/0031-Input-aw8697-add-the-Awinic-AW8697-haptics-driver.patch"
+[[ -f "$AH" ]] && ok "drivers/aw8697.c 存在" || bad "振动驱动源码不见了"
+grep -q '"awinic,aw8697"' "$AH" && ok "compatible 是 awinic,aw8697（与 DTS 一致）" \
+  || bad "驱动 compatible 变了（节点不会再 probe）"
+grep -q 'input_ff_create_memless' "$AH" && ok "注册 force feedback" \
+  || bad "没注册 ff-memless（不会震）"
+for f in Kconfig Makefile aw8697.c; do
+  grep -q "^+++ b/drivers/input/misc/$f\$" "$AHP" \
+    && ok "0031 里有 $f" || bad "0031 缺 $f"
+done
+grep -qx 'CONFIG_INPUT_AW8697=y' "$CONF" && ok "INPUT_AW8697 是 =y" \
+  || bad "INPUT_AW8697 没开（节点不会 probe）"
+
 echo "== 驱动缺口的记录"
-# 这两条不是断言，是提醒：tree 里没有这两个驱动，节点现在不会 probe。
-# 写进断言是为了让"为什么没有振动/为什么没有充电"在跑断言时能看见。
-grep -q '驱动不在 mainline 7.2.8' "$CONF" \
-  && ok "config 里写明了充电/振动的驱动缺口" || bad "缺少驱动缺口的说明"
+# 充电器仍然是缺口，这条提醒必须留着；振动已经不是了。
+grep -q '充电器的驱动不在 mainline 7.2.8' "$CONF" \
+  && ok "config 里写明了充电器的驱动缺口" || bad "缺少充电器缺口的说明"
+grep -q 'aw8697 series\|patches/0031' "$CONF" \
+  && ok "config 里记录了振动驱动的来源" || bad "没写振动驱动来自哪"
 
 [[ $fail == 0 ]] && echo && echo "全部通过" || { echo; echo "有规则被破坏"; exit 1; }
