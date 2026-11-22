@@ -306,13 +306,18 @@ def push(port, local, remote, mode, baud, chunk=400):
     # "nonexistent directory"。目标目录一定是可写的（否则它自己也写不进去）。
     tmpdir = os.path.dirname(remote) or "/"
     tmp = "%s/.op8p-push-%s" % (tmpdir, uuid.uuid4().hex[:6])
-    bb = "/dbg/bin/busybox"
     blocks = [b64[i:i + chunk] for i in range(0, len(b64), chunk)]
 
     print("推送 %s → %s（%d 字节, %d 块）" % (local, remote, len(data), len(blocks)),
           file=sys.stderr)
     try:
         with Link(port, baud) as link:
+            # busybox 只在 initramfs 里（/dbg/bin）；完整系统 shell 有的是
+            # base64/printf/chmod/wc 的原生版本，没有 busybox。写死任何一边都会
+            # 在另一边失败（101 上就是这么报 "-bash: /dbg/bin/busybox: No such"），
+            # 所以先问一句。
+            rc, probe = link.cmd("test -x /dbg/bin/busybox && echo HAVE_BB || echo NO_BB", 8)
+            bb = "/dbg/bin/busybox " if "HAVE_BB" in probe else ""
             rc, out = link.cmd(": > %s" % tmp, 3)
             if rc != 0:
                 print("清空临时文件失败: %s" % out, file=sys.stderr)
@@ -320,19 +325,19 @@ def push(port, local, remote, mode, baud, chunk=400):
             for n, part in enumerate(blocks, 1):
                 # base64 的字符集里没有单引号，可以直接用单引号包。printf 的 %s
                 # 写成 %%s：这一串要经过 python 的 % 格式化。
-                rc, out = link.cmd("%s printf %%s '%s' >> %s" % (bb, part, tmp), 6)
+                rc, out = link.cmd("%sprintf %%s '%s' >> %s" % (bb, part, tmp), 6)
                 if rc != 0:
                     print("第 %d/%d 块失败: %s" % (n, len(blocks), out), file=sys.stderr)
                     return 1
             rc, out = link.cmd(
                 # wc 读 stdin 只吐数字：带文件名的话解析要多一步，而这一步已经
                 # 错过一次（split()[-1] 拿到的是路径，报"大小不符"，文件其实是好的）。
-                "%s base64 -d %s > %s && %s chmod %s %s && %s wc -c < %s"
+                "%sbase64 -d %s > %s && %schmod %s %s && %swc -c < %s"
                 % (bb, tmp, remote, bb, mode, remote, bb, remote), 15)
             if rc != 0:
                 print("装配失败（base64 -d / chmod / wc）: %s" % out, file=sys.stderr)
                 return 1
-            link.cmd("%s rm -f %s" % (bb, tmp), 3)
+            link.cmd("%srm -f %s" % (bb, tmp), 3)
     except OSError as e:
         print("打不开 %s: %s" % (port, e), file=sys.stderr)
         return 2
