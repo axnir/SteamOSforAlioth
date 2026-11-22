@@ -3008,6 +3008,67 @@ SteamOS 默认时区是 `America/Los_Angeles`，用户看到的时间差 16 小�
 
 
 
+### 32.8 又一来源被排除：GitHub 上的整机固件仓库（2026-11-22 19:00）
+
+`pangwalla/oneplus-instantnoodlep-firmware`（2023-03 更新，含
+`adsp/ cdsp/ modem/ gpu/ ipa/ slpi/ venus/ wlan/`）里的 `adsp/` 是**分段**
+（`adsp.b00..b18` + `adsp.mdt`），与 `modem` 分区同构，但是**另一代**：
+b02/b04/b06/b07 的大小都不同。
+
+拼接后 15,921,292 字节，与 `modem` 版**完全同构**：
+
+| 检查项 | GitHub 2023 版 | AYN Thor 版 |
+|---|---|---|
+| phnum | 20 | 20 |
+| ph[1]（metadata，`PT_NULL`）头 | `0c000000 06000000 …` | 同 |
+| 段间空隙 | 全 0 | 全 0 |
+| 末段 | off = 文件尾、size = 0 | 同 |
+| max(off+size) − 文件长度 | 3,956 | 3,972（同一种布局） |
+
+真机：`error -22 setting up firmware`（TZ 在 `pas_init_image` 就拒），与
+`modem_a`/`modem_b` 完全相同。
+
+四个来源的完整证据：
+
+| 来源 | 时间 | 大小 | TZ 结果 |
+|---|---|---|---|
+| `modem_a` 现拼 | 2021-12 | 17,166,524 | 拒（`setting up`） |
+| `modem_b` 现拼 | 2021-12 | 17,166,524 | 拒（`setting up`） |
+| GitHub pangwalla | 2023-03 | 15,921,292 | 拒（`setting up`） |
+| **AYN Thor**（完整 mbn） | — | 15,523,964 | **过**，卡 `auth_and_reset`（`initializing`） |
+
+**结论**：不是版本新旧（2023 的也被拒），不是 ELF 结构（两份同构），只与
+"是不是由 OnePlus 的分段拼出来的"相关。最可能的解释是 OnePlus 用**加密
+PIL**（TZ 用设备密钥解密），而拼接产物没有那个标记；AYN 发布的是未加密的
+完整 mbn，所以它能过验签、却因为配置不匹配倒在下一步。
+
+于是 **§32.5 的候选全部关闭**：OOS 全量包、LineageOS 的 vendor、GitHub 的
+整机固件，三者给的都是同一类分段。再找更多 OnePlus 固件没有意义。
+
+剩下的只有两条路：接受音频阻塞，或者反过来攻 AYN 那份的 `auth_and_reset -22`
+（它是唯一过了 TZ 的，值得单独查 DDR/内存布局与 metadata）。
+
+### 32.9 大文件怎么传：WiFi，不是串口（同轮顺带确认）
+
+这段经验对以后所有"往设备里放文件"都适用：
+
+- 设备连上 WiFi 后有 `192.168.5.21/24`，与主机 `192.168.5.7` 同一网段；
+- 主机 `python3 -m http.server 8000 --bind 192.168.5.7`，设备
+  `curl -o <目标> http://192.168.5.7:8000/<文件>` —— 15.9 MB **几秒**，md5 一致；
+- 串口传大文件是死路，原因不是带宽而是**行规程**：getty 登录后的 tty 是
+  canonical 模式，base64 数据不含换行，超过 4 KB 的行缓冲直接被丢弃。表现是
+  "传了 21 秒、文件是 0 字节、没有任何报错"。`stty raw` 能绕过行缓冲，但
+  管道与标记的时序仍然脆（一次实测把 shell 卡死，只能从另一个口
+  `systemctl restart serial-getty@ttyGS1` 救回来）；
+- **串口只做命令**，几 KB 的文件用 `--push`（base64 分块）足够。
+
+顺带修正两个此前记错的口身份（两个都是**完整系统 shell**，不是只有 initramfs）：
+
+| 节点 | 实际 | 说明 |
+|---|---|---|
+| `/dev/cu.usbmodem101` | ttyGS0 + getty → bash（`[root@frame ~]#`） | 内核 console 的 dmesg 也混在这里，命令输出要挑着看 |
+| `/dev/cu.usbmodem103` | ttyGS1 | 开机时是 initramfs 救援 shell（`/dbg/bin/busybox chroot /proc/1/root`）；`serial-getty@ttyGS1` 重启之后也是完整系统 shell |
+
 ## 33. 震动的 reset 极性：ACTIVE_HIGH 把芯片按在复位里（2026-11-22）
 
 驱动在树里（0031）、DTS 节点齐全、`CONFIG_INPUT_AW8697=y`，probe 却失败，
