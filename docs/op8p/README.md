@@ -3090,9 +3090,46 @@ i2c11 上 `i2cdetect` 连 0x5a 都没有 —— 整条总线 NACK，看起来像
 
 - Nura 的 0074 用的是 `ACTIVE_HIGH`，而且它自己标注"未设备验证"。这是
   "参考移植里没验过的部分不能当前提"的又一例，和 §30.7 的 bq27541 同型。
-- 手感仍未确认：FF 上传 `RC=0`（`EVIOCSFF` 0x40304580，`struct ff_effect`
-  48 字节）但用户没感觉到震动 —— `play_effect` 路径待查，挂在音频/触感阶段
-  （§30.10 末尾）。**驱动 probe 成功 ≠ 震得动**，这两件事这次分开记。
+- 手感：**2026-11-22 19:28 已通**。但根因不在驱动，而在我们自己的测试工具 ——
+  `struct ff_effect` / `input_event` 的字段偏移写错（§33.1）。驱动从头到尾都是
+  好的：波形上传进 RAM、`play_mode=RAM`、`GO` 置位、`GLBSTATE` 进播放态，
+  只是拿到 `level=0`（偏移错、读到 padding）就直接 return 了。
+
+### 33.1 为什么 `EVIOCSFF` 返回 0、dmesg 干净、马达却不动
+
+症状：触发后 `RC=0`、驱动无任何日志、`dmesg` 干净、用户毫无感觉。
+复位、供电、波形上传、`probe` 全都正常 —— 所以"哪里都对，就是不震"。
+
+踩坑过程（两次判断都是错的，记下来免得再犯）：
+
+1. 先用 `grep -n "ram_init" | head -12` 看驱动，结论是"`aw8697_ram_init()`
+   从没被调用、RAM 里没有波形"。**错**：`head` 把后面的调用行截掉了，`probe`
+   里一直都有 `ram_init` + `f0_calibrate`（第 647/651 行），补丁里也有。
+2. 然后发现 `ffplay.c` 的 `input_event.type` 写在偏移 8（实际 16），改成 16 ——
+   时间对了、`RC=0`，以为好了。**又错**：同一版里把 `ff_effect` 的
+   `strong_magnitude` 挪到了 24（照着"应该是 24"推的），而它在这套内核头上
+   在 **16**。写进 24 就落进 padding，驱动读到 `level=0`，与初值相同 →
+   `play_effect` 第一行就 `return 0`（不播放、不报错）。
+
+真正定位它靠的是**不猜，量两个东西**：
+
+- `regmap` 的 debugfs（不影响驱动、不用 unbind）：播放瞬间读
+  `04`(SYSCTRL) `05`(GO) `46`(GLBSTATE) `39`(DATDBG)。修好后是
+  `SYSCTRL=0x42`（play_mode=RAM、已退出 standby）、`GO=0x01`、
+  `GLBSTATE=0x07`（播放中）、`DATDBG=0x80`（满量程）。修之前 `DATDBG=0x01` ——
+  那一格就是"level 只有 1"的直接证据，比任何日志都硬。
+- `offsetof`：容器里 `gcc + <linux/input.h>` 直接打印，aarch64 实测——
+  `sizeof(ff_effect)=48`，但 `replay.length@10`、`delay@12`、`strong@16`、
+  `weak@18`（`trigger` 只占 4 字节，`envelope` 在 union 里）；
+  `sizeof(input_event)=24`，`type@16 code@18 value@20`。
+
+工具已固化进仓库：**`scripts/op8p-ff-trigger.c`**（免 libc，`gcc -O2 -nostdlib
+-static` 直接用容器的原生 aarch64 gcc 编）。满量程 `0xFFFF` 只用于测试，
+日常强度由应用通过 FF 决定。
+
+这条和 §30.7（bq27541 寄存器表）、§33（reset 极性）是同一类：
+**"返回 0"、'寄存器都写成功了'、'状态机对了'，都不等于"东西真的动了"**。
+
 
 ## 34. 换机后的地基：三处静默故障与 docker 构建入口（2026-11-22）
 
