@@ -1,0 +1,57 @@
+From 15fd29c49d8cd1337d66a717f4342d7529dcd175 Mon Sep 17 00:00:00 2001
+From: Timo <1788603+darknagel@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 22:50:09 +0100
+Subject: [PATCH 81/81] Input: s6sy761 - set the controller up again on resume
+
+The resume handler enabled the interrupt before powering the controller
+up. The interrupt thread then read the boot event that
+s6sy761_power_on() checks for, so every resume failed:
+
+  s6sy761 13-0048: failed to read events
+  s6sy761 13-0048: PM: dpm_run_callback(): s6sy761_resume returns -19
+
+The touch function was not enabled again, and sensing was never turned
+back on although the controller had lost its state with the power.
+
+Power the controller up first, turn sensing on if the input device is
+in use, and enable the interrupt last.
+
+Signed-off-by: Timo <1788603+darknagel@users.noreply.github.com>
+---
+ drivers/input/touchscreen/s6sy761.c | 17 ++++++++++++++++-
+ 1 file changed, 16 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/input/touchscreen/s6sy761.c b/drivers/input/touchscreen/s6sy761.c
+index 3d8fcfa7f..3a6586db7 100644
+--- a/drivers/input/touchscreen/s6sy761.c
++++ b/drivers/input/touchscreen/s6sy761.c
+@@ -500,10 +500,25 @@ static int s6sy761_suspend(struct device *dev)
+ static int s6sy761_resume(struct device *dev)
+ {
+ 	struct s6sy761_data *sdata = dev_get_drvdata(dev);
++	struct input_dev *input = sdata->input;
++	int ret;
++
++	/*
++	 * Keep the interrupt off until the controller is set up: the handler
++	 * would read the boot event that s6sy761_power_on() waits for.
++	 */
++	ret = s6sy761_power_on(sdata);
++	if (!ret) {
++		/* The controller lost its state, turn sensing back on */
++		mutex_lock(&input->mutex);
++		if (input_device_enabled(input))
++			ret = s6sy761_input_open(input);
++		mutex_unlock(&input->mutex);
++	}
+ 
+ 	enable_irq(sdata->client->irq);
+ 
+-	return s6sy761_power_on(sdata);
++	return ret;
+ }
+ 
+ static const struct dev_pm_ops s6sy761_pm_ops = {
+-- 
+2.43.0
+

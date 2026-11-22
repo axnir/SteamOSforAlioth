@@ -1,0 +1,33 @@
+From e47ddb4bc0b954f35be7fb1a6b9a12a0a38df9a2 Mon Sep 17 00:00:00 2001
+From: Roman Kuraev <naoru.desu@gmail.com>
+Date: Tue, 10 Nov 2026 10:00:31 +0000
+Subject: [PATCH] Input: s6sy761 - validate the initialized multitouch axes
+
+The driver initializes ABS_MT_POSITION_X/Y before parsing touchscreen
+properties. ABS_X/Y are populated later by input_mt_init_slots, so
+checking them before that call emits a warning even when both dimensions
+are valid. Check the multitouch axes that were actually initialized.
+
+Signed-off-by: Roman Kuraev <naoru.desu@gmail.com>
+---
+ drivers/input/touchscreen/s6sy761.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/input/touchscreen/s6sy761.c b/drivers/input/touchscreen/s6sy761.c
+index 0f24a9b73..3d8fcfa7f 100644
+--- a/drivers/input/touchscreen/s6sy761.c
++++ b/drivers/input/touchscreen/s6sy761.c
+@@ -439,8 +439,8 @@ static int s6sy761_probe(struct i2c_client *client)
+ 
+ 	touchscreen_parse_properties(sdata->input, true, &sdata->prop);
+ 
+-	if (!input_abs_get_max(sdata->input, ABS_X) ||
+-	    !input_abs_get_max(sdata->input, ABS_Y)) {
++	if (!input_abs_get_max(sdata->input, ABS_MT_POSITION_X) ||
++	    !input_abs_get_max(sdata->input, ABS_MT_POSITION_Y)) {
+ 		dev_warn(&client->dev, "the axis have not been set\n");
+ 	}
+ 
+-- 
+2.51.2
+

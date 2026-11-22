@@ -297,20 +297,23 @@ static int ams678uw01_prepare(struct drm_panel *panel)
 	ret = ams678uw01_on(ctx);
 	if (ret < 0) {
 		dev_err(dev, "Failed to initialize panel: %d\n", ret);
-		gpiod_set_value_cansleep(ctx->reset_gpio, 1);
-		regulator_bulk_disable(ARRAY_SIZE(ams678uw01_supplies), ctx->supplies);
-		return ret;
+		goto err_power_off;
 	}
 
 	drm_dsc_pps_payload_pack(&pps, &ctx->dsc);
 
 	ret = mipi_dsi_picture_parameter_set(ctx->dsi, &pps);
 	if (ret < 0) {
-		dev_err(panel->dev, "failed to transmit PPS: %d\n", ret);
-		return ret;
+		dev_err(dev, "failed to transmit PPS: %d\n", ret);
+		goto err_power_off;
 	}
 
 	return 0;
+
+err_power_off:
+	gpiod_set_value_cansleep(ctx->reset_gpio, 1);
+	regulator_bulk_disable(ARRAY_SIZE(ams678uw01_supplies), ctx->supplies);
+	return ret;
 }
 
 static int ams678uw01_unprepare(struct drm_panel *panel)
@@ -346,33 +349,38 @@ static const struct drm_panel_funcs ams678uw01_panel_funcs = {
 static int ams678uw01_bl_update_status(struct backlight_device *bl)
 {
 	struct mipi_dsi_device *dsi = bl_get_data(bl);
+	struct ams678uw01 *ctx = mipi_dsi_get_drvdata(dsi);
+	unsigned long mode_flags = dsi->mode_flags;
 	u16 brightness = backlight_get_brightness(bl);
 	int ret;
 
+	/* The backlight core applies the cached value when enabling the panel. */
+	if (!ctx->panel.prepared)
+		return 0;
+
 	dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
-
 	ret = mipi_dsi_dcs_set_display_brightness_large(dsi, brightness);
-	if (ret < 0)
-		return ret;
+	dsi->mode_flags = mode_flags;
 
-	dsi->mode_flags |= MIPI_DSI_MODE_LPM;
-
-	return 0;
+	return ret;
 }
 
 static int ams678uw01_bl_get_brightness(struct backlight_device *bl)
 {
 	struct mipi_dsi_device *dsi = bl_get_data(bl);
+	struct ams678uw01 *ctx = mipi_dsi_get_drvdata(dsi);
+	unsigned long mode_flags = dsi->mode_flags;
 	u16 brightness;
 	int ret;
 
-	dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
+	if (!ctx->panel.prepared)
+		return bl->props.brightness;
 
+	dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
 	ret = mipi_dsi_dcs_get_display_brightness_large(dsi, &brightness);
+	dsi->mode_flags = mode_flags;
 	if (ret < 0)
 		return ret;
-
-	dsi->mode_flags |= MIPI_DSI_MODE_LPM;
 
 	return brightness;
 }
