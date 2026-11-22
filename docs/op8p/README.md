@@ -3086,11 +3086,72 @@ memory 里已记两次）、`scripts/assert-*.py` 与 `mkbootimg-v2.py`。
    `work/kernel-sm8250/output-1126-accepted/`（git-ignored），新产物在
    `output/7.2.8-sm8250-steamos/`，两者不要混着说。
 
-### 34.4 这轮**没做**的两件事
+### 34.4 三件补上了（同日下午）
 
-- `make-op8p.sh --install` / `--verify` 仍然只认"Linux 工具在 PATH"或 `wslc`。
-  macOS 上会走到 `[[ -x .../wslc ]]` 然后 die。要么 `brew install e2fsprogs`
-  并把 keg 路径放进 PATH，要么照 `op8p-build-docker.sh` 的样子改成 docker。
-- `flash-op8p.sh` / `make-op8p.sh` **都不调用 `assert-op8p-*`**。alioth 那边
-  是"断言不绿就拒绝刷机"，OP8P 这边只是仓库里放着。这是与 AGENTS.md
-  "规则被检查而不是被记住"最明显的一处差距。
+上午这轮结束时还留着三处缺口，当天补完。三件的共同点：都是"不绿也不会
+报错"的地方 —— 断言不跑、`--install` 直接 die、串口工具不存在，三者都只
+表现为"这一步没法做"，而不是"做错了"。
+
+**① 刷机门禁：`scripts/assert-op8p-boot-image.sh`（新）**
+
+其余 `assert-op8p-*.sh` 查的都是**源码**（DTS、config、flash 脚本）。可刷机时
+真正写进分区的是一个几十分钟前打出来的 `.img`，源码后来改没改、改完有没有
+重新打包，它们全看不见。这个脚本查那一个镜像：
+
+| 组 | 查什么 | 对应的真机症状 |
+|---|---|---|
+| 头部 | magic、`header_version`、`page_size=4096`、四个载入地址、`second_size=0`、装得进 `boot_a` | Load Error / 弹回 fastboot，ABL 不会说原因 |
+| cmdline | `root=PARTLABEL=userdata`、`rootwait`、`console=ttyGS0`+`tty0`、`loglevel=7`、`steamos.usbshell=1`、无 `quiet`/`loglevel=0` | 面板黑时唯一的观测手段被关掉 |
+| **ramdisk** | 存在、gzip、cpio 里有 `updates/qcom/a650_zap.mdt` 等四件 + `init` | **缺了就是全黑**：GPU 拿不到 zap → Vulkan 失败 → gamescope 不 modeset（§28） |
+| 设备树 | gzip 流之后恰好 1 个 DTB、没有多余字节、含 `awinic,aw8697`/`ti,bq27411`/`samsung,s6sy761`、**与当前产物逐字节相同** | 分辨率/触摸/电量计悄悄退回上一版 |
+
+`flash-op8p.sh` 在碰设备（第一次 `fastboot getvar`）**之前**跑它，加上
+`assert-op8p-flash.sh` 自己的规则；`make-op8p.sh` 打完立刻跑同一个脚本。
+`OP8P_SKIP_ASSERT=1` 是唯一的绕过方式，且必须显式设置。
+
+负向测试（不做这一步就等于不知道断言是不是恒绿）：
+
+| 动手脚 | 结果 |
+|---|---|
+| `page_size` 4096 → 2048 | 7 条 FAIL |
+| `ramdisk_size` 置 0 | 1 条 FAIL（就是黑屏那条） |
+| 截掉尾部 DTB 60 KB | 1 条 FAIL |
+| cmdline 注入 `quiet` | 7 条 FAIL |
+
+`assert-op8p-flash.sh` 里另加了 5 条"门禁自己也要被断言"：flash 必须调用这两个
+脚本、必须把 `$IMG` 传进去（否则 `--img` 指向任何文件都绕过检查）、跳过只能
+靠显式环境变量、`make-op8p.sh` 打包后也要验。
+
+**② `--install` / `--verify` 走容器：`scripts/op8p-rootfs-docker.sh`（新）**
+
+原来只认"Linux 工具在 PATH"或 Windows 的 `wslc`，macOS 上直接 die。现在复
+用内核构建的同一个镜像 `op8p-build:43`（Dockerfile 里加了 e2fsprogs /
+squashfs-tools / btrfs-progs / util-linux）：`mkfs.ext4 -d`、`unsquashfs`、
+`e2fsck`、`btrfs restore` 一个镜像全有 —— 两个镜像意味着"编译用的 gcc"和
+"打包用的 mkfs"会在不同时间漂移。
+
+- `--verify` 已实测（12.9 GB 的 `userdata.img`）：7 组全 ok，
+  "userdata.img 可以刷"；
+- `--install` **未实测**：要解包 10 GB 的 Valve rootfs 再生成 12.9 GB 镜像。
+  代码路径与 `--verify` 同一条（同一个镜像、同一套挂载），但没跑过就是没跑过；
+- 与 Windows 那条路的唯一差异：不用 `/scratch` 中转。那边是 DrvFs 不保留
+  Unix 权限位，这边 virtiofs 保留。
+
+**③ 串口：`scripts/op8p-sh.py`（新，真机未验证）**
+
+Windows 上是 COM3/COM4；macOS 上同一根线枚举成 `/dev/cu.usbmodem*`，
+**设备节点名不带端口号**，所以没法靠命名区分内核 console 和 root shell ——
+`--list` 列出来，再拿 `uname -a` 试哪个输出干净。只用 python3 标准库
+（termios + select），不引入 pyserial。
+
+用 pty 假设备做了端到端测试，抓到一个**会让调试全错**的 bug：设备会把命令
+回显一遍，而回显行里就含完成标记，只做子串匹配时"设备根本没回"会被读成
+"成功、输出为空"（超时用例返回 0 和一行空）。改成"标记必须独占一行"才对。
+真机尚未验证 —— 手机没连，所以这条只能说"逻辑在 pty 上是对的"。
+
+### 34.5 顺带确认的两件事
+
+- `make-op8p.sh --gzip` 打出来的新镜像 15,937,536 字节（旧 15,941,632），
+  差 4096 = `Image` 大小变化引起的页对齐差异；DTB 与产物**逐字节相同**
+  （dtb 编译可复现，只有 `Image` 含时间戳）。
+- 旧的 11:26 验收镜像已备份：`work/steamos-op8p/boot-op8p-gzip.img.1126-accepted`。

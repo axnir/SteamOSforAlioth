@@ -64,11 +64,19 @@ ttyGS1 root shell（免驱动），工具 `scripts/op8p-sh.ps1`；PowerShell 7 �
 ./scripts/op8p-build-docker.sh --shell      # 进同一套挂载的 shell 排查
 ./scripts/op8p-build-docker.sh --bare       # 不用工具链镜像，验证脚本自足
 
-# 断言（刷机前）
+# 断言（刷机前；flash-op8p.sh 自己也会跑前两类）
 for t in scripts/assert-op8p-*.sh; do "$t" || echo "FAILED: $t"; done
 
-# 打包 boot 镜像
+# 打包 boot 镜像（打完自动跑 assert-op8p-boot-image.sh）
 ./make-op8p.sh --gzip
+
+# rootfs（都在容器里做，宿主不需要 e2fsprogs）
+./make-op8p.sh --verify     # 只读校验现有 userdata.img（已实测）
+./make-op8p.sh --install    # 生成 userdata.img（解包 10 GB + 12.9 GB 输出）
+
+# 串口（macOS：两个 ACM 口名字一样，先 --list 再试哪个是 root shell）
+./scripts/op8p-sh.py --list
+./scripts/op8p-sh.py 'uname -a'
 
 # 刷 b 槽
 fastboot flash boot_b work/steamos-op8p/boot-op8p-gzip.img
@@ -83,9 +91,15 @@ fastboot reboot
 
 | 功能 | 现状 |
 |---|---|
-| `make-op8p.sh --install`（装 rootfs 进 userdata） | 只认"Linux 工具在 PATH"或 `wslc`，macOS 上会 die。需要 `brew install e2fsprogs` 等或改成 docker |
-| `make-op8p.sh --verify` | 同上（缺 `dumpe2fs`） |
-| 串口（COM3/COM4 的等价物） | macOS 上是 `/dev/tty.usbmodem*` / `/dev/cu.*`，**未验证**；`op8p-sh.ps1` 用不了，需要新的串口工具 |
+| `make-op8p.sh --install` / `--verify` | **已搬**：`scripts/op8p-rootfs-docker.sh` 在容器里做（`--verify` 已实测，`--install` 未实测） |
+| 串口 | **已搬但真机未验证**：`scripts/op8p-sh.py`（pty 上端到端测过；真机要 `--list` 后确认哪个口是 shell） |
+
+### 已经在 macOS 上验证过的
+
+- `./scripts/op8p-build-docker.sh`：全量 7 分 19 秒 / 增量 29 秒
+- `./make-op8p.sh --gzip`：打包 + 自动跑 `assert-op8p-boot-image.sh`
+- `./make-op8p.sh --verify`：7 组检查全 ok（12.9 GB 镜像）
+- `./flash-op8p.sh --test` 的门禁：断言通过后才碰设备（用假 fastboot 验证过顺序）
 
 ## 5. 设备当前状态（2026-11-22）
 
