@@ -171,6 +171,25 @@ grep -q 'fastboot flash userdata' "$ROOT/flash-op8p.sh" \
 awk '/== --install/,/^fi$/' "$ROOT/flash-op8p.sh" | grep -q 'flash super' \
   && bad "install 会写 super —— Android 就回不去了" || ok "不碰 super"
 
+echo "== 刷机前的断言门禁（门禁自己也要被断言） =="
+# 门禁如果被某次"简化"删掉，其余所有断言就退化成仓库里躺着的文档 —— 那正是
+# OP8P 在 2026-11-22 之前的真实状态：五套断言全绿，却没有任何东西在刷机
+# 之前执行它们。所以门禁本身也得钉住。
+grep -q 'assert-op8p-flash.sh' "$FLASH" \
+  && ok "flash 会跑自身规则断言" || bad "flash 不跑 assert-op8p-flash.sh"
+grep -q 'assert-op8p-boot-image.sh' "$FLASH" \
+  && ok "flash 会跑镜像断言" \
+  || bad "flash 不跑 assert-op8p-boot-image.sh —— 改了 DTS 刷旧镜像没人拦"
+# 必须把真正要刷的那个镜像传进去：不带 $IMG 的话，--img 指向任何文件都会
+# 绕过检查，而 --img 恰好是最常用的调试入口。
+grep -q 'OP8P_BOOT_IMAGE="\$IMG"' "$FLASH" \
+  && ok "镜像断言检查的是 \$IMG（不是默认路径）" || bad "镜像断言没拿到 \$IMG"
+# 跳过必须靠显式环境变量。有默认跳过路径的断言等于没有。
+grep -q 'OP8P_SKIP_ASSERT:-0' "$FLASH" \
+  && ok "跳过需要显式 OP8P_SKIP_ASSERT=1" || bad "存在默认跳过断言的路径"
+grep -q 'assert-op8p-boot-image.sh' "$MAKE" \
+  && ok "make-op8p.sh 打包后也验镜像" || bad "打包后不验镜像（坏镜像要到刷机才发现）"
+
 echo "== rootfs 镜像的生成"
 RFS="$ROOT/scripts/make-op8p-rootfs.sh"
 [[ -f "$RFS" ]] && ok "scripts/make-op8p-rootfs.sh 存在" || bad "缺 rootfs 生成脚本"

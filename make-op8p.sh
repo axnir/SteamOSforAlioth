@@ -90,7 +90,13 @@ if [[ $INSTALL == 1 ]]; then
       || bash "${PORT_ROOT}/scripts/fetch-steamos-rootfs.sh"
     exec bash "${PORT_ROOT}/scripts/make-op8p-rootfs.sh"
   fi
-  [[ -x "$WSLC" ]] || die "--install 需要 mkfs.ext4+unsquashfs（Linux）或 wslc（Windows）—— 两个都没有"
+  # macOS / 任何有 docker 的宿主：复用内核构建的那个容器（里面有 mkfs.ext4、
+  # unsquashfs、btrfs restore）。macOS 的 virtiofs 保留权限位，所以不需要像
+  # Windows 那样用 /scratch 中转。
+  if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+    exec bash "${PORT_ROOT}/scripts/op8p-rootfs-docker.sh" --install
+  fi
+  [[ -x "$WSLC" ]] || die "--install 需要 mkfs.ext4+unsquashfs：Linux 本机、docker，或 wslc（Windows）—— 三个都没有"
   echo "make-op8p: 在容器里做 rootfs（首次会下几 GB 的 Valve 官方 rootfs，可以中断重跑）"
   # -v 要 Windows 路径：PORT_ROOT 是 Git Bash 的 /d/... 形式，而
   # MSYS_NO_PATHCONV=1 关掉了自动转换，直接传会挂成空目录（第一次就是这样，
@@ -178,7 +184,10 @@ if [[ $VERIFY == 1 ]]; then
   if command -v dumpe2fs >/dev/null 2>&1; then
     exec bash "${PORT_ROOT}/scripts/verify-op8p-userdata.sh" "${OUT}/userdata.img"
   fi
-  [[ -x "$WSLC" ]] || die "--verify 需要 e2fsprogs（Linux）或 wslc（Windows）—— 两个都没有"
+  if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+    exec bash "${PORT_ROOT}/scripts/op8p-rootfs-docker.sh" --verify
+  fi
+  [[ -x "$WSLC" ]] || die "--verify 需要 e2fsprogs：Linux 本机、docker，或 wslc（Windows）—— 三个都没有"
   WIN_ROOT="$(cygpath -w "$PORT_ROOT" 2>/dev/null || printf '%s' "$PORT_ROOT")"
   MSYS_NO_PATHCONV=1 "$WSLC" run --rm --dns 223.5.5.5 \
     -v "${WIN_ROOT}:/repo" "$WSLC_IMAGE" bash -c '
@@ -394,6 +403,23 @@ rm -f "$payload"
 # packing's entry stale.
 ( cd "$OUT" && rm -f SHA256SUMS && sha256sum -- *.img >SHA256SUMS 2>/dev/null || \
   ( cd "$OUT" && shasum -a 256 -- *.img >SHA256SUMS ) )
+
+# 打完立刻验，而不是等刷机时才验。区别不只是"早一点"：
+#   * 这里能看到 ramdisk 有没有真的进去 —— 缺了 GPU 微码的镜像照样能打包成功，
+#     症状是刷完之后屏幕全黑、一句报错都没有（§28）；
+#   * 也能看到镜像里的 DTB 是不是刚编出来的那一份 —— 打包参数指向旧 dtb 时，
+#     结局是分辨率/触摸/电量计悄悄退回上一版。
+# flash-op8p.sh 刷之前还会再跑一遍同一个断言（那道门不能省：--img 可以指向
+# 任何文件），这里跑是为了让"打包成功"这句话有意义。
+if [[ "${OP8P_SKIP_ASSERT:-0}" == 1 ]]; then
+  echo
+  echo "!! 镜像断言被 OP8P_SKIP_ASSERT=1 跳过 —— 只应出现在测试里"
+else
+  echo
+  echo "== 镜像断言 =="
+  bash "${PORT_ROOT}/scripts/assert-op8p-boot-image.sh" "${OUT}/${name}" \
+    || die "打出来的镜像没通过断言 —— 不要刷它（确认过后果再用 OP8P_SKIP_ASSERT=1 跳过）"
+fi
 
 echo
 echo "镜像:  ${OUT}/${name}"

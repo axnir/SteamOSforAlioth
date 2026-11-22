@@ -81,6 +81,30 @@ if [[ "$MODE" != --install ]]; then
   say "镜像 $IMG ($(stat -c %s "$IMG" 2>/dev/null || stat -f %z "$IMG") 字节)"
 fi
 
+# --- 断言门禁 -------------------------------------------------------------
+#
+# alioth 的规矩是「脚本自己跑断言，不绿就什么都不做」，OP8P 之前只是把断言
+# 放在仓库里、靠人记得跑。于是「改了 DTS 却刷了旧镜像」这件事没有任何东西
+# 会拦 —— 而它的症状是分辨率/触摸/电量计悄悄退回上一版，看起来像新 bug。
+#
+# 两道门，都在碰设备**之前**：
+#   1. assert-op8p-flash.sh       这个脚本自己的规则（不碰 abl/super、ERASE 确认…）
+#   2. assert-op8p-boot-image.sh  真正要写进 boot 分区的那一个镜像
+#
+# OP8P_SKIP_ASSERT=1 是测试接缝，只给断言自身的负向测试用；正常刷机不要设。
+if [[ "${OP8P_SKIP_ASSERT:-0}" == 1 ]]; then
+  say "!! 断言被 OP8P_SKIP_ASSERT=1 跳过 —— 这只应出现在测试里"
+else
+  say "=> scripts/assert-op8p-flash.sh"
+  bash "${PORT_ROOT}/scripts/assert-op8p-flash.sh" \
+    || die "刷机脚本自身的规则不成立 —— 先修规则，不要绕过断言"
+  if [[ "$MODE" != --install ]]; then
+    say "=> scripts/assert-op8p-boot-image.sh $(basename "$IMG")"
+    OP8P_BOOT_IMAGE="$IMG" bash "${PORT_ROOT}/scripts/assert-op8p-boot-image.sh" \
+      || die "镜像没通过断言 —— 别刷进去（--img 换一个好的，或重新打包）"
+  fi
+fi
+
 # --- talk to the phone -----------------------------------------------------
 
 # getvar in both shapes this and other Qualcomm bootloaders print:

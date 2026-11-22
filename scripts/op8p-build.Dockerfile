@@ -17,6 +17,13 @@ RUN rm -f /etc/yum.repos.d/*.repo \
       file gcc binutils make bc bison flex python3 curl tar xz gzip zstd cpio \
       kmod patch perl rsync openssl-devel elfutils-libelf-devel dwarves \
       diffutils findutils hostname which git dtc \
+      e2fsprogs squashfs-tools btrfs-progs util-linux \
  && dnf clean all && rm -rf /var/cache/dnf/*
-# dtc 比容器内脚本需要的多一个：宿主机上的 assert-op8p-stage2.sh 用它在
-# 编完之后反编译 dtb，确认节点真的进了产物；在容器里手查也方便。
+# dtc：宿主机上的 assert-op8p-stage2.sh 用它在编完之后反编译 dtb，确认节点
+# 真的进了产物；在容器里手查也方便。
+#
+# e2fsprogs + squashfs-tools + btrfs-progs：不是内核构建要的，是
+# make-op8p.sh --install / --verify 要的 —— mkfs.ext4 -d、unsquashfs
+# （拆 RAUC bundle）、e2fsck、以及 btrfs restore（Valve 的 rootfs.img 是
+# btrfs，而容器没有 CAP_SYS_ADMIN，loop 挂载必然失败，只能离线恢复）。
+# util-linux 给 mountpoint/blkid。放在同一个镜像里是为了只有一份工具链要维护。
