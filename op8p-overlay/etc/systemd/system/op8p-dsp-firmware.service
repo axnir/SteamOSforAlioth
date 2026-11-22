@@ -1,0 +1,18 @@
+[Unit]
+Description=OnePlus 8 Pro: 从 modem_a 取出机内签名的 ADSP/CDSP/SLPI 固件
+Documentation=file:///usr/lib/steamos-arm/op8p-dsp-firmware
+# 必须在 remoteproc 驱动 probe 之前/之后都能跑：mount 好根、有 python3 就行。
+After=local-fs.target
+Before=op8p-firstboot.service graphical.target
+ConditionPathExists=/dev/disk/by-partlabel/modem_a
+# 固件齐不齐由脚本自己判断（三份分开查），这里不加 Condition，避免
+# 「adsp 在、slpi 不在」时整个单元被跳过。
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/steamos-arm/op8p-dsp-firmware
+TimeoutStartSec=60
+
+[Install]
+WantedBy=multi-user.target

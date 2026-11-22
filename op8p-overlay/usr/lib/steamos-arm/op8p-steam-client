@@ -43,4 +43,20 @@ chown -R 1000:1000 "$DEST"
 
 # 解压"成功"但客户端主体不在 = 包换了结构，必须让它失败，下次开机重来。
 [[ -x "$SENTINEL" ]] || { log "解压后 $SENTINEL 不存在，包结构不对" >&2; exit 1; }
+
+# 允许 Steam 自举到当前版本。
+#
+# 为什么必须做（2026-11-21 实测）：tar 包里是造镜像那天（02-23）的 Frame 客户端，
+# 而 RUNSTEAM.sh 默认拼上 -inhibitbootstrap -nobootstrapperupdate，客户端永远
+# 停在那一天。表现不是"更新太旧"，而是根本登录不上：启动日志 "Client version: 0"、
+# package/ 里只有 8 KB 的 beta 文件；CM 的 WebSocket 能连上（443 通），但服务器
+# 回 'Try another CM' 主动断开。真机统计：ConnectionCompleted 9 次、Try another CM
+# 7 次、Logged On 0 次，界面上就是输入账号后 40 秒退回未登录。
+#
+# RUNSTEAM.sh 第 58 行认这个标记文件（或 STEAM_ALLOW_CLIENT_UPDATES=1），
+# 命中后会把那两个参数从命令行里摘掉，Steam 随即联网自举（alioth 实测下载
+# 663 MB、装成 3.1 GB）。这是 alioth.md 10-24 记录里已经验证过的路径。
+touch "$DEST/.allow-client-updates"
+chown 1000:1000 "$DEST/.allow-client-updates"
+
 log "完成：$(du -sh "$DEST" | cut -f1)"

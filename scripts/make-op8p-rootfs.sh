@@ -78,6 +78,16 @@ ln -sf /etc/systemd/system/op8p-firstboot.service \
   "${R}/etc/systemd/system/sysinit.target.wants/op8p-firstboot.service"
 chmod 755 "${R}/usr/lib/steamos-arm/op8p-firstboot"
 
+# DSP 固件：机内签名的那三份（adsp/cdsp/slpi）不可再分发，镜像里一份都不放，
+# 由 op8p-dsp-firmware 在开机时从 modem_a 现取 —— 和 Nura、alioth 一个思路。
+# squash 脚本只有一份，宿主和设备共用 scripts/ 里那个。
+cp "${ROOT}/scripts/squash-qcom-mdt.py" \
+  "${R}/usr/lib/steamos-arm/squash-qcom-mdt.py"
+chmod 755 "${R}/usr/lib/steamos-arm/op8p-dsp-firmware"
+mkdir -p "${R}/etc/systemd/system/multi-user.target.wants"
+ln -sf /etc/systemd/system/op8p-dsp-firmware.service \
+  "${R}/etc/systemd/system/multi-user.target.wants/op8p-dsp-firmware.service"
+
 # 首启解压 Steam 客户端：镜像自带 /usr/lib/steam/steam.tar.zst，但没有任何
 # 东西去解它。不解的话 steam.service 的 ExecStartPre（往 ~/.local/share/Steam
 # 拷 RUNSTEAM.sh）直接失败，gamescope 没有可合成的客户端，屏幕停在 fbcon 的黑帧。

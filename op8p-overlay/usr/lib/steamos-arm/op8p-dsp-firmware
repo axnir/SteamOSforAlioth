@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# 从这台手机自己的 modem_a 分区里取出 DSP 固件，拼成 remoteproc 需要的 .mbn。
+#
+# 为什么不能直接用 linux-firmware 里的同名文件：
+# 这些镜像走 Qualcomm 的 PAS 路径，由 TrustZone 验签。通用签名的 adsp.mbn
+# 会被拒（qcom_scm_pas_init_image 返 -EINVAL，内核只说
+# "error -22 initializing firmware"），而后果离原因很远：
+#   adsp 不启动 -> q6afe 不上线 -> 只有 Dummy Output，一点声音没有
+# 机内这三份是 OnePlus 签的，只能从本机的 modem_a 读，不可再分发 ——
+# 所以它们不进镜像，由这个 oneshot 在首启时现取。
+#
+# modem_a 是 vfat，里面有 image/adsp.mdt + adsp.b00..b18 以及 cdsp/slpi
+# 同样的三件套。.mdt 只有 ELF 头和 program header 表，段在 .bNN 里，
+# squash-qcom-mdt.py 把它们拼回一个完整 ELF。
+set -euo pipefail
+
+DST=/lib/firmware/postmarketos
+PART=/dev/disk/by-partlabel/modem_a
+SQUASH=/usr/lib/steamos-arm/squash-qcom-mdt.py
+MNT=/run/op8p-modem
+
+log() { echo "op8p-dsp-firmware: $*"; }
+
+need=0
+for f in adsp cdsp slpi; do
+	[[ -s "$DST/$f.mbn" ]] || need=1
+done
+if [[ "$need" == 0 ]]; then
+	log "三份固件都已就位"
+	exit 0
+fi
+
+[[ -b "$PART" ]] || { log "没有 $PART"; exit 1; }
+[[ -f "$SQUASH" ]] || { log "没有 $SQUASH"; exit 1; }
+command -v python3 >/dev/null || { log "没有 python3"; exit 1; }
+
+mkdir -p "$DST" "$MNT"
+cleanup() { umount "$MNT" 2>/dev/null || true; }
+trap cleanup EXIT
+
+mount -o ro "$PART" "$MNT" || { log "挂不上 $PART"; exit 1; }
+
+for f in adsp cdsp slpi; do
+	[[ -s "$DST/$f.mbn" ]] && continue
+	if [[ ! -f "$MNT/image/$f.mdt" ]]; then
+		log "$f: modem_a 里没有 image/$f.mdt，跳过"
+		continue
+	fi
+	python3 "$SQUASH" "$MNT/image/$f.mdt" "$DST/$f.mbn"
+	log "$f: $(stat -c %s "$DST/$f.mbn") 字节"
+done
+
+# remoteproc 在 probe 时已经因为找不到固件失败过一次，这里重新绑一次驱动。
+for dev in 17300000.remoteproc 8300000.remoteproc 5c00000.remoteproc; do
+	d=/sys/bus/platform/drivers/qcom_q6v5_pas
+	[[ -e "$d/$dev" ]] || continue
+	echo "$dev" > "$d/unbind" 2>/dev/null || true
+	echo "$dev" > "$d/bind" 2>/dev/null || true
+done
+
+log "完成: $(ls "$DST")"
