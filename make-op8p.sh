@@ -59,6 +59,24 @@ done
 
 die() { echo "make-op8p: $*" >&2; exit 1; }
 
+# python3 here can be a *native Windows* interpreter (WorkBuddy's bundled
+# 3.13 was first on PATH on 2026-11-21), and a win32 python has no idea what
+# "/d/Developer/..." means -- it resolves it against the current drive and
+# reports a perfectly good file as missing. Every path-ish argument therefore
+# goes through cygpath first; on Linux (no cygpath) they pass through as-is.
+python3w() {
+  if ! command -v cygpath >/dev/null 2>&1; then
+    python3 "$@"
+    return
+  fi
+  local -a conv=()
+  local a
+  for a in "$@"; do
+    if [[ "$a" == /* ]]; then conv+=("$(cygpath -w -- "$a")"); else conv+=("$a"); fi
+  done
+  python3 "${conv[@]}"
+}
+
 # --install builds the rootfs image instead of the boot image. It needs
 # e2fsprogs (mkfs.ext4) and, the first time, squashfs-tools (unsquashfs, to
 # unpack Valve's RAUC bundle) -- neither exists on a Windows box, so it runs
@@ -219,7 +237,7 @@ DTB_ADDR=0x01F00000
 # the wrapper fails loudly instead of silently producing a bad image.
 stage_payload() {
   local payload="${OUT}/Image.gz"
-  python3 - "$img" "$payload" <<'PY'
+  python3w - "$img" "$payload" <<'PY' || return 1
 import gzip, sys
 
 src, dst = sys.argv[1], sys.argv[2]
@@ -292,7 +310,7 @@ cmdline="$(
   bash -c "source '${SOC_DIR}/soc.env'; source '${KCOMMON}/cmdline.sh'; build_cmdline PARTLABEL=userdata"
 )"
 
-payload="$(stage_payload)"
+payload="$(stage_payload)" || die "gzip(${img}) 失败 —— payload 没生成"
 
 # Reproducible: without SOURCE_DATE_EPOCH the header's os_version carries
 # today's date, so an unchanged kernel yields a different image and a
@@ -341,7 +359,7 @@ case "$PACK" in
     if [[ -f "${OUT}/gpu-fw-ramdisk.cpio.gz" ]]; then
       rd_arg=(--ramdisk "${OUT}/gpu-fw-ramdisk.cpio.gz")
     fi
-    python3 "${KCOMMON}/mkbootimg-v0.py" \
+    python3w "${KCOMMON}/mkbootimg-v0.py" \
       --kernel "$withdtb" \
       ${rd_arg[@]+"${rd_arg[@]}"} \
       --cmdline "$cmdline" \
@@ -355,7 +373,7 @@ case "$PACK" in
     ;;
   v2)
     name=boot-op8p-v2.img
-    python3 "${KCOMMON}/mkbootimg-v2.py" \
+    python3w "${KCOMMON}/mkbootimg-v2.py" \
       --kernel "$payload" \
       --dtb "$dtb" \
       --cmdline "$cmdline" \

@@ -81,7 +81,7 @@ MSYS_NO_PATHCONV=1 "$WSLC" run --rm \
   -v "${WIN_OUTDIR}:/out" \
   "$WSLC_IMAGE" bash -c '
   set -e
-  dnf install -y cpio gzip >/dev/null 2>&1
+  dnf install -y cpio gzip >/dev/null || { echo "dnf install cpio/gzip 失败" >&2; exit 1; }
   T=$(mktemp -d)
   for base in qcom updates/qcom; do
     mkdir -p "$T/$base"
