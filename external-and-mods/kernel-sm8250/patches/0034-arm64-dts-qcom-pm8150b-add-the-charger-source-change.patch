@@ -1,0 +1,29 @@
+arm64: dts: qcom: pm8150b: add the charger source-change interrupt
+
+From Nura kernel-patches 0086 (Roman Kuraev): describe the USB input
+source-change interrupt so the charger driver can refresh its cached
+type and allowance when APSD completes late. Applied after ROCKNIX
+0004-pm8150b.patch, which creates the charger node.
+diff --git a/arch/arm64/boot/dts/qcom/pm8150b.dtsi b/arch/arm64/boot/dts/qcom/pm8150b.dtsi
+index a1a703520..9f14113fa 100644
+--- a/arch/arm64/boot/dts/qcom/pm8150b.dtsi
++++ b/arch/arm64/boot/dts/qcom/pm8150b.dtsi
+@@ -113,11 +113,13 @@ pm8150b_charger: charger@1000 {
+ 			interrupts = <0x2 0x13 0x4 IRQ_TYPE_EDGE_BOTH>,
+ 				     <0x2 0x12 0x2 IRQ_TYPE_EDGE_BOTH>,
+ 				     <0x2 0x16 0x1 IRQ_TYPE_EDGE_RISING>,
+-				     <0x2 0x13 0x7 IRQ_TYPE_EDGE_RISING>;
++				     <0x2 0x13 0x7 IRQ_TYPE_EDGE_RISING>,
++				     <0x2 0x13 0x6 IRQ_TYPE_EDGE_RISING>;
+ 			interrupt-names = "usbin-plugin",
+ 					  "bat-ov",
+ 					  "wdog-bark",
+-					  "usbin-icl-change";
++					  "usbin-icl-change",
++					  "usbin-src-change";
+ 
+ 			io-channels = <&pm8150b_adc 7>,
+ 				      <&pm8150b_adc 8>;
+-- 
+2.51.2
+

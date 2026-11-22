@@ -1,0 +1,2715 @@
+power: supply: qcom_pm8150b: bring the charger up on the OnePlus 8 Pro
+
+The ROCKNIX 0011 driver (with its safe float-voltage formula) stays as
+the base; this patch rewrites it to the state Nura (formerly
+postmarketOS) runs on this very device, i.e. the pmOS soc tree base
+(sm8250-7.2.0_git20261010) plus Nura's fix chain:
+
+  0068 float voltage encoding (already present in ROCKNIX's copy,
+      re-applied harmlessly by the rewrite)
+  0073 read USB telemetry while charging is paused
+  0082 release the wake IRQ on detach
+  0083 scale the USB input current
+  0084 report battery overvoltage
+  0085 follow TCPM limits and refresh on source change
+  0165 keep at least 500 mA of USB input while VBUS is present
+  0166 charge by the external fuel gauge like the stock firmware
+      (temperature zones, early-cycle restart; fixes the ~88 % stall;
+      keyed off the "qcom,fuel-gauge" phandle, our DTS points it at
+      the bq27541)
+
+Source: darknagel/oneplus-instantnoodlep-nura-unofficial
+kernel-patches 0068/0073/0082/0083/0084/0085/0165/0166, applied onto
+the pmOS base file, then diffed against ROCKNIX 0011's copy.
+--- a/drivers/power/supply/qcom_pm8150b_charger.c
++++ b/drivers/power/supply/qcom_pm8150b_charger.c
+@@ -1,950 +1,1739 @@
+-// SPDX-License-Identifier: GPL-2.0-only
+-/*
+- * Copyright (c) 2024, Teguh Sobirin <teguh@sobir.in>.
+- *
+- * This driver is for the switch-mode battery charger power delivery
+- * and boost hardware found in pm8150b and related PMICs.
+- * This work based on pmi8998 charger driver by 
+- * Caleb Connolly <caleb.connolly@linaro.org>
+- * Should be merged with the existing charger driver in the future.
+- */
+-
+-#include <linux/bits.h>
+-#include <linux/devm-helpers.h>
+-#include <linux/iio/consumer.h>
+-#include <linux/interrupt.h>
+-#include <linux/kernel.h>
+-#include <linux/minmax.h>
+-#include <linux/module.h>
+-#include <linux/platform_device.h>
+-#include <linux/pm_wakeirq.h>
+-#include <linux/of.h>
+-#include <linux/power_supply.h>
+-#include <linux/regmap.h>
+-#include <linux/types.h>
+-#include <linux/workqueue.h>
+-
+-/* clang-format off */
+-#define BATTERY_CHARGER_STATUS_1			0x06
+-#define ICL_INCR_REQ_FOR_PRECHG_BIT			BIT(7)
+-#define ZERO_CHARGE_CURRENT_BIT				BIT(6)
+-#define STEP_CHARGING_STATUS_SHIFT			3
+-#define STEP_CHARGING_STATUS_MASK			GENMASK(5, 3)
+-#define BATTERY_CHARGER_STATUS_MASK			GENMASK(2, 0)
+-
+-#define BATTERY_CHARGER_STATUS_2			0x07
+-#define DROP_IN_BATTERY_VOLTAGE_REFERENCE_BIT		BIT(7)
+-#define VBATT_LTET_RECHARGE_BIT				BIT(6)
+-#define VBATT_GTET_INHIBIT_BIT				BIT(5)
+-#define VBATT_GTET_FLOAT_VOLTAGE_BIT			BIT(4)
+-#define BATT_GT_FULL_ON_BIT				BIT(3)
+-#define CHARGER_ERROR_STATUS_SFT_EXPIRE_BIT		BIT(2)
+-#define CHARGER_ERROR_STATUS_BAT_OV_BIT			BIT(1)
+-#define CHARGER_ERROR_STATUS_BAT_TERM_MISSING_BIT	BIT(0)
+-
+-#define BATTERY_CHARGER_STATUS_4		0x0A
+-#define CHARGE_CURRENT_REFERENCE_MASK		GENMASK(7, 0)
+-
+-#define BATTERY_CHARGER_STATUS_7_REG		0x0D
+-#define BAT_TEMP_STATUS_SOFT_LIMIT_MASK		GENMASK(5, 4)
+-#define BAT_TEMP_STATUS_HOT_SOFT_BIT		BIT(5)
+-#define BAT_TEMP_STATUS_COLD_SOFT_BIT		BIT(4)
+-#define BAT_TEMP_STATUS_HARD_LIMIT_MASK		GENMASK(3, 2)
+-#define BAT_TEMP_STATUS_TOO_HOT_BIT		BIT(3)
+-#define BAT_TEMP_STATUS_TOO_COLD_BIT		BIT(2)
+-#define BAT_TEMP_STATUS_TOO_HOT_AFP_BIT		BIT(1)
+-#define BAT_TEMP_STATUS_TOO_COLD_AFP_BIT	BIT(0)
+-
+-#define CHARGING_ENABLE_CMD			0x42
+-#define CHARGING_ENABLE_CMD_BIT			BIT(0)
+-#define CHARGING_ENABLE_POF_BIT			BIT(1)
+-
+-#define CHGR_CFG2				0x51
+-#define EN_FAVOR_IN_BIT				BIT(5)
+-#define BAT_OV_ECC_BIT				BIT(4)
+-#define I_TERM_BIT				BIT(3)
+-#define AUTO_RECHG_BIT				BIT(2)
+-#define SOC_BASED_RECHG_BIT			BIT(1)
+-#define CHARGER_INHIBIT_BIT			BIT(0)
+-
+-#define PRE_CHARGE_CURRENT_CFG			0x60
+-#define PRE_CHARGE_CURRENT_SETTING_MASK		GENMASK(2, 0)
+-
+-#define FAST_CHARGE_CURRENT_CFG			0x61
+-#define FAST_CHARGE_CURRENT_SETTING_MASK	GENMASK(7, 0)
+-
+-#define FLOAT_VOLTAGE_CFG			0x70
+-#define FLOAT_VOLTAGE_SETTING_MASK		GENMASK(7, 0)
+-
+-#define CHARGE_RCHG_SOC_THRESHOLD_CFG_REG	0x7D
+-#define CHARGE_RCHG_SOC_THRESHOLD_CFG_MASK	GENMASK(7, 0)
+-
+-#define ICL_STATUS				0x107
+-#define ICL_INPUT_CURRENT_LIMIT_MASK		GENMASK(7, 0)
+-
+-#define AICL_STATUS				0x108
+-#define AICL_INPUT_CURRENT_LIMIT_MASK		GENMASK(7, 0)
+-
+-#define POWER_PATH_STATUS				0x10B
+-#define P_PATH_INPUT_SS_DONE_BIT			BIT(7)
+-#define P_PATH_USBIN_SUSPEND_STS_BIT			BIT(6)
+-#define P_PATH_DCIN_SUSPEND_STS_BIT			BIT(5)
+-#define P_PATH_USE_USBIN_BIT				BIT(4)
+-#define P_PATH_USE_DCIN_BIT				BIT(3)
+-#define P_PATH_POWER_PATH_MASK				GENMASK(2, 1)
+-#define P_PATH_VALID_INPUT_POWER_SOURCE_STS_BIT		BIT(0)
+-
+-#define OTG_CFG					0x153
+-#define OTG_RESERVED_BIT			BIT(7)
+-#define FAST_ROLE_SWAP_START_OPTION_BIT		BIT(6)
+-#define DIS_OTG_ON_TSD_BIT			BIT(5)
+-#define OTG_CFG_4_BIT				BIT(4)
+-#define EN_SOC_BASED_OTG_UVLO_BIT		BIT(3)
+-#define ENABLE_OTG_IN_DEBUG_MODE_BIT		BIT(2)
+-#define OTG_EN_SRC_CFG_BIT			BIT(1)
+-#define OTG_HICCUP_CNTR_RST_TIMER_SEL_BIT	BIT(0)
+-
+-#define APSD_STATUS				0x307
+-#define APSD_STATUS_7_BIT			BIT(7)
+-#define HVDCP_CHECK_TIMEOUT_BIT			BIT(6)
+-#define SLOW_PLUGIN_TIMEOUT_BIT			BIT(5)
+-#define ENUMERATION_DONE_BIT			BIT(4)
+-#define VADP_CHANGE_DONE_AFTER_AUTH_BIT		BIT(3)
+-#define QC_AUTH_DONE_STATUS_BIT			BIT(2)
+-#define QC_CHARGER_BIT				BIT(1)
+-#define APSD_DTC_STATUS_DONE_BIT		BIT(0)
+-
+-#define APSD_RESULT_STATUS			0x308
+-#define APSD_RESULT_STATUS_7_BIT		BIT(7)
+-#define APSD_RESULT_STATUS_MASK			GENMASK(6, 0)
+-#define QC_3P0_BIT				BIT(6)
+-#define QC_2P0_BIT				BIT(5)
+-#define FLOAT_CHARGER_BIT			BIT(4)
+-#define DCP_CHARGER_BIT				BIT(3)
+-#define CDP_CHARGER_BIT				BIT(2)
+-#define OCP_CHARGER_BIT				BIT(1)
+-#define SDP_CHARGER_BIT				BIT(0)
+-
+-#define USBIN_INT_RT_STS_OFFSET			0x310
+-#define USBIN_PLUGIN_RT_STS_BIT			BIT(4)
+-
+-#define USBIN_CMD_IL				0x340
+-#define USBIN_SUSPEND_BIT			BIT(0)
+-
+-#define CMD_APSD				0x341
+-#define APSD_RERUN_BIT				BIT(0)
+-
+-#define CMD_ICL_OVERRIDE			0x342
+-#define ICL_OVERRIDE_BIT			BIT(0)
+-
+-#define TYPE_C_CFG				0x358
+-#define BC1P2_START_ON_CC_BIT			BIT(7)
+-
+-#define HVDCP_PULSE_COUNT_MAX			0x35b
+-#define HVDCP_PULSE_COUNT_MAX_QC2_MASK		GENMASK(7, 6)
+-
+-#define USBIN_ADAPTER_ALLOW_CFG			0x360
+-#define USBIN_ADAPTER_ALLOW_MASK		GENMASK(3, 0)
+-
+-#define USBIN_OPTIONS_1_CFG			0x362
+-#define HVDCP_AUTH_ALG_EN_CFG_BIT		BIT(6)
+-#define HVDCP_AUTONOMOUS_MODE_EN_CFG_BIT	BIT(5)
+-#define BC1P2_SRC_DETECT_BIT			BIT(3)
+-#define HVDCP_EN_BIT				BIT(2)
+-#define HVDCP_NO_AUTH_QC3_CFG_BIT		BIT(1)
+-
+-#define USBIN_LOAD_CFG				0x365
+-#define ICL_OVERRIDE_AFTER_APSD_BIT		BIT(4)
+-#define USBIN_AICL_STEP_TIMING_SEL_MASK		GENMASK(3, 2)
+-#define USBIN_IN_COLLAPSE_GF_SEL_MASK		GENMASK(1, 0)
+-
+-#define USBIN_ICL_OPTIONS			0x366
+-#define CFG_USB3P0_SEL_BIT			BIT(2)
+-#define USB51_MODE_BIT				BIT(1)
+-#define USBIN_MODE_CHG_BIT			BIT(0)
+-
+-#define USBIN_CURRENT_LIMIT_CFG			0x370
+-#define USBIN_CURRENT_LIMIT_MASK		GENMASK(7, 0)
+-
+-#define USBIN_AICL_OPTIONS_CFG			0x380
+-#define SUSPEND_ON_COLLAPSE_USBIN_BIT		BIT(7)
+-#define USBIN_AICL_PERIODIC_RERUN_EN_BIT	BIT(4)
+-#define USBIN_AICL_ADC_EN_BIT			BIT(3)
+-#define USBIN_AICL_EN_BIT			BIT(2)
+-
+-#define USBIN_5V_AICL_THRESHOLD_CFG		0x381
+-#define USBIN_5V_AICL_THRESHOLD_CFG_MASK	GENMASK(2, 0)
+-
+-#define USBIN_CONT_AICL_THRESHOLD_CFG		0x384
+-#define USBIN_CONT_AICL_THRESHOLD_CFG_MASK	GENMASK(5, 0)
+-
+-#define DCIN_CMD_IL				0x440
+-#define DCIN_SUSPEND_BIT			BIT(0)
+-
+-#define TYPE_C_SNK_STATUS			0x506
+-#define DETECTED_SRC_TYPE_MASK			GENMASK(6, 0)
+-#define SNK_RP_STD_DAM_BIT			BIT(6)
+-#define SNK_RP_1P5_DAM_BIT			BIT(5)
+-#define SNK_RP_3P0_DAM_BIT			BIT(4)
+-#define SNK_DAM_MASK				GENMASK(6, 4)
+-#define SNK_DAM_500MA_BIT			BIT(6)
+-#define SNK_DAM_1500MA_BIT			BIT(5)
+-#define SNK_DAM_3000MA_BIT			BIT(4)
+-#define SNK_RP_STD_BIT				BIT(3)
+-#define SNK_RP_1P5_BIT				BIT(2)
+-#define SNK_RP_3P0_BIT				BIT(1)
+-#define SNK_RP_SHORT_BIT			BIT(0)
+-
+-#define TYPE_C_MODE_CFG				0x544
+-#define TYPEC_TRY_MODE_MASK			GENMASK(4, 3)
+-#define EN_TRY_SNK_BIT				BIT(4)
+-#define EN_TRY_SRC_BIT				BIT(3)
+-#define TYPEC_POWER_ROLE_CMD_MASK		GENMASK(2, 0)
+-#define EN_SRC_ONLY_BIT				BIT(2)
+-#define EN_SNK_ONLY_BIT				BIT(1)
+-#define TYPEC_DISABLE_CMD_BIT			BIT(0)
+-
+-#define TYPEC_TYPE_C_VCONN_CONTROL		0x546
+-#define VCONN_EN_ORIENTATION_BIT		BIT(2)
+-#define VCONN_EN_VALUE_BIT			BIT(1)
+-#define VCONN_EN_SRC_BIT			BIT(0)
+-
+-#define TYPE_C_DEBUG_ACCESS_SINK		0x54a
+-#define TYPEC_DEBUG_ACCESS_SINK_MASK		GENMASK(4, 0)
+-
+-#define DEBUG_ACCESS_SRC_CFG			0x54C
+-#define EN_UNORIENTED_DEBUG_ACCESS_SRC_BIT	BIT(0)
+-
+-#define TYPE_C_EXIT_STATE_CFG			0x550
+-#define BYPASS_VSAFE0V_DURING_ROLE_SWAP_BIT	BIT(3)
+-#define SEL_SRC_UPPER_REF_BIT			BIT(2)
+-#define EXIT_SNK_BASED_ON_CC_BIT		BIT(0)
+-
+-#define TYPE_C_INTERRUPT_EN_CFG_1			0x55e
+-#define TYPEC_LEGACY_CABLE_INT_EN_BIT			BIT(7)
+-#define TYPEC_NONCOMPLIANT_LEGACY_CABLE_INT_EN_BIT	BIT(6)
+-#define TYPEC_TRYSOURCE_DETECT_INT_EN_BIT		BIT(5)
+-#define TYPEC_TRYSINK_DETECT_INT_EN_BIT			BIT(4)
+-#define TYPEC_CCOUT_DETACH_INT_EN_BIT			BIT(3)
+-#define TYPEC_CCOUT_ATTACH_INT_EN_BIT			BIT(2)
+-#define TYPEC_VBUS_DEASSERT_INT_EN_BIT			BIT(1)
+-#define TYPEC_VBUS_ASSERT_INT_EN_BIT			BIT(0)
+-
+-#define BARK_BITE_WDOG_PET			0x643
+-#define BARK_BITE_WDOG_PET_BIT			BIT(0)
+-
+-#define WD_CFG					0x651
+-#define WATCHDOG_TRIGGER_AFP_EN_BIT		BIT(7)
+-#define BARK_WDOG_INT_EN_BIT			BIT(6)
+-#define BITE_WDOG_INT_EN_BIT			BIT(5)
+-#define SFT_AFTER_WDOG_IRQ_MASK			GENMASK(4, 3)
+-#define WDOG_IRQ_SFT_BIT			BIT(2)
+-#define WDOG_TIMER_EN_ON_PLUGIN_BIT		BIT(1)
+-#define WDOG_TIMER_EN_BIT			BIT(0)
+-
+-#define SNARL_BARK_BITE_WD_CFG			0x653
+-#define BITE_WDOG_DISABLE_CHARGING_CFG_BIT	BIT(7)
+-#define SNARL_WDOG_TIMEOUT_MASK			GENMASK(6, 4)
+-#define BARK_WDOG_TIMEOUT_MASK			GENMASK(3, 2)
+-#define BITE_WDOG_TIMEOUT_MASK			GENMASK(1, 0)
+-
+-#define AICL_RERUN_TIME_CFG			0x661
+-#define AICL_RERUN_TIME_MASK			GENMASK(1, 0)
+-
+-#define SDP_CURRENT_UA			500000
+-#define CDP_CURRENT_UA			3000000
+-#define DCP_CURRENT_UA			3300000
+-#define CURRENT_MAX_UA			DCP_CURRENT_UA
+-
+-/* pmi8150b registers represent current in increments of 1/40th of an amp */
+-#define CURRENT_SCALE_FACTOR		50000
+-/* clang-format on */
+-
+-enum charger_status {
+-	INHIBIT_CHARGE = 0,
+-	TRICKLE_CHARGE,
+-	PRE_CHARGE,
+-	FULLON_CHARGE,
+-	TAPER_CHARGE,
+-	TERMINATE_CHARGE,
+-	PAUSE_CHARGE,
+-	DISABLE_CHARGE,
+-};
+-
+-struct smb5_register {
+-	u16 addr;
+-	u8 mask;
+-	u8 val;
+-};
+-
+-/**
+- * struct smb5_chip - smb5 chip structure
+- * @dev:		Device reference for power_supply
+- * @name:		The platform device name
+- * @base:		Base address for smb5 registers
+- * @regmap:		Register map
+- * @batt_info:		Battery data from DT
+- * @status_change_work: Worker to handle plug/unplug events
+- * @cable_irq:		USB plugin IRQ
+- * @wakeup_enabled:	If the cable IRQ will cause a wakeup
+- * @usb_in_i_chan:	USB_IN current measurement channel
+- * @usb_in_v_chan:	USB_IN voltage measurement channel
+- * @chg_psy:		Charger power supply instance
+- */
+-struct smb5_chip {
+-	struct device *dev;
+-	const char *name;
+-	unsigned int base;
+-	struct regmap *regmap;
+-	struct power_supply_battery_info *batt_info;
+-
+-	struct delayed_work status_change_work;
+-	int cable_irq;
+-	bool wakeup_enabled;
+-
+-	struct iio_channel *usb_in_i_chan;
+-	struct iio_channel *usb_in_v_chan;
+-
+-	struct power_supply *chg_psy;
+-};
+-
+-static enum power_supply_property smb5_properties[] = {
+-	POWER_SUPPLY_PROP_MANUFACTURER,
+-	POWER_SUPPLY_PROP_MODEL_NAME,
+-	POWER_SUPPLY_PROP_CURRENT_MAX,
+-	POWER_SUPPLY_PROP_CURRENT_NOW,
+-	POWER_SUPPLY_PROP_VOLTAGE_NOW,
+-	POWER_SUPPLY_PROP_STATUS,
+-	POWER_SUPPLY_PROP_HEALTH,
+-	POWER_SUPPLY_PROP_ONLINE,
+-	POWER_SUPPLY_PROP_USB_TYPE,
+-};
+-
+-static int smb5_get_prop_usb_online(struct smb5_chip *chip, int *val)
+-{
+-	unsigned int stat;
+-	int rc;
+-
+-	rc = regmap_read(chip->regmap, chip->base + USBIN_INT_RT_STS_OFFSET, &stat);
+-	if (rc < 0) {
+-		dev_err(chip->dev, "Couldn't read USBIN_RT_STS rc=%d\n", rc);
+-		return rc;
+-	}
+-
+-	*val = (stat & USBIN_PLUGIN_RT_STS_BIT);
+-	return 0;
+-}
+-
+-/*
+- * Qualcomm "automatic power source detection" aka APSD
+- * tells us what type of charger we're connected to.
+- */
+-static int smb5_apsd_get_charger_type(struct smb5_chip *chip, int *val)
+-{
+-	unsigned int apsd_stat, stat;
+-	int usb_online = 0;
+-	int rc;
+-
+-	rc = smb5_get_prop_usb_online(chip, &usb_online);
+-	if (!usb_online) {
+-		*val = POWER_SUPPLY_USB_TYPE_UNKNOWN;
+-		return rc;
+-	}
+-
+-	rc = regmap_read(chip->regmap, chip->base + APSD_STATUS, &apsd_stat);
+-	if (rc < 0) {
+-		dev_err(chip->dev, "Failed to read apsd status, rc = %d", rc);
+-		return rc;
+-	}
+-	if (!(apsd_stat & APSD_DTC_STATUS_DONE_BIT)) {
+-		dev_err(chip->dev, "Apsd not ready");
+-		return -EAGAIN;
+-	}
+-
+-	rc = regmap_read(chip->regmap, chip->base + APSD_RESULT_STATUS, &stat);
+-	if (rc < 0) {
+-		dev_err(chip->dev, "Failed to read apsd result, rc = %d", rc);
+-		return rc;
+-	}
+-
+-	stat &= APSD_RESULT_STATUS_MASK;
+-
+-	if (stat & CDP_CHARGER_BIT){
+-		*val = POWER_SUPPLY_USB_TYPE_CDP;
+-	} else if (stat & DCP_CHARGER_BIT){
+-		*val = POWER_SUPPLY_USB_TYPE_DCP;
+-	} else if (stat & OCP_CHARGER_BIT){
+-		*val = POWER_SUPPLY_USB_TYPE_DCP;
+-	} else if (stat & FLOAT_CHARGER_BIT){
+-		*val = POWER_SUPPLY_USB_TYPE_DCP;
+-	} else if (stat & QC_2P0_BIT){
+-		*val = POWER_SUPPLY_USB_TYPE_DCP;
+-	} else if (stat & QC_3P0_BIT){
+-		*val = POWER_SUPPLY_USB_TYPE_DCP;
+-	} else {
+-		*val = POWER_SUPPLY_USB_TYPE_SDP;
+-	}
+-
+-	return 0;
+-}
+-
+-static int smb5_get_prop_status(struct smb5_chip *chip, int *val)
+-{
+-	unsigned char stat[2];
+-	int usb_online = 0;
+-	int rc;
+-
+-	rc = smb5_get_prop_usb_online(chip, &usb_online);
+-	if (!usb_online) {
+-		*val = POWER_SUPPLY_STATUS_DISCHARGING;
+-		return rc;
+-	}
+-
+-	rc = regmap_bulk_read(chip->regmap,
+-			      chip->base + BATTERY_CHARGER_STATUS_1, &stat, 2);
+-	if (rc < 0) {
+-		dev_err(chip->dev, "Failed to read charging status ret=%d\n",
+-			rc);
+-		return rc;
+-	}
+-
+-	if (stat[1] & CHARGER_ERROR_STATUS_BAT_OV_BIT) {
+-		*val = POWER_SUPPLY_STATUS_NOT_CHARGING;
+-		return 0;
+-	}
+-
+-	stat[0] = stat[0] & BATTERY_CHARGER_STATUS_MASK;
+-
+-	switch (stat[0]) {
+-	case TRICKLE_CHARGE:
+-	case PRE_CHARGE:
+-	case FULLON_CHARGE:
+-	case TAPER_CHARGE:
+-		*val = POWER_SUPPLY_STATUS_CHARGING;
+-		return rc;
+-	case PAUSE_CHARGE:
+-	case DISABLE_CHARGE:
+-		*val = POWER_SUPPLY_STATUS_NOT_CHARGING;
+-		return rc;
+-	case TERMINATE_CHARGE:
+-	case INHIBIT_CHARGE:
+-		*val = POWER_SUPPLY_STATUS_FULL;
+-		return rc;
+-	default:
+-		*val = POWER_SUPPLY_STATUS_UNKNOWN;
+-		return rc;
+-	}
+-}
+-
+-static inline int smb5_get_current_limit(struct smb5_chip *chip,
+-					 unsigned int *val)
+-{
+-	int rc = regmap_read(chip->regmap, chip->base + AICL_STATUS, val);
+-
+-	if (rc >= 0)
+-		*val *= CURRENT_SCALE_FACTOR;	
+-	return rc;
+-}
+-
+-static int smb5_set_current_limit(struct smb5_chip *chip, unsigned int val)
+-{
+-	unsigned char val_raw;
+-
+-	if (val > 4950000) {
+-		dev_err(chip->dev,
+-			"Can't set current limit higher than 4950000uA");
+-		return -EINVAL;
+-	}
+-	val_raw = val / CURRENT_SCALE_FACTOR;
+-
+-	return regmap_write(chip->regmap, chip->base + USBIN_CURRENT_LIMIT_CFG,
+-		val_raw);
+-}
+-
+-static void smb5_status_change_work(struct work_struct *work)
+-{
+-	unsigned int charger_type, current_ua;
+-	int usb_online = 0;
+-	int count, rc;
+-	struct smb5_chip *chip;
+-
+-	chip = container_of(work, struct smb5_chip, status_change_work.work);
+-
+-	smb5_get_prop_usb_online(chip, &usb_online);
+-	if (!usb_online)
+-		return;
+-
+-	for (count = 0; count < 3; count++) {
+-		dev_dbg(chip->dev, "get charger type retry %d\n", count);
+-		rc = smb5_apsd_get_charger_type(chip, &charger_type);
+-		if (rc != -EAGAIN)
+-			break;
+-		msleep(100);
+-	}
+-
+-	if (rc < 0 && rc != -EAGAIN) {
+-		dev_err(chip->dev, "get charger type failed: %d\n", rc);
+-		return;
+-	}
+-
+-	if (rc < 0) {
+-		rc = regmap_update_bits(chip->regmap, chip->base + CMD_APSD,
+-					APSD_RERUN_BIT, APSD_RERUN_BIT);
+-		schedule_delayed_work(&chip->status_change_work,
+-				      msecs_to_jiffies(1000));
+-		dev_dbg(chip->dev, "get charger type failed, rerun apsd\n");
+-		return;
+-	}
+-
+-	switch (charger_type) {
+-	case POWER_SUPPLY_USB_TYPE_CDP:
+-		current_ua = CDP_CURRENT_UA;
+-		break;
+-	case POWER_SUPPLY_USB_TYPE_DCP:
+-		current_ua = DCP_CURRENT_UA;
+-		break;
+-	case POWER_SUPPLY_USB_TYPE_SDP:
+-	default:
+-		current_ua = SDP_CURRENT_UA;
+-		break;
+-	}
+-
+-	smb5_set_current_limit(chip, current_ua);
+-	power_supply_changed(chip->chg_psy);
+-}
+-
+-static int smb5_get_iio_chan(struct smb5_chip *chip, struct iio_channel *chan,
+-			     int *val)
+-{
+-	int rc;
+-	union power_supply_propval status;
+-
+-	rc = power_supply_get_property(chip->chg_psy, POWER_SUPPLY_PROP_STATUS,
+-				       &status);
+-	if (rc < 0 || status.intval != POWER_SUPPLY_STATUS_CHARGING) {
+-		*val = 0;
+-		return 0;
+-	}
+-
+-	if (IS_ERR(chan)) {
+-		dev_err(chip->dev, "Failed to chan, err = %li", PTR_ERR(chan));
+-		return PTR_ERR(chan);
+-	}
+-
+-	return iio_read_channel_processed(chan, val);
+-}
+-
+-static int smb5_get_prop_health(struct smb5_chip *chip, int *val)
+-{
+-	int rc;
+-	unsigned int stat;
+-
+-	rc = regmap_read(chip->regmap, chip->base + BATTERY_CHARGER_STATUS_2,
+-			 &stat);
+-	if (rc < 0) {
+-		dev_err(chip->dev, "Couldn't read charger status rc=%d\n", rc);
+-		return rc;
+-	}
+-
+-	if (stat & CHARGER_ERROR_STATUS_BAT_OV_BIT) {
+-		dev_err(chip->dev, "battery over-voltage");
+-	}
+-
+-	rc = regmap_read(chip->regmap, chip->base + BATTERY_CHARGER_STATUS_7_REG,
+-			 &stat);
+-	if (rc < 0) {
+-		dev_err(chip->dev, "Couldn't read charger status 7 rc=%d\n", rc);
+-		return rc;
+-	}
+-
+-	if (stat & BAT_TEMP_STATUS_TOO_COLD_BIT)
+-		*val = POWER_SUPPLY_HEALTH_COLD;
+-	else if (stat & BAT_TEMP_STATUS_TOO_HOT_BIT)
+-		*val = POWER_SUPPLY_HEALTH_OVERHEAT;
+-	else if (stat & BAT_TEMP_STATUS_COLD_SOFT_BIT)
+-		*val = POWER_SUPPLY_HEALTH_COOL;
+-	else if (stat & BAT_TEMP_STATUS_HOT_SOFT_BIT)
+-		*val = POWER_SUPPLY_HEALTH_WARM;
+-	else
+-		*val = POWER_SUPPLY_HEALTH_GOOD;
+-
+-	return 0;
+-}
+-
+-static int smb5_get_property(struct power_supply *psy,
+-			     enum power_supply_property psp,
+-			     union power_supply_propval *val)
+-{
+-	struct smb5_chip *chip = power_supply_get_drvdata(psy);
+-
+-	switch (psp) {
+-	case POWER_SUPPLY_PROP_MANUFACTURER:
+-		val->strval = "Qualcomm";
+-		return 0;
+-	case POWER_SUPPLY_PROP_MODEL_NAME:
+-		val->strval = chip->name;
+-		return 0;
+-	case POWER_SUPPLY_PROP_CURRENT_MAX:
+-		return smb5_get_current_limit(chip, &val->intval);
+-	case POWER_SUPPLY_PROP_CURRENT_NOW:
+-		return smb5_get_iio_chan(chip, chip->usb_in_i_chan,
+-					 &val->intval);
+-	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
+-		return smb5_get_iio_chan(chip, chip->usb_in_v_chan,
+-					 &val->intval);
+-	case POWER_SUPPLY_PROP_ONLINE:
+-		return smb5_get_prop_usb_online(chip, &val->intval);
+-	case POWER_SUPPLY_PROP_STATUS:
+-		return smb5_get_prop_status(chip, &val->intval);
+-	case POWER_SUPPLY_PROP_HEALTH:
+-		return smb5_get_prop_health(chip, &val->intval);
+-	case POWER_SUPPLY_PROP_USB_TYPE:
+-		return smb5_apsd_get_charger_type(chip, &val->intval);
+-	default:
+-		dev_err(chip->dev, "invalid property: %d\n", psp);
+-		return -EINVAL;
+-	}
+-}
+-
+-static int smb5_set_property(struct power_supply *psy,
+-			     enum power_supply_property psp,
+-			     const union power_supply_propval *val)
+-{
+-	struct smb5_chip *chip = power_supply_get_drvdata(psy);
+-
+-	switch (psp) {
+-	case POWER_SUPPLY_PROP_CURRENT_MAX:
+-		return smb5_set_current_limit(chip, val->intval);
+-	default:
+-		dev_err(chip->dev, "No setter for property: %d\n", psp);
+-		return -EINVAL;
+-	}
+-}
+-
+-static int smb5_property_is_writable(struct power_supply *psy,
+-				     enum power_supply_property psp)
+-{
+-	switch (psp) {
+-	case POWER_SUPPLY_PROP_CURRENT_MAX:
+-		return 1;
+-	default:
+-		return 0;
+-	}
+-}
+-
+-static irqreturn_t smb5_handle_batt_overvoltage(int irq, void *data)
+-{
+-	struct smb5_chip *chip = data;
+-	unsigned int status;
+-
+-	regmap_read(chip->regmap, chip->base + BATTERY_CHARGER_STATUS_2,
+-		    &status);
+-
+-	if (status & CHARGER_ERROR_STATUS_BAT_OV_BIT) {
+-		/* The hardware stops charging automatically */
+-		dev_err(chip->dev, "battery overvoltage detected\n");
+-		power_supply_changed(chip->chg_psy);
+-	}
+-
+-	return IRQ_HANDLED;
+-}
+-
+-static irqreturn_t smb5_handle_usb_plugin(int irq, void *data)
+-{
+-	struct smb5_chip *chip = data;
+-
+-	power_supply_changed(chip->chg_psy);
+-
+-	schedule_delayed_work(&chip->status_change_work,
+-			      msecs_to_jiffies(1500));
+-
+-	return IRQ_HANDLED;
+-}
+-
+-static irqreturn_t smb5_handle_usb_icl_change(int irq, void *data)
+-{
+-	struct smb5_chip *chip = data;
+-
+-	power_supply_changed(chip->chg_psy);
+-
+-	return IRQ_HANDLED;
+-}
+-
+-static irqreturn_t smb5_handle_wdog_bark(int irq, void *data)
+-{
+-	struct smb5_chip *chip = data;
+-	int rc;
+-
+-	power_supply_changed(chip->chg_psy);
+-
+-	rc = regmap_write(chip->regmap, BARK_BITE_WDOG_PET,
+-			  BARK_BITE_WDOG_PET_BIT);
+-	if (rc < 0)
+-		dev_err(chip->dev, "Couldn't pet the dog rc=%d\n", rc);
+-
+-	return IRQ_HANDLED;
+-}
+-
+-static const struct power_supply_desc smb5_psy_desc = {
+-	.name = "pmi8998_charger",
+-	.type = POWER_SUPPLY_TYPE_USB,
+-	.usb_types = BIT(POWER_SUPPLY_USB_TYPE_SDP) |
+-		     BIT(POWER_SUPPLY_USB_TYPE_CDP) |
+-		     BIT(POWER_SUPPLY_USB_TYPE_DCP) |
+-		     BIT(POWER_SUPPLY_USB_TYPE_UNKNOWN),
+-	.properties = smb5_properties,
+-	.num_properties = ARRAY_SIZE(smb5_properties),
+-	.get_property = smb5_get_property,
+-	.set_property = smb5_set_property,
+-	.property_is_writeable = smb5_property_is_writable,
+-};
+-
+-/* Init sequence derived from vendor downstream driver */
+-static const struct smb5_register smb5_init_seq[] = {
+-	{ .addr = USBIN_CMD_IL, .mask = USBIN_SUSPEND_BIT, .val = 0 },
+-	{ .addr = AICL_RERUN_TIME_CFG, .mask = AICL_RERUN_TIME_MASK, .val = 0 },
+-	/*
+-	 * By default configure us as an upstream facing port
+-	 * FIXME: This will be handled by the type-c driver
+-	 */
+-	{ .addr = TYPE_C_MODE_CFG,
+-	  .mask = EN_TRY_SNK_BIT | EN_SNK_ONLY_BIT,
+-	  .val = EN_TRY_SNK_BIT },
+-	{ .addr = TYPEC_TYPE_C_VCONN_CONTROL,
+-	  .mask = VCONN_EN_ORIENTATION_BIT | VCONN_EN_SRC_BIT |
+-		  VCONN_EN_VALUE_BIT,
+-	  .val = VCONN_EN_SRC_BIT },
+-	{ .addr = DEBUG_ACCESS_SRC_CFG,
+-	  .mask = EN_UNORIENTED_DEBUG_ACCESS_SRC_BIT,
+-	  .val = EN_UNORIENTED_DEBUG_ACCESS_SRC_BIT },
+-	{ .addr = TYPE_C_EXIT_STATE_CFG,
+-	  .mask = SEL_SRC_UPPER_REF_BIT,
+-	  .val = SEL_SRC_UPPER_REF_BIT },
+-	/*
+-	 * Disable Type-C factory mode and stay in Attached.SRC state when VCONN
+-	 * over-current happens
+-	 */
+-	{ .addr = TYPE_C_CFG,
+-	  .mask = BC1P2_START_ON_CC_BIT,
+-	  .val = 0 },
+-	{ .addr = TYPE_C_DEBUG_ACCESS_SINK,
+-	  .mask = TYPEC_DEBUG_ACCESS_SINK_MASK,
+-	  .val = 0x17 },
+-	/* Configure VBUS for software control */
+-	{ .addr = OTG_CFG, .mask = OTG_EN_SRC_CFG_BIT, .val = 0 },
+-	/*
+-	 * Use VBAT to determine the recharge threshold when battery is full
+-	 * rather than the state of charge.
+-	 */
+-	{ .addr = CHARGE_RCHG_SOC_THRESHOLD_CFG_REG,
+-	  .mask = CHARGE_RCHG_SOC_THRESHOLD_CFG_MASK,
+-	  .val = 98 },
+-	/* Enable charging */
+-	{ .addr = CHARGING_ENABLE_CMD,
+-	  .mask = CHARGING_ENABLE_CMD_BIT,
+-	  .val = CHARGING_ENABLE_CMD_BIT },
+-	/* Enable BC1P2 Src detect */
+-	{ .addr = USBIN_OPTIONS_1_CFG,
+-	  .mask = BC1P2_SRC_DETECT_BIT,
+-	  .val = BC1P2_SRC_DETECT_BIT },
+-	/* Set the default SDP charger type to a 500ma USB 2.0 port */
+-	{ .addr = USBIN_ICL_OPTIONS,
+-	  .mask = USBIN_MODE_CHG_BIT,
+-	  .val = USBIN_MODE_CHG_BIT },
+-	{ .addr = CMD_ICL_OVERRIDE,
+-	  .mask = ICL_OVERRIDE_BIT,
+-	  .val = 0 },
+-	{ .addr = USBIN_LOAD_CFG,
+-	  .mask = ICL_OVERRIDE_AFTER_APSD_BIT,
+-	  .val = 0 },
+-	/* Disable watchdog */
+-	{ .addr = SNARL_BARK_BITE_WD_CFG, .mask = 0xff, .val = 0 },
+-	{ .addr = WD_CFG,
+-	  .mask = WATCHDOG_TRIGGER_AFP_EN_BIT | WDOG_TIMER_EN_ON_PLUGIN_BIT |
+-		  BARK_WDOG_INT_EN_BIT,
+-	  .val = 0 },
+-	/*
+-	 * Enable Automatic Input Current Limit, this will slowly ramp up the current
+-	 * When connected to a wall charger, and automatically stop when it detects
+-	 * the charger current limit (voltage drop?) or it reaches the programmed limit.
+-	 */
+-	{ .addr = USBIN_AICL_OPTIONS_CFG,
+-	  .mask = USBIN_AICL_PERIODIC_RERUN_EN_BIT | USBIN_AICL_ADC_EN_BIT
+-			| USBIN_AICL_EN_BIT | SUSPEND_ON_COLLAPSE_USBIN_BIT,
+-	  .val = USBIN_AICL_PERIODIC_RERUN_EN_BIT | USBIN_AICL_ADC_EN_BIT
+-			| USBIN_AICL_EN_BIT | SUSPEND_ON_COLLAPSE_USBIN_BIT },
+-};
+-
+-static int smb5_init_hw(struct smb5_chip *chip)
+-{
+-	int rc, i;
+-	for (i = 0; i < ARRAY_SIZE(smb5_init_seq); i++) {
+-		dev_dbg(chip->dev, "%d: Writing 0x%02x to 0x%02x\n", i,
+-			smb5_init_seq[i].val, smb5_init_seq[i].addr);
+-		rc = regmap_update_bits(chip->regmap,
+-					chip->base + smb5_init_seq[i].addr,
+-					smb5_init_seq[i].mask,
+-					smb5_init_seq[i].val);
+-		if (rc < 0)
+-			return dev_err_probe(chip->dev, rc,
+-					     "%s: init command %d failed\n",
+-					     __func__, i);
+-	}
+-	return 0;
+-}
+-
+-static int smb5_init_irq(struct smb5_chip *chip, int *irq, const char *name,
+-			 irqreturn_t (*handler)(int irq, void *data))
+-{
+-	int irqnum;
+-	int rc;
+-
+-	irqnum = platform_get_irq_byname(to_platform_device(chip->dev), name);
+-	if (irqnum < 0)
+-		return irqnum;
+-
+-	rc = devm_request_threaded_irq(chip->dev, irqnum, NULL, handler,
+-				       IRQF_ONESHOT, name, chip);
+-	if (rc < 0)
+-		return dev_err_probe(chip->dev, rc, "Couldn't request irq %s\n",
+-				     name);
+-
+-	if (irq)
+-		*irq = irqnum;
+-
+-	return 0;
+-}
+-
+-static int smb5_probe(struct platform_device *pdev)
+-{
+-	struct power_supply_config supply_config = {};
+-	struct power_supply_desc *desc;
+-	struct smb5_chip *chip;
+-	int rc, irq;
+-
+-	chip = devm_kzalloc(&pdev->dev, sizeof(*chip), GFP_KERNEL);
+-	if (!chip)
+-		return -ENOMEM;
+-
+-	chip->dev = &pdev->dev;
+-	chip->name = pdev->name;
+-
+-	chip->regmap = dev_get_regmap(pdev->dev.parent, NULL);
+-	if (!chip->regmap)
+-		return dev_err_probe(chip->dev, -ENODEV,
+-				     "failed to locate the regmap\n");
+-
+-	rc = device_property_read_u32(chip->dev, "reg", &chip->base);
+-	if (rc < 0)
+-		return dev_err_probe(chip->dev, rc,
+-				     "Couldn't read base address\n");
+-
+-	chip->usb_in_v_chan = devm_iio_channel_get(chip->dev, "usb_in_v_div_16");
+-	if (IS_ERR(chip->usb_in_v_chan))
+-		return dev_err_probe(chip->dev, PTR_ERR(chip->usb_in_v_chan),
+-				     "Couldn't get usb_in_v_div_16 IIO channel\n");
+-
+-	chip->usb_in_i_chan = devm_iio_channel_get(chip->dev, "usb_in_i_uv");
+-	if (IS_ERR(chip->usb_in_i_chan)) {
+-		return dev_err_probe(chip->dev, PTR_ERR(chip->usb_in_i_chan),
+-				     "Couldn't get usb_in_i_uv IIO channel\n");
+-	}
+-
+-	rc = smb5_init_hw(chip);
+-	if (rc < 0)
+-		return rc;
+-
+-	supply_config.drv_data = chip;
+-	supply_config.fwnode = dev_fwnode(&pdev->dev);
+-
+-	desc = devm_kzalloc(chip->dev, sizeof(smb5_psy_desc), GFP_KERNEL);
+-	if (!desc)
+-		return -ENOMEM;
+-	memcpy(desc, &smb5_psy_desc, sizeof(smb5_psy_desc));
+-	desc->name =
+-		devm_kasprintf(chip->dev, GFP_KERNEL, "%s-charger",
+-			       (const char *)device_get_match_data(chip->dev));
+-	if (!desc->name)
+-		return -ENOMEM;
+-
+-	chip->chg_psy =
+-		devm_power_supply_register(chip->dev, desc, &supply_config);
+-	if (IS_ERR(chip->chg_psy))
+-		return dev_err_probe(chip->dev, PTR_ERR(chip->chg_psy),
+-				     "failed to register power supply\n");
+-
+-	rc = power_supply_get_battery_info(chip->chg_psy, &chip->batt_info);
+-	if (rc)
+-		return dev_err_probe(chip->dev, rc,
+-				     "Failed to get battery info\n");
+-
+-	rc = devm_delayed_work_autocancel(chip->dev, &chip->status_change_work,
+-					  smb5_status_change_work);
+-	if (rc)
+-		return dev_err_probe(chip->dev, rc,
+-				     "Failed to init status change work\n");
+-
+-	rc = clamp(chip->batt_info->voltage_max_design_uv, 3600000, 4450000);
+-	rc = (rc - 3600000) / 10000;
+-	rc = regmap_update_bits(chip->regmap, chip->base + FLOAT_VOLTAGE_CFG,
+-				FLOAT_VOLTAGE_SETTING_MASK, rc);
+-	if (rc < 0)
+-		return dev_err_probe(chip->dev, rc, "Couldn't set vbat max\n");
+-
+-	rc = chip->batt_info->constant_charge_current_max_ua;
+-	if (rc <= 0)
+-		rc = min(chip->batt_info->charge_full_design_uah / 2, 3000000);
+-	rc = regmap_update_bits(chip->regmap,
+-				chip->base + FAST_CHARGE_CURRENT_CFG,
+-				FAST_CHARGE_CURRENT_SETTING_MASK, rc / 50000);
+-	if (rc < 0)
+-		return dev_err_probe(chip->dev, rc, "Couldn't set charge current\n");
+-
+-	rc = smb5_init_irq(chip, &irq, "bat-ov", smb5_handle_batt_overvoltage);
+-	if (rc < 0)
+-		return rc;
+-
+-	rc = smb5_init_irq(chip, &chip->cable_irq, "usbin-plugin",
+-			   smb5_handle_usb_plugin);
+-	if (rc < 0)
+-		return rc;
+-
+-	rc = smb5_init_irq(chip, &irq, "usbin-icl-change",
+-			   smb5_handle_usb_icl_change);
+-	if (rc < 0)
+-		return rc;
+-	rc = smb5_init_irq(chip, &irq, "wdog-bark", smb5_handle_wdog_bark);
+-	if (rc < 0)
+-		return rc;
+-
+-	rc = dev_pm_set_wake_irq(chip->dev, chip->cable_irq);
+-	if (rc < 0)
+-		return dev_err_probe(chip->dev, rc, "Couldn't set wake irq\n");
+-
+-	platform_set_drvdata(pdev, chip);
+-
+-	/* Initialise charger state */
+-	schedule_delayed_work(&chip->status_change_work, 0);
+-
+-	return 0;
+-}
+-
+-static const struct of_device_id smb5_match_id_table[] = {
+-	{ .compatible = "qcom,pm8150b-charger", .data = "pm8150b" },
+-	{ /* sentinal */ }
+-};
+-MODULE_DEVICE_TABLE(of, smb5_match_id_table);
+-
+-static struct platform_driver qcom_spmi_smb5 = {
+-	.probe = smb5_probe,
+-	.driver = {
+-		.name = "qcom-pm8150b-charger",
+-		.of_match_table = smb5_match_id_table,
+-		},
+-};
+-
+-module_platform_driver(qcom_spmi_smb5);
+-
+-MODULE_AUTHOR("Caleb Connolly <caleb.connolly@linaro.org>");
+-MODULE_DESCRIPTION("Qualcomm SMB5 Charger Driver");
+-MODULE_LICENSE("GPL");
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (c) 2024, Teguh Sobirin <teguh@sobir.in>.
++ *
++ * This driver is for the switch-mode battery charger power delivery
++ * and boost hardware found in pm8150b and related PMICs.
++ * This work based on pmi8998 charger driver by 
++ * Caleb Connolly <caleb.connolly@linaro.org>
++ * Should be merged with the existing charger driver in the future.
++ */
++
++#include <linux/bits.h>
++#include <linux/delay.h>
++#include <linux/devm-helpers.h>
++#include <linux/iio/consumer.h>
++#include <linux/interrupt.h>
++#include <linux/kernel.h>
++#include <linux/minmax.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/platform_device.h>
++#include <linux/pm_wakeirq.h>
++#include <linux/suspend.h>
++#include <linux/property.h>
++#include <linux/of.h>
++#include <linux/power_supply.h>
++#include <linux/regmap.h>
++#include <linux/types.h>
++#include <linux/workqueue.h>
++
++/* clang-format off */
++#define BATTERY_CHARGER_STATUS_1			0x06
++#define ICL_INCR_REQ_FOR_PRECHG_BIT			BIT(7)
++#define ZERO_CHARGE_CURRENT_BIT				BIT(6)
++#define STEP_CHARGING_STATUS_SHIFT			3
++#define STEP_CHARGING_STATUS_MASK			GENMASK(5, 3)
++#define BATTERY_CHARGER_STATUS_MASK			GENMASK(2, 0)
++
++#define BATTERY_CHARGER_STATUS_2			0x07
++#define DROP_IN_BATTERY_VOLTAGE_REFERENCE_BIT		BIT(7)
++#define VBATT_LTET_RECHARGE_BIT				BIT(6)
++#define VBATT_GTET_INHIBIT_BIT				BIT(5)
++#define VBATT_GTET_FLOAT_VOLTAGE_BIT			BIT(4)
++#define BATT_GT_FULL_ON_BIT				BIT(3)
++#define CHARGER_ERROR_STATUS_SFT_EXPIRE_BIT		BIT(2)
++#define CHARGER_ERROR_STATUS_BAT_OV_BIT			BIT(1)
++#define CHARGER_ERROR_STATUS_BAT_TERM_MISSING_BIT	BIT(0)
++
++#define BATTERY_CHARGER_STATUS_4		0x0A
++#define CHARGE_CURRENT_REFERENCE_MASK		GENMASK(7, 0)
++
++#define BATTERY_CHARGER_STATUS_7_REG		0x0D
++#define BAT_TEMP_STATUS_SOFT_LIMIT_MASK		GENMASK(5, 4)
++#define BAT_TEMP_STATUS_HOT_SOFT_BIT		BIT(5)
++#define BAT_TEMP_STATUS_COLD_SOFT_BIT		BIT(4)
++#define BAT_TEMP_STATUS_HARD_LIMIT_MASK		GENMASK(3, 2)
++#define BAT_TEMP_STATUS_TOO_HOT_BIT		BIT(3)
++#define BAT_TEMP_STATUS_TOO_COLD_BIT		BIT(2)
++#define BAT_TEMP_STATUS_TOO_HOT_AFP_BIT		BIT(1)
++#define BAT_TEMP_STATUS_TOO_COLD_AFP_BIT	BIT(0)
++
++#define CHARGING_ENABLE_CMD			0x42
++#define CHARGING_ENABLE_CMD_BIT			BIT(0)
++#define CHARGING_ENABLE_POF_BIT			BIT(1)
++
++#define CHGR_CFG2				0x51
++#define EN_FAVOR_IN_BIT				BIT(5)
++#define BAT_OV_ECC_BIT				BIT(4)
++#define I_TERM_BIT				BIT(3)
++#define AUTO_RECHG_BIT				BIT(2)
++#define SOC_BASED_RECHG_BIT			BIT(1)
++#define CHARGER_INHIBIT_BIT			BIT(0)
++
++#define PRE_CHARGE_CURRENT_CFG			0x60
++#define PRE_CHARGE_CURRENT_SETTING_MASK		GENMASK(2, 0)
++
++#define FAST_CHARGE_CURRENT_CFG			0x61
++#define FAST_CHARGE_CURRENT_SETTING_MASK	GENMASK(7, 0)
++
++#define BATTERY_CHARGER_STATUS_8			0x0e
++#define PRE_TERM_BIT				BIT(2)
++
++#define TCCC_CHARGE_CURRENT_TERMINATION_CFG	0x63
++#define TCCC_CHARGE_CURRENT_TERMINATION_MASK	GENMASK(3, 0)
++
++#define FLOAT_VOLTAGE_CFG			0x70
++#define FLOAT_VOLTAGE_SETTING_MASK		GENMASK(7, 0)
++#define FLOAT_VOLTAGE_MIN_UV			3600000
++#define FLOAT_VOLTAGE_MAX_UV			4790000
++#define FLOAT_VOLTAGE_STEP_UV			10000
++
++#define CHARGE_RCHG_SOC_THRESHOLD_CFG_REG	0x7D
++#define CHARGE_RCHG_SOC_THRESHOLD_CFG_MASK	GENMASK(7, 0)
++
++#define ICL_STATUS				0x107
++#define ICL_INPUT_CURRENT_LIMIT_MASK		GENMASK(7, 0)
++
++#define AICL_STATUS				0x108
++#define AICL_INPUT_CURRENT_LIMIT_MASK		GENMASK(7, 0)
++
++#define POWER_PATH_STATUS				0x10B
++#define P_PATH_INPUT_SS_DONE_BIT			BIT(7)
++#define P_PATH_USBIN_SUSPEND_STS_BIT			BIT(6)
++#define P_PATH_DCIN_SUSPEND_STS_BIT			BIT(5)
++#define P_PATH_USE_USBIN_BIT				BIT(4)
++#define P_PATH_USE_DCIN_BIT				BIT(3)
++#define P_PATH_POWER_PATH_MASK				GENMASK(2, 1)
++#define P_PATH_VALID_INPUT_POWER_SOURCE_STS_BIT		BIT(0)
++
++#define OTG_CFG					0x153
++#define OTG_RESERVED_BIT			BIT(7)
++#define FAST_ROLE_SWAP_START_OPTION_BIT		BIT(6)
++#define DIS_OTG_ON_TSD_BIT			BIT(5)
++#define OTG_CFG_4_BIT				BIT(4)
++#define EN_SOC_BASED_OTG_UVLO_BIT		BIT(3)
++#define ENABLE_OTG_IN_DEBUG_MODE_BIT		BIT(2)
++#define OTG_EN_SRC_CFG_BIT			BIT(1)
++#define OTG_HICCUP_CNTR_RST_TIMER_SEL_BIT	BIT(0)
++
++#define APSD_STATUS				0x307
++#define APSD_STATUS_7_BIT			BIT(7)
++#define HVDCP_CHECK_TIMEOUT_BIT			BIT(6)
++#define SLOW_PLUGIN_TIMEOUT_BIT			BIT(5)
++#define ENUMERATION_DONE_BIT			BIT(4)
++#define VADP_CHANGE_DONE_AFTER_AUTH_BIT		BIT(3)
++#define QC_AUTH_DONE_STATUS_BIT			BIT(2)
++#define QC_CHARGER_BIT				BIT(1)
++#define APSD_DTC_STATUS_DONE_BIT		BIT(0)
++
++#define APSD_RESULT_STATUS			0x308
++#define APSD_RESULT_STATUS_7_BIT		BIT(7)
++#define APSD_RESULT_STATUS_MASK			GENMASK(6, 0)
++#define QC_3P0_BIT				BIT(6)
++#define QC_2P0_BIT				BIT(5)
++#define FLOAT_CHARGER_BIT			BIT(4)
++#define DCP_CHARGER_BIT				BIT(3)
++#define CDP_CHARGER_BIT				BIT(2)
++#define OCP_CHARGER_BIT				BIT(1)
++#define SDP_CHARGER_BIT				BIT(0)
++
++#define USBIN_INT_RT_STS_OFFSET			0x310
++#define USBIN_PLUGIN_RT_STS_BIT			BIT(4)
++
++#define USBIN_CMD_IL				0x340
++#define USBIN_SUSPEND_BIT			BIT(0)
++
++#define CMD_APSD				0x341
++#define APSD_RERUN_BIT				BIT(0)
++
++#define CMD_ICL_OVERRIDE			0x342
++#define ICL_OVERRIDE_BIT			BIT(0)
++
++#define TYPE_C_CFG				0x358
++#define BC1P2_START_ON_CC_BIT			BIT(7)
++
++#define HVDCP_PULSE_COUNT_MAX			0x35b
++#define HVDCP_PULSE_COUNT_MAX_QC2_MASK		GENMASK(7, 6)
++
++#define USBIN_ADAPTER_ALLOW_CFG			0x360
++#define USBIN_ADAPTER_ALLOW_MASK		GENMASK(3, 0)
++
++#define USBIN_OPTIONS_1_CFG			0x362
++#define HVDCP_AUTH_ALG_EN_CFG_BIT		BIT(6)
++#define HVDCP_AUTONOMOUS_MODE_EN_CFG_BIT	BIT(5)
++#define BC1P2_SRC_DETECT_BIT			BIT(3)
++#define HVDCP_EN_BIT				BIT(2)
++#define HVDCP_NO_AUTH_QC3_CFG_BIT		BIT(1)
++
++#define USBIN_LOAD_CFG				0x365
++#define ICL_OVERRIDE_AFTER_APSD_BIT		BIT(4)
++#define USBIN_AICL_STEP_TIMING_SEL_MASK		GENMASK(3, 2)
++#define USBIN_IN_COLLAPSE_GF_SEL_MASK		GENMASK(1, 0)
++
++#define USBIN_ICL_OPTIONS			0x366
++#define CFG_USB3P0_SEL_BIT			BIT(2)
++#define USB51_MODE_BIT				BIT(1)
++#define USBIN_MODE_CHG_BIT			BIT(0)
++
++#define USBIN_CURRENT_LIMIT_CFG			0x370
++#define USBIN_CURRENT_LIMIT_MASK		GENMASK(7, 0)
++
++#define USBIN_AICL_OPTIONS_CFG			0x380
++#define SUSPEND_ON_COLLAPSE_USBIN_BIT		BIT(7)
++#define USBIN_AICL_PERIODIC_RERUN_EN_BIT	BIT(4)
++#define USBIN_AICL_ADC_EN_BIT			BIT(3)
++#define USBIN_AICL_EN_BIT			BIT(2)
++
++#define USBIN_5V_AICL_THRESHOLD_CFG		0x381
++#define USBIN_5V_AICL_THRESHOLD_CFG_MASK	GENMASK(2, 0)
++
++#define USBIN_CONT_AICL_THRESHOLD_CFG		0x384
++#define USBIN_CONT_AICL_THRESHOLD_CFG_MASK	GENMASK(5, 0)
++
++#define DCIN_CMD_IL				0x440
++#define DCIN_SUSPEND_BIT			BIT(0)
++
++#define TYPE_C_SNK_STATUS			0x506
++#define TYPE_C_MISC_STATUS			0x50b
++#define TYPEC_SNK_SRC_MODE_BIT			BIT(6)
++#define DETECTED_SRC_TYPE_MASK			GENMASK(6, 0)
++#define SNK_RP_STD_DAM_BIT			BIT(6)
++#define SNK_RP_1P5_DAM_BIT			BIT(5)
++#define SNK_RP_3P0_DAM_BIT			BIT(4)
++#define SNK_DAM_MASK				GENMASK(6, 4)
++#define SNK_DAM_500MA_BIT			BIT(6)
++#define SNK_DAM_1500MA_BIT			BIT(5)
++#define SNK_DAM_3000MA_BIT			BIT(4)
++#define SNK_RP_STD_BIT				BIT(3)
++#define SNK_RP_1P5_BIT				BIT(2)
++#define SNK_RP_3P0_BIT				BIT(1)
++#define SNK_RP_SHORT_BIT			BIT(0)
++
++#define TYPE_C_MODE_CFG				0x544
++#define TYPEC_TRY_MODE_MASK			GENMASK(4, 3)
++#define EN_TRY_SNK_BIT				BIT(4)
++#define EN_TRY_SRC_BIT				BIT(3)
++#define TYPEC_POWER_ROLE_CMD_MASK		GENMASK(2, 0)
++#define EN_SRC_ONLY_BIT				BIT(2)
++#define EN_SNK_ONLY_BIT				BIT(1)
++#define TYPEC_DISABLE_CMD_BIT			BIT(0)
++
++#define TYPEC_TYPE_C_VCONN_CONTROL		0x546
++#define VCONN_EN_ORIENTATION_BIT		BIT(2)
++#define VCONN_EN_VALUE_BIT			BIT(1)
++#define VCONN_EN_SRC_BIT			BIT(0)
++
++#define TYPE_C_DEBUG_ACCESS_SINK		0x54a
++#define TYPEC_DEBUG_ACCESS_SINK_MASK		GENMASK(4, 0)
++
++#define DEBUG_ACCESS_SRC_CFG			0x54C
++#define EN_UNORIENTED_DEBUG_ACCESS_SRC_BIT	BIT(0)
++
++#define TYPE_C_EXIT_STATE_CFG			0x550
++#define BYPASS_VSAFE0V_DURING_ROLE_SWAP_BIT	BIT(3)
++#define SEL_SRC_UPPER_REF_BIT			BIT(2)
++#define EXIT_SNK_BASED_ON_CC_BIT		BIT(0)
++
++#define TYPE_C_INTERRUPT_EN_CFG_1			0x55e
++#define TYPEC_LEGACY_CABLE_INT_EN_BIT			BIT(7)
++#define TYPEC_NONCOMPLIANT_LEGACY_CABLE_INT_EN_BIT	BIT(6)
++#define TYPEC_TRYSOURCE_DETECT_INT_EN_BIT		BIT(5)
++#define TYPEC_TRYSINK_DETECT_INT_EN_BIT			BIT(4)
++#define TYPEC_CCOUT_DETACH_INT_EN_BIT			BIT(3)
++#define TYPEC_CCOUT_ATTACH_INT_EN_BIT			BIT(2)
++#define TYPEC_VBUS_DEASSERT_INT_EN_BIT			BIT(1)
++#define TYPEC_VBUS_ASSERT_INT_EN_BIT			BIT(0)
++
++#define BARK_BITE_WDOG_PET			0x643
++#define BARK_BITE_WDOG_PET_BIT			BIT(0)
++
++#define WD_CFG					0x651
++#define WATCHDOG_TRIGGER_AFP_EN_BIT		BIT(7)
++#define BARK_WDOG_INT_EN_BIT			BIT(6)
++#define BITE_WDOG_INT_EN_BIT			BIT(5)
++#define SFT_AFTER_WDOG_IRQ_MASK			GENMASK(4, 3)
++#define WDOG_IRQ_SFT_BIT			BIT(2)
++#define WDOG_TIMER_EN_ON_PLUGIN_BIT		BIT(1)
++#define WDOG_TIMER_EN_BIT			BIT(0)
++
++#define SNARL_BARK_BITE_WD_CFG			0x653
++#define BITE_WDOG_DISABLE_CHARGING_CFG_BIT	BIT(7)
++#define SNARL_WDOG_TIMEOUT_MASK			GENMASK(6, 4)
++#define BARK_WDOG_TIMEOUT_MASK			GENMASK(3, 2)
++#define BITE_WDOG_TIMEOUT_MASK			GENMASK(1, 0)
++/* Vendor setting: snarl 8 s, bark 64 s, bite 8 s later, bite stops charging */
++#define WDOG_POLICY_CFG				(BITE_WDOG_DISABLE_CHARGING_CFG_BIT | \
++						 0x70 | (2 << 2) | 0x3)
++
++#define AICL_RERUN_TIME_CFG			0x661
++#define AICL_RERUN_TIME_MASK			GENMASK(1, 0)
++
++#define SDP_CURRENT_UA			500000
++#define CDP_CURRENT_UA			1500000
++#define DCP_CURRENT_UA			1500000
++#define CURRENT_MAX_UA			3000000
++#define FAST_CHARGE_CURRENT_MAX_UA		8000000
++#define APSD_MAX_RETRIES			3
++
++/* PM8150B current registers use 50 mA steps. */
++#define CURRENT_SCALE_FACTOR		50000
++/* clang-format on */
++
++/* BATTERY_CHARGER_STATUS_1 charger states, as in the vendor smb5 headers. */
++enum charger_status {
++	INHIBIT_CHARGE = 0,
++	TRICKLE_CHARGE,
++	PRE_CHARGE,
++	FULLON_CHARGE,
++	TAPER_CHARGE,
++	TERMINATE_CHARGE,
++	PAUSE_CHARGE,
++	DISABLE_CHARGE,
++};
++
++/*
++ * Charging policy of the stock OnePlus 8 Pro firmware (oplus_chg with an
++ * external fuel gauge), used when the device tree names a fuel gauge.
++ *
++ * The PM8150B float voltage is set above the level at which the cell is
++ * full, because the charger senses the battery behind the charge path. The
++ * fuel gauge at the cell decides when the battery is full and stops the
++ * charger. Limits depend on the battery temperature. All values are those
++ * of the stock device tree (kona-mtp.dtsi of instantnoodlep); temperatures
++ * are in 0.1 degC. Where this differs from stock it is stricter.
++ */
++struct smb5_temp_zone {
++	int min_dc;		/* lower bound of the zone */
++	int fv_uv;		/* PM8150B float voltage */
++	int fcc_ua;		/* fast charge current */
++	int full_uv;		/* cell voltage for "full" at low current */
++	int over_uv;		/* cell voltage that lowers the float voltage */
++	int recharge_uv;	/* recharge this far below the float voltage */
++};
++
++static const struct smb5_temp_zone smb5_zones[] = {
++	{ -20, 3980000,  300000, 3980000, 3990000, 400000 },	/* cold */
++	{   0, 4435000, 1200000, 4385000, 4445000, 300000 },	/* little cold */
++	{  50, 4435000, 2000000, 4385000, 4445000, 200000 },	/* cool */
++	{ 120, 4435000, 2000000, 4385000, 4445000, 200000 },	/* little cool */
++	{ 160, 4435000, 2000000, 4385000, 4445000, 200000 },	/* normal */
++	{ 450, 4130000, 1100000, 4080000, 4140000, 200000 },	/* warm */
++};
++
++#define ZONE_NONE			-2
++#define ZONE_TOO_COLD			-1
++#define ZONE_COLD			0
++#define ZONE_NORMAL			4
++#define ZONE_WARM			5
++#define ZONE_TOO_HOT			6
++#define POLICY_HOT_DC			500	/* no charging above 50 degC */
++#define POLICY_HYST_DC			20
++#define POLICY_INTERVAL			(5 * HZ)
++/* Stock limits for a battery the gauge cannot vouch for */
++#define POLICY_FALLBACK_FV_UV		3980000
++#define POLICY_FALLBACK_FCC_UA		500000
++#define POLICY_ITERM_UA			230000
++#define POLICY_SW_FULL_COUNT		5
++#define POLICY_HW_FULL_COUNT		4
++#define POLICY_HW_FULL_INC_UV		18000
++#define POLICY_RECHARGE_COUNT		4
++#define POLICY_OVER_COUNT		2
++#define POLICY_FV_STEP_UV		8000
++#define POLICY_OVP_MARGIN_UV		10000
++/*
++ * Without the PMIC fuel gauge the PM8150B has no battery current for its
++ * termination check and ends each charge cycle after a few seconds in
++ * constant voltage. The cycle is restarted while the cell, measured by the
++ * gauge with no current flowing, is this far below the stock full level.
++ * Stock ends at that level with 230 mA still flowing, so its resting
++ * voltage is lower than the level itself.
++ */
++#define POLICY_REST_MARGIN_UV		35000
++/* Not in stock: stop at once this far above the over-voltage limit */
++#define POLICY_HARD_STOP_UV		15000
++
++struct smb5_register {
++	u16 addr;
++	u8 mask;
++	u8 val;
++};
++
++/**
++ * struct smb5_chip - smb5 chip structure
++ * @dev:		Device reference for power_supply
++ * @name:		The platform device name
++ * @base:		Base address for smb5 registers
++ * @regmap:		Register map
++ * @batt_info:		Battery data from DT
++ * @status_change_work: Worker to handle plug/unplug events
++ * @cable_irq:		USB plugin IRQ
++ * @wakeup_enabled:	If the cable IRQ will cause a wakeup
++ * @usb_in_i_chan:	USB_IN current measurement channel
++ * @usb_in_v_chan:	USB_IN voltage measurement channel
++ * @chg_psy:		Charger power supply instance
++ */
++struct smb5_chip {
++	struct device *dev;
++	const char *name;
++	unsigned int base;
++	struct regmap *regmap;
++	struct power_supply_battery_info *batt_info;
++
++	struct delayed_work status_change_work;
++	int cable_irq;
++	bool wakeup_enabled;
++
++	struct iio_channel *usb_in_i_chan;
++	struct iio_channel *usb_in_v_chan;
++
++	struct power_supply *chg_psy;
++	struct mutex lock;
++	bool ready;
++	bool has_tcpm;
++	bool apsd_started;
++	unsigned int apsd_retries;
++	unsigned int user_current_limit;
++	unsigned int source_current_limit;
++	enum power_supply_usb_type usb_type;
++
++	/* Charging policy driven by the external fuel gauge */
++	bool policy;
++	struct delayed_work policy_work;
++	struct power_supply *gauge;
++	struct notifier_block pm_nb;
++	bool gauge_ok;
++	bool suspended;
++	bool charging;
++	bool user_charge_enable;
++	bool policy_charge_enable;
++	bool batt_full;
++	int zone;
++	int fv_set_uv;
++	int sw_full_count;
++	int hw_full_count;
++	int recharge_count;
++	int over_count;
++	int rest_count;
++};
++
++static enum power_supply_property smb5_properties[] = {
++	POWER_SUPPLY_PROP_MANUFACTURER,
++	POWER_SUPPLY_PROP_MODEL_NAME,
++	POWER_SUPPLY_PROP_CURRENT_MAX,
++	POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT,
++	POWER_SUPPLY_PROP_CURRENT_NOW,
++	POWER_SUPPLY_PROP_VOLTAGE_NOW,
++	POWER_SUPPLY_PROP_STATUS,
++	POWER_SUPPLY_PROP_HEALTH,
++	POWER_SUPPLY_PROP_ONLINE,
++	POWER_SUPPLY_PROP_USB_TYPE,
++	POWER_SUPPLY_PROP_CHARGING_ENABLED,
++};
++
++static int smb5_get_prop_usb_online(struct smb5_chip *chip, int *val)
++{
++	unsigned int stat;
++	int rc;
++
++	rc = regmap_read(chip->regmap, chip->base + USBIN_INT_RT_STS_OFFSET, &stat);
++	if (rc < 0) {
++		dev_err(chip->dev, "Couldn't read USBIN_RT_STS rc=%d\n", rc);
++		return rc;
++	}
++
++	*val = (stat & USBIN_PLUGIN_RT_STS_BIT) ? 1 : 0;
++	return 0;
++}
++
++/*
++ * True when the charger sees VBUS that it did not source itself: USBIN is
++ * plugged in and the Type-C block is not in source mode.
++ */
++static bool smb5_sink_vbus_present(struct smb5_chip *chip)
++{
++	unsigned int misc;
++	int online = 0;
++
++	if (smb5_get_prop_usb_online(chip, &online) || !online)
++		return false;
++	if (regmap_read(chip->regmap, chip->base + TYPE_C_MISC_STATUS, &misc))
++		return false;
++
++	return !(misc & TYPEC_SNK_SRC_MODE_BIT);
++}
++
++/*
++ * Qualcomm "automatic power source detection" aka APSD
++ * tells us what type of charger we're connected to.
++ */
++static int smb5_apsd_get_charger_type(struct smb5_chip *chip, int *val)
++{
++	unsigned int apsd_stat, stat;
++	int usb_online = 0;
++	int rc;
++
++	rc = smb5_get_prop_usb_online(chip, &usb_online);
++	if (!usb_online) {
++		*val = POWER_SUPPLY_USB_TYPE_UNKNOWN;
++		return rc;
++	}
++
++	rc = regmap_read(chip->regmap, chip->base + APSD_STATUS, &apsd_stat);
++	if (rc < 0) {
++		dev_err(chip->dev, "Failed to read apsd status, rc = %d", rc);
++		return rc;
++	}
++	if (!(apsd_stat & APSD_DTC_STATUS_DONE_BIT)) {
++		return -EAGAIN;
++	}
++
++	rc = regmap_read(chip->regmap, chip->base + APSD_RESULT_STATUS, &stat);
++	if (rc < 0) {
++		dev_err(chip->dev, "Failed to read apsd result, rc = %d", rc);
++		return rc;
++	}
++
++	stat &= APSD_RESULT_STATUS_MASK;
++
++	switch (stat) {
++	case SDP_CHARGER_BIT:
++		*val = POWER_SUPPLY_USB_TYPE_SDP;
++		break;
++	case CDP_CHARGER_BIT:
++		*val = POWER_SUPPLY_USB_TYPE_CDP;
++		break;
++	case DCP_CHARGER_BIT:
++	case OCP_CHARGER_BIT:
++	case QC_2P0_BIT:
++	case QC_3P0_BIT:
++	case DCP_CHARGER_BIT | QC_2P0_BIT:
++	case DCP_CHARGER_BIT | QC_3P0_BIT:
++		*val = POWER_SUPPLY_USB_TYPE_DCP;
++		break;
++	default:
++		/* Empty, floating and unrecognised results are not an SDP. */
++		*val = POWER_SUPPLY_USB_TYPE_UNKNOWN;
++		break;
++	}
++
++	return 0;
++}
++
++static int smb5_get_prop_charging_enabled(struct smb5_chip *chip, int *val)
++{
++	unsigned int charging_enabled;
++	int rc = regmap_read(chip->regmap, chip->base + CHARGING_ENABLE_CMD, &charging_enabled);
++	if (rc < 0) {
++		dev_err(chip->dev, "Failed to read charging enabled status, rc = %d", rc);
++		return rc;
++	}
++	*val = charging_enabled & CHARGING_ENABLE_CMD_BIT ? 1 : 0;
++	return 0;
++}
++
++static int smb5_get_prop_status(struct smb5_chip *chip, int *val)
++{
++	unsigned char stat[2];
++	int usb_online = 0;
++	int rc;
++
++	rc = smb5_get_prop_usb_online(chip, &usb_online);
++	if (!usb_online) {
++		*val = POWER_SUPPLY_STATUS_DISCHARGING;
++		return rc;
++	}
++
++	if (chip->policy) {
++		/* The charger state flips with every restarted cycle. */
++		if (READ_ONCE(chip->batt_full))
++			*val = POWER_SUPPLY_STATUS_FULL;
++		else if (READ_ONCE(chip->charging))
++			*val = POWER_SUPPLY_STATUS_CHARGING;
++		else
++			*val = POWER_SUPPLY_STATUS_NOT_CHARGING;
++		return 0;
++	}
++
++	rc = regmap_bulk_read(chip->regmap,
++			      chip->base + BATTERY_CHARGER_STATUS_1, &stat, 2);
++	if (rc < 0) {
++		dev_err(chip->dev, "Failed to read charging status ret=%d\n",
++			rc);
++		return rc;
++	}
++
++	if (stat[1] & VBATT_GTET_INHIBIT_BIT) {
++		*val = POWER_SUPPLY_STATUS_NOT_CHARGING;
++		return 0;
++	}
++
++	stat[0] = stat[0] & BATTERY_CHARGER_STATUS_MASK;
++
++	switch (stat[0]) {
++	case TRICKLE_CHARGE:
++	case PRE_CHARGE:
++	case FULLON_CHARGE:
++	case TAPER_CHARGE:
++		*val = POWER_SUPPLY_STATUS_CHARGING;
++		return rc;
++	case PAUSE_CHARGE:
++	case DISABLE_CHARGE:
++		*val = POWER_SUPPLY_STATUS_NOT_CHARGING;
++		return rc;
++	case TERMINATE_CHARGE:
++	case INHIBIT_CHARGE:
++		*val = POWER_SUPPLY_STATUS_FULL;
++		return rc;
++	default:
++		*val = POWER_SUPPLY_STATUS_UNKNOWN;
++		return rc;
++	}
++}
++
++static inline int smb5_get_current_limit(struct smb5_chip *chip,
++					 unsigned int *val)
++{
++	int rc = regmap_read(chip->regmap, chip->base + AICL_STATUS, val);
++
++	if (rc >= 0)
++		*val *= CURRENT_SCALE_FACTOR;	
++	return rc;
++}
++
++static int smb5_set_current_limit(struct smb5_chip *chip, unsigned int val)
++{
++	unsigned char val_raw;
++
++	if (val > CURRENT_MAX_UA)
++		return -EINVAL;
++	val_raw = val / CURRENT_SCALE_FACTOR;
++
++	return regmap_write(chip->regmap, chip->base + USBIN_CURRENT_LIMIT_CFG,
++		val_raw);
++}
++
++static int smb5_set_charge_current(struct smb5_chip *chip, int current_ua)
++{
++	/* Retain the bring-up default only for boards without a battery limit. */
++	if (current_ua <= 0)
++		current_ua = 1500000;
++	if (current_ua < CURRENT_SCALE_FACTOR ||
++	    current_ua > FAST_CHARGE_CURRENT_MAX_UA)
++		return -EINVAL;
++
++	return regmap_write(chip->regmap, chip->base + FAST_CHARGE_CURRENT_CFG,
++			    current_ua / CURRENT_SCALE_FACTOR);
++}
++
++static int smb5_set_prop_charging_enabled(struct smb5_chip *chip, unsigned int val)
++{
++	return regmap_update_bits(chip->regmap, chip->base + CHARGING_ENABLE_CMD,
++					CHARGING_ENABLE_CMD_BIT, val ? CHARGING_ENABLE_CMD_BIT : 0);
++}
++
++static void smb5_queue_status_work(struct smb5_chip *chip)
++{
++	mutex_lock(&chip->lock);
++	if (chip->ready)
++		mod_delayed_work(system_wq, &chip->status_change_work, 0);
++	mutex_unlock(&chip->lock);
++}
++
++static void smb5_external_power_changed(struct power_supply *psy)
++{
++	smb5_queue_status_work(power_supply_get_drvdata(psy));
++}
++
++static int smb5_supplier_property(struct smb5_chip *chip,
++				 enum power_supply_property prop, int *value)
++{
++	union power_supply_propval val;
++	int ret;
++
++	ret = power_supply_get_property_from_supplier(chip->chg_psy, prop, &val);
++	if (!ret)
++		*value = val.intval;
++	return ret;
++}
++
++static int smb5_apply_input_limit(struct smb5_chip *chip, unsigned int current_ua,
++				 bool apsd)
++{
++	int ret;
++
++	/* Suspend before disabling input; never leave a stale large limit. */
++	if (!current_ua) {
++		ret = regmap_update_bits(chip->regmap, chip->base + USBIN_CMD_IL,
++					 USBIN_SUSPEND_BIT, USBIN_SUSPEND_BIT);
++		if (ret)
++			return ret;
++	}
++
++	ret = smb5_set_current_limit(chip, current_ua);
++	if (ret)
++		return ret;
++	ret = regmap_update_bits(chip->regmap, chip->base + USBIN_OPTIONS_1_CFG,
++				 BC1P2_SRC_DETECT_BIT, apsd ? BC1P2_SRC_DETECT_BIT : 0);
++	if (ret)
++		return ret;
++
++	/* Software high-current mode, also used by downstream for PD. */
++	ret = regmap_update_bits(chip->regmap, chip->base + USBIN_ICL_OPTIONS,
++				 USBIN_MODE_CHG_BIT, USBIN_MODE_CHG_BIT);
++	if (ret)
++		return ret;
++	ret = regmap_update_bits(chip->regmap, chip->base + CMD_ICL_OVERRIDE,
++				 ICL_OVERRIDE_BIT, 0);
++	if (ret)
++		return ret;
++	ret = regmap_update_bits(chip->regmap, chip->base + USBIN_LOAD_CFG,
++				 ICL_OVERRIDE_AFTER_APSD_BIT, ICL_OVERRIDE_AFTER_APSD_BIT);
++	if (ret)
++		return ret;
++
++	return regmap_update_bits(chip->regmap, chip->base + USBIN_CMD_IL,
++				  USBIN_SUSPEND_BIT, current_ua ? 0 : USBIN_SUSPEND_BIT);
++}
++
++static void smb5_status_change_work(struct work_struct *work)
++{
++	struct smb5_chip *chip = container_of(work, struct smb5_chip,
++					     status_change_work.work);
++	int online, type = POWER_SUPPLY_USB_TYPE_UNKNOWN, current_ua = 0;
++	int voltage_uv, ret;
++	bool apsd = false, start_apsd = false, retry = false;
++
++	mutex_lock(&chip->lock);
++	if (!chip->ready)
++		goto unlock;
++
++	if (chip->has_tcpm) {
++		ret = smb5_supplier_property(chip, POWER_SUPPLY_PROP_ONLINE, &online);
++		if (ret)
++			goto fail;
++		if (!online) {
++			chip->apsd_retries = 0;
++			goto apply;
++		}
++		ret = smb5_supplier_property(chip, POWER_SUPPLY_PROP_CURRENT_NOW,
++					     &current_ua);
++		if (ret)
++			goto fail;
++		ret = smb5_supplier_property(chip, POWER_SUPPLY_PROP_USB_TYPE, &type);
++		if (ret)
++			goto fail;
++		ret = smb5_supplier_property(chip, POWER_SUPPLY_PROP_VOLTAGE_NOW,
++					     &voltage_uv);
++		if (ret)
++			goto fail;
++
++		/* Default Rp is reported as zero when TCPM has no BC1.2 limit. */
++		if (current_ua < 0)
++			goto apply;
++		/* This board advertises only fixed 5 V PDOs. */
++		if (voltage_uv < 4500000 || voltage_uv > 5500000) {
++			ret = -ERANGE;
++			goto fail;
++		}
++		if (type == POWER_SUPPLY_USB_TYPE_PD ||
++		    type == POWER_SUPPLY_USB_TYPE_PD_PPS || current_ua > SDP_CURRENT_UA) {
++			if (type != POWER_SUPPLY_USB_TYPE_PD &&
++			    type != POWER_SUPPLY_USB_TYPE_PD_PPS)
++				type = POWER_SUPPLY_USB_TYPE_C;
++			chip->apsd_retries = 0;
++			goto apply;
++		}
++	} else {
++		ret = smb5_get_prop_usb_online(chip, &online);
++		if (ret)
++			goto fail;
++		if (!online) {
++			chip->apsd_retries = 0;
++			goto apply;
++		}
++	}
++
++	/* Default Rp or a legacy cable: start with a conservative BC1.2 limit. */
++	apsd = true;
++	current_ua = SDP_CURRENT_UA;
++	if (!chip->apsd_started) {
++		/* Ignore any result left by the previous connection or PD mode. */
++		type = POWER_SUPPLY_USB_TYPE_UNKNOWN;
++		start_apsd = true;
++		retry = true;
++		goto apply;
++	}
++
++	ret = smb5_apsd_get_charger_type(chip, &type);
++	if (ret == -EAGAIN)
++		type = POWER_SUPPLY_USB_TYPE_UNKNOWN;
++	else if (ret)
++		goto fail;
++	else if (type == POWER_SUPPLY_USB_TYPE_CDP)
++		current_ua = CDP_CURRENT_UA;
++	else if (type == POWER_SUPPLY_USB_TYPE_DCP)
++		current_ua = DCP_CURRENT_UA;
++
++	/* Also recheck early completed results; old DTs have no source-change IRQ. */
++	if (chip->apsd_retries < APSD_MAX_RETRIES) {
++		chip->apsd_retries++;
++		retry = true;
++	}
++
++apply:
++	/*
++	 * A sink may always draw pSnkStdby (2.5 W, 500 mA at 5 V). Do not cut
++	 * the input completely while an external source still supplies VBUS:
++	 * if TCPM loses track of the partner, the phone would otherwise run
++	 * from the battery until it is empty, with the charger attached.
++	 */
++	if (current_ua < SDP_CURRENT_UA && smb5_sink_vbus_present(chip)) {
++		/* Routine during attach debounce, so not worth a warning. */
++		dev_dbg(chip->dev, "VBUS present without a source limit, using %u uA\n",
++			SDP_CURRENT_UA);
++		current_ua = SDP_CURRENT_UA;
++	}
++	chip->source_current_limit = clamp(current_ua, 0, CURRENT_MAX_UA);
++	ret = smb5_apply_input_limit(chip,
++		min(chip->source_current_limit, chip->user_current_limit), apsd);
++	if (ret)
++		goto fail;
++	if (start_apsd) {
++		/* Detection must be enabled before requesting a fresh measurement. */
++		ret = regmap_update_bits(chip->regmap, chip->base + CMD_APSD,
++					 APSD_RERUN_BIT, APSD_RERUN_BIT);
++		if (ret)
++			goto fail;
++		chip->apsd_started = true;
++		chip->apsd_retries = 0;
++	} else if (!apsd) {
++		chip->apsd_started = false;
++		chip->apsd_retries = 0;
++	}
++	chip->usb_type = type;
++	if (retry)
++		mod_delayed_work(system_wq, &chip->status_change_work, HZ);
++	power_supply_changed(chip->chg_psy);
++	goto unlock;
++
++fail:
++	chip->apsd_started = false;
++	chip->apsd_retries = 0;
++	chip->usb_type = POWER_SUPPLY_USB_TYPE_UNKNOWN;
++	if (smb5_sink_vbus_present(chip)) {
++		/* Keep pSnkStdby so a flat battery is not left to carry the system. */
++		chip->source_current_limit = SDP_CURRENT_UA;
++		smb5_apply_input_limit(chip,
++			min(chip->source_current_limit, chip->user_current_limit),
++			false);
++	} else {
++		chip->source_current_limit = 0;
++		regmap_update_bits(chip->regmap, chip->base + USBIN_CMD_IL,
++				   USBIN_SUSPEND_BIT, USBIN_SUSPEND_BIT);
++	}
++	dev_err_ratelimited(chip->dev, "Unable to apply input power limit: %d\n", ret);
++	mod_delayed_work(system_wq, &chip->status_change_work, HZ);
++unlock:
++	mutex_unlock(&chip->lock);
++}
++
++static int smb5_set_float_voltage(struct smb5_chip *chip, int fv_uv)
++{
++	/* 3.6 V plus 10 mV per step, as in the vendor smb5 driver */
++	if (fv_uv < FLOAT_VOLTAGE_MIN_UV || fv_uv > FLOAT_VOLTAGE_MAX_UV)
++		return -EINVAL;
++
++	return regmap_update_bits(chip->regmap, chip->base + FLOAT_VOLTAGE_CFG,
++				  FLOAT_VOLTAGE_SETTING_MASK,
++				  (fv_uv - FLOAT_VOLTAGE_MIN_UV) / FLOAT_VOLTAGE_STEP_UV);
++}
++
++static void smb5_apply_charge_enable(struct smb5_chip *chip)
++{
++	smb5_set_prop_charging_enabled(chip, chip->user_charge_enable &&
++					     chip->policy_charge_enable &&
++					     !chip->suspended);
++}
++
++static int smb5_gauge_read(struct smb5_chip *chip, enum power_supply_property psp,
++			   int *val)
++{
++	union power_supply_propval pval;
++	int ret;
++
++	ret = power_supply_get_property(chip->gauge, psp, &pval);
++	if (!ret)
++		*val = pval.intval;
++	return ret;
++}
++
++static int smb5_zone_for_temp(int temp)
++{
++	int i;
++
++	if (temp > POLICY_HOT_DC)
++		return ZONE_TOO_HOT;
++	if (temp < smb5_zones[ZONE_COLD].min_dc)
++		return ZONE_TOO_COLD;
++	for (i = ARRAY_SIZE(smb5_zones) - 1; i > 0; i--)
++		if (temp >= smb5_zones[i].min_dc)
++			break;
++	return i;
++}
++
++/*
++ * A zone with tighter limits applies at once. Moving back towards the
++ * normal zone needs the temperature to be 2 degC inside the new zone.
++ */
++static int smb5_next_zone(struct smb5_chip *chip, int temp)
++{
++	int zone = smb5_zone_for_temp(temp);
++
++	if (chip->zone == ZONE_NONE || zone == chip->zone)
++		return zone;
++
++	if (zone > chip->zone && zone <= ZONE_NORMAL) {
++		zone = smb5_zone_for_temp(temp - POLICY_HYST_DC);
++		if (zone < chip->zone)
++			zone = chip->zone;
++	} else if (zone < chip->zone && zone >= ZONE_NORMAL) {
++		zone = smb5_zone_for_temp(temp + POLICY_HYST_DC);
++		if (zone > chip->zone)
++			zone = chip->zone;
++	}
++
++	return zone;
++}
++
++static void smb5_policy_reset(struct smb5_chip *chip)
++{
++	chip->batt_full = false;
++	chip->sw_full_count = 0;
++	chip->hw_full_count = 0;
++	chip->recharge_count = 0;
++	chip->over_count = 0;
++	chip->rest_count = 0;
++}
++
++/* Limits for a battery the fuel gauge cannot vouch for, as in stock. */
++static void smb5_policy_fallback(struct smb5_chip *chip)
++{
++	if (chip->gauge_ok || chip->zone != ZONE_NONE)
++		dev_warn(chip->dev, "no fuel gauge data, charging limited to %d uV\n",
++			 POLICY_FALLBACK_FV_UV);
++	chip->gauge_ok = false;
++	chip->zone = ZONE_NONE;
++	chip->fv_set_uv = POLICY_FALLBACK_FV_UV;
++	smb5_set_float_voltage(chip, chip->fv_set_uv);
++	smb5_set_charge_current(chip, POLICY_FALLBACK_FCC_UA);
++	smb5_policy_reset(chip);
++	chip->policy_charge_enable = true;
++}
++
++static void smb5_policy_set_zone(struct smb5_chip *chip, int zone, int vbat)
++{
++	const struct smb5_temp_zone *z;
++	int fcc, old_full_uv = INT_MAX;
++
++	dev_info(chip->dev, "battery temperature zone %d -> %d\n", chip->zone, zone);
++	if (chip->zone >= ZONE_COLD && chip->zone <= ZONE_WARM)
++		old_full_uv = smb5_zones[chip->zone].full_uv;
++	chip->zone = zone;
++	chip->over_count = 0;
++	if (zone == ZONE_TOO_HOT || zone == ZONE_TOO_COLD)
++		return;
++
++	z = &smb5_zones[zone];
++	fcc = z->fcc_ua;
++	if (chip->batt_info->constant_charge_current_max_ua > 0)
++		fcc = min(fcc, chip->batt_info->constant_charge_current_max_ua);
++	chip->fv_set_uv = z->fv_uv;
++	smb5_set_float_voltage(chip, chip->fv_set_uv);
++	smb5_set_charge_current(chip, fcc);
++
++	/* A full state reached under a lower limit does not hold here. */
++	if (chip->batt_full && old_full_uv < z->full_uv &&
++	    vbat < z->fv_uv - z->recharge_uv)
++		smb5_policy_reset(chip);
++}
++
++static void smb5_policy_work(struct work_struct *work)
++{
++	struct smb5_chip *chip = container_of(work, struct smb5_chip,
++					     policy_work.work);
++	const struct smb5_temp_zone *z;
++	int temp, vbat, ibat, online = 0, zone, gauge_status;
++	unsigned int stat;
++	bool was_full, ovp = false;
++
++	mutex_lock(&chip->lock);
++	if (!chip->ready || chip->suspended)
++		goto unlock;
++
++	if (!chip->gauge) {
++		chip->gauge = power_supply_get_by_reference(dev_fwnode(chip->dev),
++							    "qcom,fuel-gauge");
++		if (IS_ERR_OR_NULL(chip->gauge))
++			chip->gauge = NULL;
++		else
++			dev_info(chip->dev, "charging policy uses %s\n",
++				 chip->gauge->desc->name);
++	}
++
++	if (!chip->gauge ||
++	    smb5_gauge_read(chip, POWER_SUPPLY_PROP_TEMP, &temp) ||
++	    smb5_gauge_read(chip, POWER_SUPPLY_PROP_VOLTAGE_NOW, &vbat) ||
++	    smb5_gauge_read(chip, POWER_SUPPLY_PROP_CURRENT_NOW, &ibat) ||
++	    temp < -400 || temp > 1000 || vbat < 2000000 || vbat > 5000000) {
++		smb5_policy_fallback(chip);
++		goto apply;
++	}
++	chip->gauge_ok = true;
++
++	zone = smb5_next_zone(chip, temp);
++	if (zone != chip->zone)
++		smb5_policy_set_zone(chip, zone, vbat);
++
++	if (zone == ZONE_TOO_HOT || zone == ZONE_TOO_COLD) {
++		chip->policy_charge_enable = false;
++		goto apply;
++	}
++
++	smb5_get_prop_usb_online(chip, &online);
++	if (!online) {
++		smb5_policy_reset(chip);
++		chip->policy_charge_enable = true;
++		goto apply;
++	}
++
++	z = &smb5_zones[zone];
++	was_full = chip->batt_full;
++
++	/* Near the reduced float voltage of the cold and warm zones: pause. */
++	if ((zone == ZONE_COLD || zone == ZONE_WARM) &&
++	    vbat >= chip->fv_set_uv - POLICY_OVP_MARGIN_UV)
++		ovp = true;
++
++	if (vbat >= z->over_uv + POLICY_HARD_STOP_UV) {
++		/* Never charge a cell that is this high, whatever the current. */
++		if (!chip->batt_full)
++			dev_warn(chip->dev, "battery at %d uV, charging stopped\n", vbat);
++		chip->batt_full = true;
++		chip->recharge_count = 0;
++	} else if (!chip->batt_full) {
++		/* Full by gauge: above the limit with only a small current left. */
++		if (vbat > z->full_uv && ibat <= POLICY_ITERM_UA) {
++			if (++chip->sw_full_count >
++			    (ibat > 0 ? POLICY_SW_FULL_COUNT : 2 * POLICY_SW_FULL_COUNT))
++				chip->batt_full = true;
++		} else {
++			chip->sw_full_count = 0;
++		}
++
++		/* Full by the gauge's own judgement, not part of stock. */
++		if (!smb5_gauge_read(chip, POWER_SUPPLY_PROP_STATUS, &gauge_status) &&
++		    gauge_status == POWER_SUPPLY_STATUS_FULL)
++			chip->batt_full = true;
++
++		/* Full by voltage: the cell reached the float voltage. */
++		if (vbat >= z->fv_uv + POLICY_HW_FULL_INC_UV) {
++			if (++chip->hw_full_count >= POLICY_HW_FULL_COUNT)
++				chip->batt_full = true;
++		} else {
++			chip->hw_full_count = 0;
++		}
++
++		/* Over the cell limit while charging: lower the float voltage. */
++		if (!chip->batt_full && vbat >= z->over_uv) {
++			if (++chip->over_count > POLICY_OVER_COUNT &&
++			    chip->fv_set_uv - POLICY_FV_STEP_UV >= FLOAT_VOLTAGE_MIN_UV) {
++				chip->over_count = 0;
++				chip->fv_set_uv -= POLICY_FV_STEP_UV;
++				smb5_set_float_voltage(chip, chip->fv_set_uv);
++				dev_info(chip->dev, "battery at %d uV, float voltage now %d uV\n",
++					 vbat, chip->fv_set_uv);
++			}
++		} else {
++			chip->over_count = 0;
++		}
++	} else if (vbat < z->fv_uv - z->recharge_uv) {
++		if (++chip->recharge_count > POLICY_RECHARGE_COUNT)
++			smb5_policy_reset(chip);
++	} else {
++		chip->recharge_count = 0;
++	}
++
++	if (chip->batt_full != was_full)
++		dev_info(chip->dev, "battery %s at %d uV, %d uA, %d.%d degC\n",
++			 chip->batt_full ? "full" : "recharging", vbat, ibat,
++			 temp / 10, abs(temp % 10));
++
++	chip->policy_charge_enable = !chip->batt_full && !ovp;
++
++	/*
++	 * No current to speak of: either the charger ended the cycle early
++	 * and is restarted, as stock does, or the cell has reached the level
++	 * at which nothing more is charged and counts as full.
++	 */
++	if (chip->policy_charge_enable && chip->user_charge_enable &&
++	    ibat <= POLICY_ITERM_UA / 2) {
++		if (vbat > z->full_uv - POLICY_REST_MARGIN_UV) {
++			if (++chip->rest_count > 2 * POLICY_SW_FULL_COUNT) {
++				chip->batt_full = true;
++				chip->policy_charge_enable = false;
++				dev_info(chip->dev, "battery full at rest, %d uV\n", vbat);
++			}
++		} else {
++			chip->rest_count = 0;
++			if (!regmap_read(chip->regmap,
++					 chip->base + BATTERY_CHARGER_STATUS_8, &stat) &&
++			    (stat & PRE_TERM_BIT)) {
++				dev_dbg(chip->dev, "charge ended early at %d uV, restarting\n",
++					vbat);
++				smb5_set_prop_charging_enabled(chip, 0);
++				msleep(100);
++			}
++		}
++	} else {
++		chip->rest_count = 0;
++	}
++
++apply:
++	smb5_apply_charge_enable(chip);
++	smb5_get_prop_usb_online(chip, &online);
++	WRITE_ONCE(chip->charging, online && chip->policy_charge_enable &&
++				   chip->user_charge_enable);
++
++	/*
++	 * Only this work pets the charger watchdog. If it stops running, the
++	 * watchdog bites and the PM8150B stops charging by itself.
++	 */
++	regmap_write(chip->regmap, chip->base + BARK_BITE_WDOG_PET,
++		     BARK_BITE_WDOG_PET_BIT);
++	mod_delayed_work(system_wq, &chip->policy_work, POLICY_INTERVAL);
++unlock:
++	mutex_unlock(&chip->lock);
++}
++
++/*
++ * The battery is only charged under supervision. Like the wakelock of the
++ * stock firmware, refuse to sleep while it is being charged; once it is
++ * full the system may sleep.
++ */
++static int smb5_pm_notify(struct notifier_block *nb, unsigned long action,
++			  void *data)
++{
++	struct smb5_chip *chip = container_of(nb, struct smb5_chip, pm_nb);
++
++	if ((action == PM_SUSPEND_PREPARE || action == PM_HIBERNATION_PREPARE) &&
++	    READ_ONCE(chip->charging)) {
++		dev_info_ratelimited(chip->dev, "battery is charging, not suspending\n");
++		return notifier_from_errno(-EBUSY);
++	}
++
++	return NOTIFY_DONE;
++}
++
++static void smb5_stop(void *data)
++{
++	struct smb5_chip *chip = data;
++
++	mutex_lock(&chip->lock);
++	chip->ready = false;
++	mutex_unlock(&chip->lock);
++	cancel_delayed_work_sync(&chip->status_change_work);
++	if (chip->policy) {
++		cancel_delayed_work_sync(&chip->policy_work);
++		smb5_set_float_voltage(chip, POLICY_FALLBACK_FV_UV);
++		if (chip->gauge)
++			power_supply_put(chip->gauge);
++		unregister_pm_notifier(&chip->pm_nb);
++	}
++	smb5_set_prop_charging_enabled(chip, 0);
++	regmap_update_bits(chip->regmap, chip->base + USBIN_CMD_IL,
++			   USBIN_SUSPEND_BIT, USBIN_SUSPEND_BIT);
++}
++
++static int smb5_get_iio_chan(struct smb5_chip *chip, struct iio_channel *chan,
++			     int *val)
++{
++	int online, rc;
++
++	/* USB may power the system while battery charging is inhibited or full. */
++	rc = smb5_get_prop_usb_online(chip, &online);
++	if (rc)
++		return rc;
++	if (!online) {
++		*val = 0;
++		return 0;
++	}
++
++	if (IS_ERR(chan)) {
++		dev_err(chip->dev, "Failed to chan, err = %li", PTR_ERR(chan));
++		return PTR_ERR(chan);
++	}
++
++	return iio_read_channel_processed(chan, val);
++}
++
++static int smb5_get_prop_health(struct smb5_chip *chip, int *val)
++{
++	int rc;
++	unsigned int stat;
++
++	rc = regmap_read(chip->regmap, chip->base + BATTERY_CHARGER_STATUS_2,
++			 &stat);
++	if (rc < 0) {
++		dev_err(chip->dev, "Couldn't read charger status rc=%d\n", rc);
++		return rc;
++	}
++
++	if (stat & CHARGER_ERROR_STATUS_BAT_OV_BIT) {
++		*val = POWER_SUPPLY_HEALTH_OVERVOLTAGE;
++		return 0;
++	}
++
++	rc = regmap_read(chip->regmap, chip->base + BATTERY_CHARGER_STATUS_7_REG,
++			 &stat);
++	if (rc < 0) {
++		dev_err(chip->dev, "Couldn't read charger status 7 rc=%d\n", rc);
++		return rc;
++	}
++
++	if (stat & BAT_TEMP_STATUS_TOO_COLD_BIT)
++		*val = POWER_SUPPLY_HEALTH_COLD;
++	else if (stat & BAT_TEMP_STATUS_TOO_HOT_BIT)
++		*val = POWER_SUPPLY_HEALTH_OVERHEAT;
++	else if (stat & BAT_TEMP_STATUS_COLD_SOFT_BIT)
++		*val = POWER_SUPPLY_HEALTH_COOL;
++	else if (stat & BAT_TEMP_STATUS_HOT_SOFT_BIT)
++		*val = POWER_SUPPLY_HEALTH_WARM;
++	else
++		*val = POWER_SUPPLY_HEALTH_GOOD;
++
++	return 0;
++}
++
++static int smb5_get_property(struct power_supply *psy,
++			     enum power_supply_property psp,
++			     union power_supply_propval *val)
++{
++	struct smb5_chip *chip = power_supply_get_drvdata(psy);
++	unsigned int raw;
++	int ret;
++
++	switch (psp) {
++	case POWER_SUPPLY_PROP_MANUFACTURER:
++		val->strval = "Qualcomm";
++		return 0;
++	case POWER_SUPPLY_PROP_MODEL_NAME:
++		val->strval = chip->name;
++		return 0;
++	case POWER_SUPPLY_PROP_CURRENT_MAX:
++		return smb5_get_current_limit(chip, &val->intval);
++	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
++		ret = regmap_read(chip->regmap, chip->base + USBIN_CURRENT_LIMIT_CFG, &raw);
++		if (!ret)
++			val->intval = raw * CURRENT_SCALE_FACTOR;
++		return ret;
++	case POWER_SUPPLY_PROP_CURRENT_NOW:
++		ret = smb5_get_iio_chan(chip, chip->usb_in_i_chan, &val->intval);
++		/* The current-sense channel is 0.2 V/A, reported in microvolts. */
++		if (!ret)
++			val->intval *= 5;
++		return ret;
++	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
++		return smb5_get_iio_chan(chip, chip->usb_in_v_chan,
++					 &val->intval);
++	case POWER_SUPPLY_PROP_ONLINE:
++		return smb5_get_prop_usb_online(chip, &val->intval);
++	case POWER_SUPPLY_PROP_STATUS:
++		return smb5_get_prop_status(chip, &val->intval);
++	case POWER_SUPPLY_PROP_HEALTH:
++		return smb5_get_prop_health(chip, &val->intval);
++	case POWER_SUPPLY_PROP_USB_TYPE:
++		val->intval = READ_ONCE(chip->usb_type);
++		return 0;
++	case POWER_SUPPLY_PROP_CHARGING_ENABLED:
++		return smb5_get_prop_charging_enabled(chip, &val->intval);
++	default:
++		dev_err(chip->dev, "invalid property: %d\n", psp);
++		return -EINVAL;
++	}
++}
++
++static int smb5_set_property(struct power_supply *psy,
++			     enum power_supply_property psp,
++			     const union power_supply_propval *val)
++{
++	struct smb5_chip *chip = power_supply_get_drvdata(psy);
++
++	guard(mutex)(&chip->lock);
++	if (!chip->ready)
++		return -EAGAIN;
++
++	switch (psp) {
++	case POWER_SUPPLY_PROP_CURRENT_MAX:
++	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
++		if (val->intval < 0 || val->intval > CURRENT_MAX_UA)
++			return -EINVAL;
++		chip->user_current_limit = val->intval;
++		mod_delayed_work(system_wq, &chip->status_change_work, 0);
++		return 0;
++	case POWER_SUPPLY_PROP_CHARGING_ENABLED:
++		chip->user_charge_enable = !!val->intval;
++		smb5_apply_charge_enable(chip);
++		return 0;
++	default:
++		dev_err(chip->dev, "No setter for property: %d\n", psp);
++		return -EINVAL;
++	}
++}
++
++static int smb5_property_is_writable(struct power_supply *psy,
++				     enum power_supply_property psp)
++{
++	switch (psp) {
++	case POWER_SUPPLY_PROP_CURRENT_MAX:
++	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
++	case POWER_SUPPLY_PROP_CHARGING_ENABLED:
++		return 1;
++	default:
++		return 0;
++	}
++}
++
++static irqreturn_t smb5_handle_batt_overvoltage(int irq, void *data)
++{
++	struct smb5_chip *chip = data;
++	unsigned int status;
++
++	regmap_read(chip->regmap, chip->base + BATTERY_CHARGER_STATUS_2,
++		    &status);
++
++	if (status & CHARGER_ERROR_STATUS_BAT_OV_BIT) {
++		/* The hardware stops charging automatically */
++		dev_err(chip->dev, "battery overvoltage detected\n");
++		power_supply_changed(chip->chg_psy);
++	}
++
++	return IRQ_HANDLED;
++}
++
++static irqreturn_t smb5_handle_usb_plugin(int irq, void *data)
++{
++	struct smb5_chip *chip = data;
++
++	/* Keep a quick detach/reattach from reusing the last cable's result. */
++	mutex_lock(&chip->lock);
++	chip->apsd_started = false;
++	chip->apsd_retries = 0;
++	if (chip->ready)
++		mod_delayed_work(system_wq, &chip->status_change_work, 0);
++	if (chip->ready && chip->policy)
++		mod_delayed_work(system_wq, &chip->policy_work, 0);
++	mutex_unlock(&chip->lock);
++	power_supply_changed(chip->chg_psy);
++
++	return IRQ_HANDLED;
++}
++
++static irqreturn_t smb5_handle_usb_source_change(int irq, void *data)
++{
++	struct smb5_chip *chip = data;
++
++	/* A late APSD completion must refresh the cached type and allowance. */
++	smb5_queue_status_work(chip);
++
++	return IRQ_HANDLED;
++}
++
++static irqreturn_t smb5_handle_usb_icl_change(int irq, void *data)
++{
++	struct smb5_chip *chip = data;
++
++	power_supply_changed(chip->chg_psy);
++
++	return IRQ_HANDLED;
++}
++
++static irqreturn_t smb5_handle_wdog_bark(int irq, void *data)
++{
++	struct smb5_chip *chip = data;
++	int rc;
++
++	power_supply_changed(chip->chg_psy);
++
++	/* With the charging policy, only its work may pet the watchdog. */
++	if (chip->policy) {
++		dev_warn(chip->dev, "charger watchdog bark\n");
++		return IRQ_HANDLED;
++	}
++
++	rc = regmap_write(chip->regmap, BARK_BITE_WDOG_PET,
++			  BARK_BITE_WDOG_PET_BIT);
++	if (rc < 0)
++		dev_err(chip->dev, "Couldn't pet the dog rc=%d\n", rc);
++
++	return IRQ_HANDLED;
++}
++
++static const struct power_supply_desc smb5_psy_desc = {
++	.name = "pm8150b_charger",
++	.type = POWER_SUPPLY_TYPE_USB,
++	.usb_types = BIT(POWER_SUPPLY_USB_TYPE_SDP) |
++		     BIT(POWER_SUPPLY_USB_TYPE_CDP) |
++ 		     BIT(POWER_SUPPLY_USB_TYPE_DCP) |
++		     BIT(POWER_SUPPLY_USB_TYPE_C) |
++		     BIT(POWER_SUPPLY_USB_TYPE_PD) |
++		     BIT(POWER_SUPPLY_USB_TYPE_PD_PPS) |
++		     BIT(POWER_SUPPLY_USB_TYPE_UNKNOWN),
++	.properties = smb5_properties,
++	.num_properties = ARRAY_SIZE(smb5_properties),
++	.get_property = smb5_get_property,
++	.set_property = smb5_set_property,
++	.property_is_writeable = smb5_property_is_writable,
++	.external_power_changed = smb5_external_power_changed,
++};
++
++/* Init sequence derived from vendor downstream driver */
++static const struct smb5_register smb5_init_seq[] = {
++	/*
++	 * Keep charging off until limits have been programmed, but let USB
++	 * power the system at the 500 mA default meanwhile: probing can wait
++	 * on the Type-C supplier, and a nearly empty battery must not carry
++	 * the boot alone.
++	 */
++	{ .addr = CHARGING_ENABLE_CMD, .mask = CHARGING_ENABLE_CMD_BIT, .val = 0 },
++	{ .addr = USBIN_CMD_IL, .mask = USBIN_SUSPEND_BIT, .val = 0 },
++	{ .addr = USBIN_CURRENT_LIMIT_CFG, .mask = USBIN_CURRENT_LIMIT_MASK,
++	  .val = SDP_CURRENT_UA / CURRENT_SCALE_FACTOR },
++	{ .addr = AICL_RERUN_TIME_CFG, .mask = AICL_RERUN_TIME_MASK, .val = 0 },
++	/* TCPM owns the Type-C and VCONN configuration. */
++	{ .addr = TYPE_C_CFG, .mask = BC1P2_START_ON_CC_BIT, .val = 0 },
++	/* Keep VBUS sourcing under software control, whichever supply provides it. */
++	{ .addr = OTG_CFG, .mask = OTG_EN_SRC_CFG_BIT, .val = 0 },
++	/*
++	 * Use VBAT to determine the recharge threshold when battery is full
++	 * rather than the state of charge.
++	 */
++	{ .addr = CHARGE_RCHG_SOC_THRESHOLD_CFG_REG,
++	  .mask = CHARGE_RCHG_SOC_THRESHOLD_CFG_MASK,
++	  .val = 98 },
++	/* The input policy enables BC1.2 only when TCPM has no better limit. */
++	{ .addr = USBIN_OPTIONS_1_CFG,
++	  .mask = BC1P2_SRC_DETECT_BIT | HVDCP_AUTH_ALG_EN_CFG_BIT |
++		  HVDCP_AUTONOMOUS_MODE_EN_CFG_BIT | HVDCP_EN_BIT |
++		  HVDCP_NO_AUTH_QC3_CFG_BIT,
++	  .val = 0 },
++	/* Set the default SDP charger type to a 500ma USB 2.0 port */
++	{ .addr = USBIN_ICL_OPTIONS,
++	  .mask = USBIN_MODE_CHG_BIT,
++	  .val = USBIN_MODE_CHG_BIT },
++	{ .addr = CMD_ICL_OVERRIDE,
++	  .mask = ICL_OVERRIDE_BIT,
++	  .val = 0 },
++	{ .addr = USBIN_LOAD_CFG,
++	  .mask = ICL_OVERRIDE_AFTER_APSD_BIT,
++	  .val = 0 },
++	/* Disable watchdog */
++	{ .addr = SNARL_BARK_BITE_WD_CFG, .mask = 0xff, .val = 0 },
++	{ .addr = WD_CFG,
++	  .mask = WATCHDOG_TRIGGER_AFP_EN_BIT | WDOG_TIMER_EN_ON_PLUGIN_BIT |
++		  BARK_WDOG_INT_EN_BIT,
++	  .val = 0 },
++	/*
++	 * Enable Automatic Input Current Limit, this will slowly ramp up the current
++	 * When connected to a wall charger, and automatically stop when it detects
++	 * the charger current limit (voltage drop?) or it reaches the programmed limit.
++	 */
++	{ .addr = USBIN_AICL_OPTIONS_CFG,
++	  .mask = USBIN_AICL_PERIODIC_RERUN_EN_BIT | USBIN_AICL_ADC_EN_BIT
++			| USBIN_AICL_EN_BIT | SUSPEND_ON_COLLAPSE_USBIN_BIT,
++	  .val = USBIN_AICL_PERIODIC_RERUN_EN_BIT | USBIN_AICL_ADC_EN_BIT
++			| USBIN_AICL_EN_BIT | SUSPEND_ON_COLLAPSE_USBIN_BIT },
++};
++
++static int smb5_init_hw(struct smb5_chip *chip)
++{
++	int rc, i;
++	for (i = 0; i < ARRAY_SIZE(smb5_init_seq); i++) {
++		dev_dbg(chip->dev, "%d: Writing 0x%02x to 0x%02x\n", i,
++			smb5_init_seq[i].val, smb5_init_seq[i].addr);
++		rc = regmap_update_bits(chip->regmap,
++					chip->base + smb5_init_seq[i].addr,
++					smb5_init_seq[i].mask,
++					smb5_init_seq[i].val);
++		if (rc < 0)
++			return dev_err_probe(chip->dev, rc,
++					     "%s: init command %d failed\n",
++					     __func__, i);
++	}
++	return 0;
++}
++
++static int smb5_init_irq(struct smb5_chip *chip, int *irq, const char *name,
++			 irqreturn_t (*handler)(int irq, void *data))
++{
++	int irqnum;
++	int rc;
++
++	irqnum = platform_get_irq_byname(to_platform_device(chip->dev), name);
++	if (irqnum < 0)
++		return irqnum;
++
++	rc = devm_request_threaded_irq(chip->dev, irqnum, NULL, handler,
++				       IRQF_ONESHOT, name, chip);
++	if (rc < 0)
++		return dev_err_probe(chip->dev, rc, "Couldn't request irq %s\n",
++				     name);
++
++	if (irq)
++		*irq = irqnum;
++
++	return 0;
++}
++
++static int smb5_probe(struct platform_device *pdev)
++{
++	struct power_supply_config supply_config = {};
++	struct power_supply_desc *desc;
++	struct smb5_chip *chip;
++	int rc, irq, fv_uv;
++
++	chip = devm_kzalloc(&pdev->dev, sizeof(*chip), GFP_KERNEL);
++	if (!chip)
++		return -ENOMEM;
++
++	chip->dev = &pdev->dev;
++	chip->name = pdev->name;
++	mutex_init(&chip->lock);
++	chip->has_tcpm = device_property_present(chip->dev, "power-supplies");
++	chip->user_current_limit = CURRENT_MAX_UA;
++
++	chip->regmap = dev_get_regmap(pdev->dev.parent, NULL);
++	if (!chip->regmap)
++		return dev_err_probe(chip->dev, -ENODEV,
++				     "failed to locate the regmap\n");
++
++	rc = device_property_read_u32(chip->dev, "reg", &chip->base);
++	if (rc < 0)
++		return dev_err_probe(chip->dev, rc,
++				     "Couldn't read base address\n");
++
++	chip->usb_in_v_chan = devm_iio_channel_get(chip->dev, "usb_in_v_div_16");
++	if (IS_ERR(chip->usb_in_v_chan))
++		return dev_err_probe(chip->dev, PTR_ERR(chip->usb_in_v_chan),
++				     "Couldn't get usb_in_v_div_16 IIO channel\n");
++
++	chip->usb_in_i_chan = devm_iio_channel_get(chip->dev, "usb_in_i_uv");
++	if (IS_ERR(chip->usb_in_i_chan)) {
++		return dev_err_probe(chip->dev, PTR_ERR(chip->usb_in_i_chan),
++				     "Couldn't get usb_in_i_uv IIO channel\n");
++	}
++
++	rc = smb5_init_hw(chip);
++	if (rc < 0)
++		return rc;
++
++	supply_config.drv_data = chip;
++	supply_config.fwnode = pdev->dev.fwnode;
++
++	desc = devm_kzalloc(chip->dev, sizeof(smb5_psy_desc), GFP_KERNEL);
++	if (!desc)
++		return -ENOMEM;
++	memcpy(desc, &smb5_psy_desc, sizeof(smb5_psy_desc));
++	desc->name =
++		devm_kasprintf(chip->dev, GFP_KERNEL, "%s-charger",
++			       (const char *)device_get_match_data(chip->dev));
++	if (!desc->name)
++		return -ENOMEM;
++
++	chip->chg_psy =
++		devm_power_supply_register(chip->dev, desc, &supply_config);
++	if (IS_ERR(chip->chg_psy))
++		return dev_err_probe(chip->dev, PTR_ERR(chip->chg_psy),
++				     "failed to register power supply\n");
++
++	rc = power_supply_get_battery_info(chip->chg_psy, &chip->batt_info);
++	if (rc)
++		return dev_err_probe(chip->dev, rc,
++				     "Failed to get battery info\n");
++
++	INIT_DELAYED_WORK(&chip->status_change_work, smb5_status_change_work);
++	INIT_DELAYED_WORK(&chip->policy_work, smb5_policy_work);
++	chip->policy = device_property_present(chip->dev, "qcom,fuel-gauge");
++	chip->user_charge_enable = true;
++	chip->policy_charge_enable = true;
++	chip->zone = ZONE_NONE;
++	if (chip->policy) {
++		chip->pm_nb.notifier_call = smb5_pm_notify;
++		rc = register_pm_notifier(&chip->pm_nb);
++		if (rc)
++			return rc;
++	}
++	rc = devm_add_action_or_reset(chip->dev, smb5_stop, chip);
++	if (rc)
++		return rc;
++
++	/*
++	 * With the charging policy, start from the limits for an unknown
++	 * battery; the policy raises them once the fuel gauge has been read.
++	 */
++	fv_uv = chip->policy ? POLICY_FALLBACK_FV_UV :
++			       chip->batt_info->voltage_max_design_uv;
++	rc = smb5_set_float_voltage(chip, fv_uv);
++	if (rc == -EINVAL)
++		return dev_err_probe(chip->dev, rc, "Invalid battery voltage %d uV\n",
++				     fv_uv);
++	if (rc < 0)
++		return dev_err_probe(chip->dev, rc, "Couldn't set vbat max\n");
++	chip->fv_set_uv = fv_uv;
++	dev_info(chip->dev, "float voltage %d uV\n", fv_uv);
++
++	rc = smb5_set_charge_current(chip, chip->policy ? POLICY_FALLBACK_FCC_UA :
++		chip->batt_info->constant_charge_current_max_ua);
++	if (rc)
++		return dev_err_probe(chip->dev, rc, "Couldn't set battery current limit\n");
++
++	if (chip->policy) {
++		/* Termination current and charger watchdog as in stock. */
++		rc = regmap_update_bits(chip->regmap,
++					chip->base + TCCC_CHARGE_CURRENT_TERMINATION_CFG,
++					TCCC_CHARGE_CURRENT_TERMINATION_MASK,
++					POLICY_ITERM_UA / CURRENT_SCALE_FACTOR);
++		if (!rc)
++			rc = regmap_write(chip->regmap, chip->base + BARK_BITE_WDOG_PET,
++					  BARK_BITE_WDOG_PET_BIT);
++		if (!rc)
++			rc = regmap_write(chip->regmap,
++					  chip->base + SNARL_BARK_BITE_WD_CFG,
++					  WDOG_POLICY_CFG);
++		if (!rc)
++			rc = regmap_update_bits(chip->regmap, chip->base + WD_CFG,
++						WATCHDOG_TRIGGER_AFP_EN_BIT |
++						WDOG_TIMER_EN_ON_PLUGIN_BIT |
++						BARK_WDOG_INT_EN_BIT,
++						WDOG_TIMER_EN_ON_PLUGIN_BIT |
++						BARK_WDOG_INT_EN_BIT);
++		if (rc)
++			return dev_err_probe(chip->dev, rc,
++					     "Couldn't set up the charging policy\n");
++	}
++
++	rc = smb5_init_irq(chip, &irq, "bat-ov", smb5_handle_batt_overvoltage);
++	if (rc < 0)
++		return rc;
++
++	rc = smb5_init_irq(chip, &chip->cable_irq, "usbin-plugin",
++			   smb5_handle_usb_plugin);
++	if (rc < 0)
++		return rc;
++
++	rc = smb5_init_irq(chip, &irq, "usbin-icl-change",
++			   smb5_handle_usb_icl_change);
++	if (rc < 0)
++		return rc;
++	/* Optional for compatibility with DTs predating source-change support. */
++	irq = platform_get_irq_byname_optional(pdev, "usbin-src-change");
++	if (irq >= 0) {
++		rc = devm_request_threaded_irq(chip->dev, irq, NULL,
++					       smb5_handle_usb_source_change,
++					       IRQF_ONESHOT, "usbin-src-change", chip);
++		if (rc)
++			return dev_err_probe(chip->dev, rc,
++					     "Couldn't request source-change IRQ\n");
++	} else if (irq != -ENXIO) {
++		return irq;
++	}
++
++	rc = smb5_init_irq(chip, &irq, "wdog-bark", smb5_handle_wdog_bark);
++	if (rc < 0)
++		return rc;
++
++	rc = devm_pm_set_wake_irq(chip->dev, chip->cable_irq);
++	if (rc < 0)
++		return dev_err_probe(chip->dev, rc, "Couldn't set wake irq\n");
++
++	platform_set_drvdata(pdev, chip);
++
++	rc = smb5_set_prop_charging_enabled(chip, 1);
++	if (rc)
++		return rc;
++
++	mutex_lock(&chip->lock);
++	chip->ready = true;
++	if (chip->policy)
++		mod_delayed_work(system_wq, &chip->policy_work, 0);
++	mutex_unlock(&chip->lock);
++	smb5_queue_status_work(chip);
++
++	return 0;
++}
++
++/* Nothing supervises the battery while asleep or after shutdown. */
++static int smb5_suspend(struct device *dev)
++{
++	struct smb5_chip *chip = dev_get_drvdata(dev);
++
++	if (!chip->policy)
++		return 0;
++
++	mutex_lock(&chip->lock);
++	chip->suspended = true;
++	smb5_apply_charge_enable(chip);
++	mutex_unlock(&chip->lock);
++	dev_dbg(dev, "charging off while suspended\n");
++	cancel_delayed_work_sync(&chip->policy_work);
++
++	return 0;
++}
++
++static int smb5_resume(struct device *dev)
++{
++	struct smb5_chip *chip = dev_get_drvdata(dev);
++
++	if (!chip->policy)
++		return 0;
++
++	mutex_lock(&chip->lock);
++	chip->suspended = false;
++	if (chip->ready)
++		mod_delayed_work(system_wq, &chip->policy_work, 0);
++	mutex_unlock(&chip->lock);
++
++	return 0;
++}
++
++static DEFINE_SIMPLE_DEV_PM_OPS(smb5_pm_ops, smb5_suspend, smb5_resume);
++
++static void smb5_shutdown(struct platform_device *pdev)
++{
++	struct smb5_chip *chip = platform_get_drvdata(pdev);
++
++	if (chip && chip->policy)
++		smb5_set_float_voltage(chip, POLICY_FALLBACK_FV_UV);
++}
++
++static const struct of_device_id smb5_match_id_table[] = {
++	{ .compatible = "qcom,pm8150b-charger", .data = "pm8150b" },
++	{ /* sentinal */ }
++};
++MODULE_DEVICE_TABLE(of, smb5_match_id_table);
++
++static struct platform_driver qcom_spmi_smb5 = {
++	.probe = smb5_probe,
++	.shutdown = smb5_shutdown,
++	.driver = {
++		.name = "qcom-pm8150b-charger",
++		.of_match_table = smb5_match_id_table,
++		.pm = pm_sleep_ptr(&smb5_pm_ops),
++		},
++};
++
++module_platform_driver(qcom_spmi_smb5);
++
++MODULE_AUTHOR("Caleb Connolly <caleb.connolly@linaro.org>");
++MODULE_DESCRIPTION("Qualcomm SMB5 Charger Driver");
++MODULE_LICENSE("GPL");

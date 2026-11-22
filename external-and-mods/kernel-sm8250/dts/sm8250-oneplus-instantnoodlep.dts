@@ -7,6 +7,7 @@
 #include <dt-bindings/clock/qcom,gcc-sm8250.h>
 #include <dt-bindings/regulator/qcom,rpmh-regulator.h>
 #include <dt-bindings/phy/phy.h>
+#include <dt-bindings/usb/pd.h>
 #include "sm8250.dtsi"
 #include "pm8150.dtsi"
 #include "pm8150b.dtsi"
@@ -761,9 +762,20 @@
     status = "okay";
 
     smart_battery: fuel-gauge@55 {
-        compatible = "ti,bq27541";
+        compatible = "ti,bq27411";
         reg = <0x55>;
         monitored-battery = <&battery>;
+        /*
+         * 2026-11-22 定案：这颗芯片是 bq27411，不是 bq27541。判据 =
+         * 七寄存器同刻交叉验证（fg 独立基准），详见 README §30.9；
+         * DeviceType=0x0421 旁证（sdm845-mainline 给 OnePlus 6/6T 的
+         * 修复补丁写明 0x0541=bq27541 / 0x0421=bq27411）。
+         * 用 bq27411 绑定后寄存器表全对上（电压 4229 vs fg 4237 等），
+         * 0032/0036 的补偿属性不再需要 —— ti,ts-pin-unused 已删，
+         * 温度走原生寄存器（读数 35 °C 左右，合理）。
+         * 注意 monitored-battery 会让驱动把 design capacity 等写进
+         * 芯片 data flash（bq27xxx_dt_to_nvm 默认开），pmOS 同款行为。
+         */
     };
 };
 
@@ -1626,7 +1638,7 @@
 		compatible = "awinic,aw8697";
 		reg = <0x5a>;
 		interrupts-extended = <&tlmm 118 IRQ_TYPE_EDGE_FALLING>;
-		reset-gpios = <&tlmm 72 GPIO_ACTIVE_HIGH>;
+		reset-gpios = <&tlmm 72 GPIO_ACTIVE_LOW>;
 		pinctrl-names = "default";
 		pinctrl-0 = <&haptics_irq_default>;
 		awinic,f0-preset = <1700>;
@@ -1679,21 +1691,204 @@
 };
 
 /*
- * 充电：PM8150B 的充电器。**驱动不在 mainline 7.2.8**
- * （drivers/power/supply/ 里只有 smbb/smbx，没有 qcom_pm8150b_charger.c；
- * 参考移植的 0068–0085/0165–0166 全是对那个驱动打的补丁，本体没给）。
- * 节点先写好，驱动进来即用。
+ * 充电：PM8150B 的充电器。
+ *
+ * 历史注记（2026-11-22 更正）：之前写「驱动不在 mainline 7.2.8」是错的 ——
+ * ROCKNIX 的 0004-pm8150b.patch（charger/fg 节点 + ADC 通道）和
+ * 0011-qcom-pm8150b-charger.patch（驱动本体，且已带浮压 3.6V/10mV 的
+ * 正确编码）本来就随构建进内核，steamos.config 沿用的 ROCKNIX 设备配置
+ * 也开着 CONFIG_CHARGER_QCOM_SMB5。真机一直 `deferred probe pending:
+ * failed to register power supply` 的真因是 power-supplies 指向的
+ * &pm8150b_typec 从未启用 → typec 的 power_supply 注册不出来 → 充电器
+ * 注册永远 defer。
+ *
+ * 2026-11-22：启用 &pm8150b_typec（connector + ports + dwc3 HS 端点）和
+ * &pm8150b_vbus（照抄 Nura 板级，PDO/限值同款）；驱动侧由 patches/
+ * 0033 应用 Nura 修复链（follow TCPM limits、500mA 最低输入、
+ * 按电量计的充满判定等），0034 给 charger 节点补 usbin-src-change 中断。
  *
  * qcom,fuel-gauge 指向 i2c16 上那颗 bq27541（smart_battery，DTS 里原本
  * 就有），充电是否充满由电量计决定，与厂商行为一致。
  *
  * 电量计本身是可以工作的：CONFIG_BATTERY_BQ27XXX_I2C 打开后
  * /sys/class/power_supply 里会出现 bms，能读电压、电流、容量。
+ *
+ * Nura 的 &usb_1_dwc3 用 dr_mode="otg" + usb-role-switch 由 TCPM 管角色；
+ * 我们暂时保持 "peripheral" 固定外设模式（串口 gadget / NCM 调试依赖），
+ * 数据角色切换留到 USB-C host 验证时再改。
  */
 &pm8150b_charger {
 	status = "okay";
 	monitored-battery = <&battery>;
 	power-supplies = <&pm8150b_typec>;
-	qcom,fuel-gauge = <&smart_battery>;
+	/*
+	 * 充电策略的电量计源（2026-11-22 裁决后）：改指 PM8150B 自己的
+	 * FG Gen4。bq27541 的 SOC 恒 37%、电流恒 -2142 mA、FCC 未学习
+	 * —— 学习引擎没在工作；PMIC fg 实测 95%/4.19V/694mA/24 °C，
+	 * 全部自洽且实时。0166 策略只读 TEMP/VOLTAGE_NOW/CURRENT_NOW
+	 * 三个标准属性，fg 全部提供且比 bq27541 可信。
+	 */
+	qcom,fuel-gauge = <&pm8150b_fg>;
+};
+
+/*
+ * PM8150B 自带的 FG Gen4 硬件电量计（qcom_fg 驱动，ROCKNIX 0011 已在内核）。
+ * 与 bq27541 完全独立的第二套测量：启用它是为了交叉验证 bq27541 的读数 ——
+ * bq27541 的 SOC 寄存器（恒 37%）与 NAC（3851mAh ≈ 86%）互相矛盾、电流
+ * 寄存器恒 -2142mA，电量学习引擎疑似没在工作（用户怀疑实际满电，验证为真：
+ * fg 实测 95%/4.19V）。
+ */
+&pm8150b_fg {
+	status = "okay";
+	monitored-battery = <&battery>;
+};
+
+/*
+ * bq27411（2026-11-22）：correct binding 后重新启用为第二意见电量计。
+ * 主源仍是 fg（battery psy，充电策略的 qcom,fuel-gauge 也指 fg）。
+ * bq27411 的读数应与 fg 一致（SOC ~90%、电压 4.19V、电流活值）——
+ * 若再次出现矛盾，以 fg 为准并回查芯片状态。
+ */
+
+&pm8150b_typec {
+	vdd-pdphy-supply = <&vreg_l2a_3p1>;
+	status = "okay";
+
+	connector {
+		compatible = "usb-c-connector";
+
+		op-sink-microwatt = <10000000>;
+		power-role = "dual";
+		data-role = "dual";
+		self-powered;
+
+		source-pdos = <PDO_FIXED(5000, 3000,
+					 PDO_FIXED_DUAL_ROLE |
+					 PDO_FIXED_USB_COMM |
+					 PDO_FIXED_DATA_SWAP)>;
+
+		sink-pdos = <PDO_FIXED(5000, 3000,
+				       PDO_FIXED_DUAL_ROLE |
+				       PDO_FIXED_USB_COMM |
+				       PDO_FIXED_DATA_SWAP)>;
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+
+				pm8150b_hs_in: endpoint {
+					remote-endpoint = <&usb_1_dwc3_hs_out>;
+				};
+			};
+		};
+	};
+};
+
+/* HS 数据路径的另一头：dwc3 的空端点接到 typec connector 上。 */
+&usb_1_dwc3_hs_out {
+	remote-endpoint = <&pm8150b_hs_in>;
+};
+
+/* Nura 同款：VBUS 源能力 500 mA–3 A（downstream 的 otg-use_external_boost 不启用它）。 */
+&pm8150b_vbus {
+	regulator-min-microamp = <500000>;
+	regulator-max-microamp = <3000000>;
+	status = "okay";
+};
+
+/*
+ * 温控（2026-11-21 阶段 2）
+ *
+ * sm8250.dtsi 的默认策略是给参考平板写的：被动降频 90 °C、第二档 95 °C，
+ * critical 110 °C。这台手机跑 Steam 时 CPU 稳定 80-90 °C，等 90 °C 才开始
+ * 降频等于不降频 —— 实测 thermal_zone5/6（cluster0/1）升温到 44 °C 时
+ * /sys/class/thermal/thermal_zone5/cdev* 是空的。
+ *
+ * 两层保护：
+ *   1. 用户态 op8p-thermal-guard 按 78/84/88 进、72/79/84 退压 scaling_max_freq
+ *   2. 这里把内核被动降频提前到 84/88，作为用户态没跑起来时的兜底
+ *
+ * critical 保持 110 °C 不动：那是最后一道关机的线。
+ *
+ * cluster0/cluster1 在 dtsi 里只有 "hot" trip，没有 passive trip 也没有
+ * cooling-maps，所以这两个温区对降温完全没贡献。补一档 84 °C 的 passive
+ * 绑全部 8 个 CPU，让 cluster 温度本身也能驱动降频。
+ */
+
+/* 一档：84 °C */
+&cpu0_alert0 { temperature = <84000>; };
+&cpu1_alert0 { temperature = <84000>; };
+&cpu2_alert0 { temperature = <84000>; };
+&cpu3_alert0 { temperature = <84000>; };
+&cpu4_top_alert0 { temperature = <84000>; };
+&cpu5_top_alert0 { temperature = <84000>; };
+&cpu6_top_alert0 { temperature = <84000>; };
+&cpu7_top_alert0 { temperature = <84000>; };
+&cpu4_bottom_alert0 { temperature = <84000>; };
+&cpu5_bottom_alert0 { temperature = <84000>; };
+&cpu6_bottom_alert0 { temperature = <84000>; };
+&cpu7_bottom_alert0 { temperature = <84000>; };
+
+/* 二档：88 °C */
+&cpu0_alert1 { temperature = <88000>; };
+&cpu1_alert1 { temperature = <88000>; };
+&cpu2_alert1 { temperature = <88000>; };
+&cpu3_alert1 { temperature = <88000>; };
+&cpu4_top_alert1 { temperature = <88000>; };
+&cpu5_top_alert1 { temperature = <88000>; };
+&cpu6_top_alert1 { temperature = <88000>; };
+&cpu7_top_alert1 { temperature = <88000>; };
+&cpu4_bottom_alert1 { temperature = <88000>; };
+&cpu5_bottom_alert1 { temperature = <88000>; };
+&cpu6_bottom_alert1 { temperature = <88000>; };
+&cpu7_bottom_alert1 { temperature = <88000>; };
+
+/* GPU：原本 85 °C 才开始压频，跟 CPU 一起提到 82/88 */
+&gpu_top_alert0 { temperature = <82000>; };
+&gpu_bottom_alert0 { temperature = <82000>; };
+
+/* cluster0：小核簇 */
+&{/thermal-zones/cluster0-thermal/trips} {
+	cluster0_alert_passive: trip-point-passive {
+		temperature = <84000>;
+		hysteresis = <2000>;
+		type = "passive";
+	};
+};
+
+&{/thermal-zones/cluster0-thermal} {
+	cooling-maps {
+		map-passive {
+			trip = <&cluster0_alert_passive>;
+			cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+					 <&cpu1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+					 <&cpu2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+					 <&cpu3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+		};
+	};
+};
+
+/* cluster1：大核簇 */
+&{/thermal-zones/cluster1-thermal/trips} {
+	cluster1_alert_passive: trip-point-passive {
+		temperature = <84000>;
+		hysteresis = <2000>;
+		type = "passive";
+	};
+};
+
+&{/thermal-zones/cluster1-thermal} {
+	cooling-maps {
+		map-passive {
+			trip = <&cluster1_alert_passive>;
+			cooling-device = <&cpu4 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+					 <&cpu5 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+					 <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+					 <&cpu7 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+		};
+	};
 };
 

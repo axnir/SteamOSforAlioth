@@ -1,0 +1,21 @@
+power: supply: add POWER_SUPPLY_PROP_CHARGING_ENABLED
+
+The enum value the PM8150B charger driver (and the downstream Qualcomm
+vendor drivers it follows) use to expose and control the charging
+enable bit. The pmOS soc/qualcomm-sm8250 tree carries the same value;
+mainline does not, so the driver fails to build against pristine
+7.2.8. Deliberately no sysfs name: the driver only uses it internally
+and the pmOS tree does not expose it either.
+
+Source: darknagel/oneplus-instantnoodlep-nura-unofficial against the
+pmOS soc tree (sm8250-7.2.0_git20261010).
+--- a/include/linux/power_supply.h
++++ b/include/linux/power_supply.h
+@@ -178,6 +178,7 @@
+ 	POWER_SUPPLY_PROP_MANUFACTURE_DAY,
+ 	POWER_SUPPLY_PROP_INTERNAL_RESISTANCE,
+ 	POWER_SUPPLY_PROP_STATE_OF_HEALTH,
++	POWER_SUPPLY_PROP_CHARGING_ENABLED,
+ 	/* Properties of type `const char *' */
+ 	POWER_SUPPLY_PROP_MODEL_NAME,
+ 	POWER_SUPPLY_PROP_MANUFACTURER,

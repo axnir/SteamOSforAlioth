@@ -1,0 +1,78 @@
+power: supply: bq27xxx: use the internal sensor when the TS pin is unpopulated
+
+The OnePlus 8 Pro (instantnoodlep, hw_version 15) does not populate the
+bq27541's TS thermistor input: battery temperature in the vendor setup
+comes from the PM8150B batt_therm ADC instead. With the TEMPS
+pack-configuration bit at its default (external thermistor),
+Temperature() reads the floating pin and reports a stuck bogus value
+(52.1 C while the whole board sits at 38-42 C); the charger policy then
+refuses to charge as "too hot".
+
+Add a "ti,ts-pin-unused" DT property: when set, Temperature() comes
+from InternalTemperature() (0x28), which TI confirms works regardless
+of the TEMPS bit. The same off-spec firmware that reports SOC and
+Temperature() in unexpected units reports InternalTemperature() in
+decidegrees Celsius as well, so no Kelvin conversion on this path.
+
+Verified on device by direct i2c reads: INT_TEMP tracks the board
+(37.0 -> 36.9 C) while Temperature() stays pinned at 521.
+
+Precedent: the OnePlus 6/6T shipped either bq27411 or bq27541 depending
+on the production run, and misbinding the compatible produced exactly
+this class of garbage readings (sdm845-mainline issue #36).
+--- a/drivers/power/supply/bq27xxx_battery.c
++++ b/drivers/power/supply/bq27xxx_battery.c
+@@ -1712,6 +1712,22 @@
+ {
+ 	int temp;
+ 
++	if (di->use_internal_temp) {
++		temp = bq27xxx_read(di, BQ27XXX_REG_INT_TEMP, false);
++		if (temp < 0) {
++			dev_err(di->dev, "error reading internal temperature\n");
++			return temp;
++		}
++
++		/*
++		 * The same off-spec firmware reports InternalTemperature()
++		 * in decidegrees Celsius as well (see the Temperature()
++		 * comment below); no Kelvin conversion here.
++		 */
++		val->intval = temp;
++		return 0;
++	}
++
+ 	temp = bq27xxx_read(di, BQ27XXX_REG_TEMP, false);
+ 	if (temp < 0) {
+ 		dev_err(di->dev, "error reading temperature\n");
+--- a/drivers/power/supply/bq27xxx_battery_i2c.c
++++ b/drivers/power/supply/bq27xxx_battery_i2c.c
+@@ -181,6 +181,17 @@
+ 
+ 	di->dev = &client->dev;
+ 	di->chip = id->driver_data;
++
++	/*
++	 * OnePlus 8 Pro (hw_version 15): the board does not populate the
++	 * bq27541 TS thermistor input (battery temperature comes from the
++	 * PMIC batt_therm in the vendor setup). With the default TEMPS
++	 * pack-configuration bit, Temperature() reads the floating pin and
++	 * reports a stuck bogus value. Boards that set ti,ts-pin-unused in
++	 * DT switch Temperature() to the internal sensor instead.
++	 */
++	di->use_internal_temp = device_property_read_bool(&client->dev,
++						 "ti,ts-pin-unused");
+ 	di->name = name;
+ 
+ 	di->bus.read = bq27xxx_battery_i2c_read;
+--- a/include/linux/power/bq27xxx_battery.h
++++ b/include/linux/power/bq27xxx_battery.h
+@@ -64,6 +64,8 @@
+ 	int voltage_min_design;
+ 	int voltage_max_design;
+ 	bool removed;
++	/* DT ti,ts-pin-unused: Temperature() comes from the internal sensor */
++	bool use_internal_temp;
+ 	unsigned long last_update;
+ 	union power_supply_propval last_status;
+ 	struct delayed_work work;

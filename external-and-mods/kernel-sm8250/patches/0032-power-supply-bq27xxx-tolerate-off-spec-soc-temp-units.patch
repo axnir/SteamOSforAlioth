@@ -1,0 +1,130 @@
+--- a/drivers/power/supply/bq27xxx_battery.c
++++ b/drivers/power/supply/bq27xxx_battery.c
+@@ -1578,8 +1578,26 @@
+ 	else
+ 		soc = bq27xxx_read(di, BQ27XXX_REG_SOC, false);
+ 
+-	if (soc < 0)
++	if (soc < 0) {
+ 		dev_dbg(di->dev, "error reading State-of-Charge\n");
++		return soc;
++	}
++
++	/*
++	 * OnePlus 8 Pro 上那颗 bq27541（DeviceType() = 0x0421）的固件把
++	 * StateOfCharge() 报成 0.01 % 单位：3807 表示 38.07 %。上游按
++	 * 0-100 直接使用，power_supply 的 capacity 就变成 3807 %。
++	 *
++	 * 只有越界时才换算，正常报 0-100 的 gauge 完全不受影响；
++	 * 超过 10000 的值连 0.01 % 也解释不了，当作读数无效返回错误。
++	 */
++	if (soc > 100) {
++		if (soc > 10000) {
++			dev_dbg(di->dev, "implausible State-of-Charge %d\n", soc);
++			return -ENODATA;
++		}
++		soc = DIV_ROUND_CLOSEST(soc, 100);
++	}
+ 
+ 	return soc;
+ }
+@@ -1634,10 +1652,28 @@
+  * Return the battery Full Charge Capacity in µAh
+  * Or < 0 if something fails.
+  */
++static int bq27xxx_battery_read_dcap(struct bq27xxx_device_info *di,
++				     union power_supply_propval *val);
++
+ static inline int bq27xxx_battery_read_fcc(struct bq27xxx_device_info *di,
+ 					   union power_supply_propval *val)
+ {
+-	return bq27xxx_battery_read_charge(di, BQ27XXX_REG_FCC, val);
++	int ret;
++
++	ret = bq27xxx_battery_read_charge(di, BQ27XXX_REG_FCC, val);
++	if (ret < 0)
++		return ret;
++
++	/*
++	 * 0xFFFE / 0xFFFF 是 gauge 的"FCC 未知"哨兵值（还没做过完整学习
++	 * 循环时就是这样）。上游会把它 ×1000 报成 65.5 Ah。这时退回设计
++	 * 容量，比报一个明显不可能的数好。
++	 */
++	if (val->intval >= 0xfffe * 1000 &&
++	    di->regs[BQ27XXX_REG_DCAP] != INVALID_REG_ADDR)
++		return bq27xxx_battery_read_dcap(di, val);
++
++	return 0;
+ }
+ 
+ /*
+@@ -1721,6 +1757,17 @@
+ 	if (di->opts & BQ27XXX_O_ZERO)
+ 		temp = 5 * temp / 2;
+ 
++	/*
++	 * 同一批固件的 Temperature() 直接返回 0.1 °C，不是 datasheet 的
++	 * 0.1 K。照上游减 2731 会得到 -246.7 °C，thermal 子系统还会把这个
++	 * 值当成电池温度去限流。用"减出来低于 -100 °C"当判据回退，
++	 * 正常 gauge（25 °C 时 raw≈2981）走的还是原来的换算。
++	 */
++	if (temp - 2731 < -1000) {
++		val->intval = temp;
++		return 0;
++	}
++
+ 	/* Convert decidegree Kelvin to Celsius */
+ 	temp -= 2731;
+ 
+@@ -1830,7 +1877,13 @@
+ 		health = POWER_SUPPLY_HEALTH_OVERHEAT;
+ 	else if (unlikely(bq27xxx_battery_undertemp(di, di->cache.flags)))
+ 		health = POWER_SUPPLY_HEALTH_COLD;
+-	else if (unlikely(bq27xxx_battery_dead(di, di->cache.flags)))
++	/*
++	 * SOCF 位（"电量耗尽"）在 OnePlus 8 Pro 的 gauge 上常驻置位，
++	 * 即使电量还有 30 % 也报 Dead，于是 upower / SteamOS 直接把电池
++	 * 判成坏电池。只在容量确实见底时才认这个标志。
++	 */
++	else if (unlikely(bq27xxx_battery_dead(di, di->cache.flags)) &&
++		 di->cache.capacity >= 0 && di->cache.capacity <= 5)
+ 		health = POWER_SUPPLY_HEALTH_DEAD;
+ 	else if (unlikely(bq27xxx_battery_capacity_inaccurate(di, di->cache.flags)))
+ 		health = POWER_SUPPLY_HEALTH_CALIBRATION_REQUIRED;
+@@ -1899,7 +1952,11 @@
+ 		val_curr->intval = curr;
+ 
+ 	if (val_status) {
+-		if (bq27xxx_battery_is_full(di, flags))
++		/*
++		 * 满电位不能盖过"正在放电"的事实：这块 gauge 的 FC 位常亮，
++		 * 上游逻辑会让 2 A 放电中的电池报 FULL。
++		 */
++		if (bq27xxx_battery_is_full(di, flags) && curr >= 0)
+ 			val_status->intval = POWER_SUPPLY_STATUS_FULL;
+ 		else if (curr > 0)
+ 			val_status->intval = POWER_SUPPLY_STATUS_CHARGING;
+@@ -2012,6 +2069,23 @@
+ 			level = POWER_SUPPLY_CAPACITY_LEVEL_CRITICAL;
+ 		else
+ 			level = POWER_SUPPLY_CAPACITY_LEVEL_NORMAL;
++	} else if ((di->cache.flags & BQ27XXX_FLAG_FC) &&
++		   (di->cache.flags & BQ27XXX_FLAG_SOCF)) {
++		/*
++		 * "已满"和"已耗尽"同时置位 —— 这块 gauge 的 flags 不可信
++		 * （实测 Flags() = 0x0F3B，FC 与 SOCF 都亮）。按 capacity
++		 * 分档，否则电池图标永远满格。
++		 */
++		if (di->cache.capacity < 0)
++			level = POWER_SUPPLY_CAPACITY_LEVEL_UNKNOWN;
++		else if (di->cache.capacity >= 95)
++			level = POWER_SUPPLY_CAPACITY_LEVEL_FULL;
++		else if (di->cache.capacity <= 5)
++			level = POWER_SUPPLY_CAPACITY_LEVEL_CRITICAL;
++		else if (di->cache.capacity <= 15)
++			level = POWER_SUPPLY_CAPACITY_LEVEL_LOW;
++		else
++			level = POWER_SUPPLY_CAPACITY_LEVEL_NORMAL;
+ 	} else {
+ 		if (di->cache.flags & BQ27XXX_FLAG_FC)
+ 			level = POWER_SUPPLY_CAPACITY_LEVEL_FULL;
