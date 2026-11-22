@@ -2916,3 +2916,60 @@ psy：`battery`（fg，主）与 `bq27411-0`（第二意见）。0032/0036 补�
 **挂起**：aw8697 FF 链路 RC=0（EVIOCSFF 修复 = struct ff_effect 48 字节）
 但用户未感觉到震动——play_effect 路径待查（挂到音频/触感阶段）。
 ffplay 工具沉淀在 `work/fftool-src/`。
+
+---
+
+## 32. 音频开工：adsp 固件调查与排除清单（2026-11-22）
+
+### 32.1 顺手修复：时区
+
+SteamOS 默认时区是 `America/Los_Angeles`，用户看到的时间差 16 小时。
+`timedatectl set-timezone Asia/Shanghai` 修掉；NTP 同步（systemd）本来就
+在跑，开机自动对时。**此后所有 op8p 交付出厂配置都应直接写
+`Asia/Shanghai`**（记入 make-op8p-rootfs 待办）。
+
+### 32.2 启动链现状（dmesg 事实）
+
+内核按 DTB `firmware-name` 请求 `/lib/firmware/postmarketos/{adsp,cdsp,slpi}.mbn`。
+已试过的三种来源与结果：
+
+| 来源 | 结果 |
+|---|---|
+| 通用签名（ROCKNIX linux-firmware 20260916，镜像出厂） | `-22 setting up firmware` |
+| modem_a 机内 .mdt/.bNN 现拼（squash-qcom-mdt.py） | adsp `-22 initializing`（TZ 验签拒）；**cdsp 验签过了但 `auth_and_reset` -22**；slpi 未单独测 |
+| AYN Thor adsp（不同 OEM 签名） | `-22 initializing` |
+
+### 32.3 Nura 的真实做法（读完 firmware/ 全部脚本后的复盘）
+
+- 镜像"console only, no proprietary OnePlus files"：**不内置任何机内固件**；
+- `dsp-firmware.sh` 首启只从 modem 槽取 **slpi/venus/cdsp**（pil-squasher 现拼，
+  放 `/lib/firmware/updates/postmarketos/` 覆盖打包版）；
+- **adsp 不在这个脚本里**——pmOS 体系里它来自 `firmware-oneplus-instantnoodlep`
+  提取包，安装时从用户自己手机的分区提取（我们缺的就是这一步的正确姿势）；
+- 脚本靠 cmdline 的 `androidboot.slot_suffix` 决定取 modem_a 还是 modem_b
+  ——**我们的 cmdline 没有这个标记**，之前"取 modem_a"是拍脑袋，没有依据。
+
+### 32.4 已排除（不再走）
+
+| 途径 | 结论 |
+|---|---|
+| super 动态分区（vendor_a EROFS） | **没有 adsp.mbn**。513 MB vendor 镜像已拉到主机（WiFi 流式 ~11 MB/s，47 s）并用 erofs-utils 解包验证：`firmware/` 目录结构与预期一致但无 adsp |
+| OnePlus OTA（oneplus-ota-fetch.json） | 只含指纹 TA（gfp96xx）+ 传感器配置，无 adsp |
+| AYN Thor / 通用签名固件 | TZ 拒签 |
+| modem_a 的 adsp | 不是本机 bootloader 配套版本（拒签 + cdsp auth 失败，Nura 注释明说打包固件可能与本机共享内存布局不兼容） |
+
+### 32.5 待决（三个候选，等用户拍板）
+
+1. **modem_b 对比**（1 条只读命令）：挂 modem_b、sha256 对比 adsp/cdsp。
+   当前活动槽是 b——原厂配套固件可能在 modem_b，正好解释拒签；
+2. **用户提供 OxygenOS 完整 OTA 或原厂分区备份**，从配套版本提取；
+3. **转 Venus**：venus.mbn 已确认在 modem_a，Nura 标注 works，无 TZ 签名敏感。
+
+### 32.6 工具沉淀（work/fftool-src/）
+
+- `ffplay.c` / `ffplay`：免 libc aarch64 FF 触发器（2.2 KB，raw syscall）。
+  注意 `struct ff_effect` 在新内核为 **48 字节**（EVIOCSFF=0x40304580）；
+- `receiver.py`：主机端 HTTP POST 流式接收（WiFi 快传，实测 ~11 MB/s）；
+- `scan2.py`：super 分区 ext4/EROFS/f2fs 魔数扫描器；
+- `lpinfo.py` / `findname.py`：LP metadata 解析 / 文件名扫描（本轮弃用，
+  留档）。串口 base64 推送流程见 memory 2026-11-22。
