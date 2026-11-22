@@ -2973,3 +2973,124 @@ SteamOS 默认时区是 `America/Los_Angeles`，用户看到的时间差 16 小�
 - `scan2.py`：super 分区 ext4/EROFS/f2fs 魔数扫描器；
 - `lpinfo.py` / `findname.py`：LP metadata 解析 / 文件名扫描（本轮弃用，
   留档）。串口 base64 推送流程见 memory 2026-11-22。
+
+---
+
+## 33. 震动的 reset 极性：ACTIVE_HIGH 把芯片按在复位里（2026-11-22）
+
+驱动在树里（0031）、DTS 节点齐全、`CONFIG_INPUT_AW8697=y`，probe 却失败，
+i2c11 上 `i2cdetect` 连 0x5a 都没有 —— 整条总线 NACK，看起来像"芯片没焊好"
+或"供电没起来"。
+
+判据链（不靠猜）：
+
+1. `debugfs` 读 gpio72：**物理低**；
+2. 读 `drivers/aw8697.c` 的 `aw8697_hw_reset()`：`:569` 写逻辑 1（拉复位），
+   `:571` 写逻辑 0（释放），而 `devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH)`
+   的初值也是逻辑 1。也就是说**复位序列结束时引脚停在逻辑 0**；
+3. 在 `GPIO_ACTIVE_HIGH` 的语义下，逻辑 0 = 物理低 = **RSTN 有效** ——
+   驱动以为自己在"释放复位"，实际把芯片一直摁在复位里。
+
+改 `GPIO_ACTIVE_LOW` 后 probe 成功（`input2` 注册，`/dev/input/event*` 出现）。
+
+留档两点：
+
+- Nura 的 0074 用的是 `ACTIVE_HIGH`，而且它自己标注"未设备验证"。这是
+  "参考移植里没验过的部分不能当前提"的又一例，和 §30.7 的 bq27541 同型。
+- 手感仍未确认：FF 上传 `RC=0`（`EVIOCSFF` 0x40304580，`struct ff_effect`
+  48 字节）但用户没感觉到震动 —— `play_effect` 路径待查，挂在音频/触感阶段
+  （§30.10 末尾）。**驱动 probe 成功 ≠ 震得动**，这两件事这次分开记。
+
+## 34. 换机后的地基：三处静默故障与 docker 构建入口（2026-11-22）
+
+换机（`MIGRATION.md`）之后在 macOS 上重新验证，先撞上的不是设备问题，是
+**仓库和构建链的三处静默故障**：它们都不报错，只是让"验证"变成假的。
+
+### 34.1 三个静默故障
+
+| 现象 | 真因 | 判据 |
+|---|---|---|
+| `git status` 110 个文件全脏，18033 增 / 18033 删 | 工作树被转成 CRLF，索引是 LF | `git diff --ignore-cr-at-eol` 为空 + 逐文件增删等量 = 纯行尾；`git checkout -- .` 复原 |
+| `assert-op8p-stage2.sh` 无任何输出、退出码 1 | `output/current` 是**被展开成空目录的符号链接**（Windows 拷贝把 `ln -sfn` 摊平了）+ `find dtbs` 返回 1 + `set -e` | 三条路径分开：目录不存在 / 缺 dtbs / 缺 config 都显式 SKIP 并说明 |
+| `assert-op8p-power.sh` 三条 FAIL | 期望值停在修复前：`ti,bq27541`、`fuel-gauge = <&smart_battery>`、`reset ACTIVE_HIGH` | 按 §30.8–30.10 与 §33 的实测结论对齐 |
+
+行尾那条最危险的不是文档，是这三处**会原样进镜像**：
+`external-and-mods/kernel-common/initramfs/init`（shebang 带 `\r` → 内核
+exec 失败 = 起不来）、`alioth-overlay/usr/lib/steamos-arm/alioth-*`（126 退出，
+memory 里已记两次）、`scripts/assert-*.py` 与 `mkbootimg-v2.py`。
+
+两个断言脚本的修改都做了**负向测试**：把值改回旧写法，断言必须报红（分别
+报 2 / 2 / 1 / 3 条），恢复后全绿。这一步不能省 —— 一个恒绿的断言比没有
+断言更糟。stage2 另外加了一条真检查："反编译产出的 dtb，确认里面真的有
+`awinic,aw8697`"（需要 `dtc`；没有就 SKIP 并说明，不假装通过）。
+
+`output/current` 修复：`rmdir current && ln -s 7.2.8-sm8250-steamos current`。
+
+### 34.2 构建入口：`scripts/op8p-build-docker.sh`
+
+`work/wslc-op8p-build.sh` 驱动的是 Windows 容器 CLI（`/c/Program Files/WSL/wslc`），
+在 macOS 上不存在。新增三个文件，与它并存（Windows 那台继续用旧的）：
+
+| 文件 | 作用 |
+|---|---|
+| `scripts/op8p-build-docker.sh` | 宿主入口：挂 `/repo`（bind）+ `/work`（docker volume），跑容器 |
+| `scripts/op8p-build-container.sh` | 容器内：装依赖、取 busybox、去 CRLF、调 `build.sh sm8250`、把 `output/` 带回来 |
+| `scripts/op8p-build.Dockerfile` | 工具链镜像 `op8p-build:43`，把 330 个包烧进层里 |
+
+四个关键决策，每个都因为踩过：
+
+1. **aarch64 不传 `CROSS_COMPILE`。** colima 是 aarch64 VM，镜像也是 arm64
+   原生，`build.sh` 自己就在 `uname -m == aarch64` 时走原生分支；硬塞
+   `CROSS_COMPILE` 会去找一个不该存在的 `aarch64-linux-gnu-gcc`。
+2. **包列表按架构分支。** Fedora 的 aarch64 仓库没有 `gcc-aarch64-linux-gnu`
+   —— 这个名字只在"从哪些架构交叉出去"的仓库里存在。
+3. **`/work` 用 volume，不用 bind。** 内核树是几十万文件 + 140 MB 缓存，
+   放 virtiofs 上元数据开销比编译本身还贵，也免得 `git status` 被副产品弄脏。
+4. **`safe.directory`。** bind mount 属主不是 root，git 判 "dubious ownership"
+   拒绝操作，而 `build.sh` 会把拒绝读成
+   `ROCKNIX checkout does not match pinned 20261001`（一句非常误导的错误）。
+
+实测（MacBook，colima aarch64）：
+
+| 场景 | 耗时 |
+|---|---|
+| 首次全量（含 linux-7.2.8.tar.xz 140 MB、extra-firmware、11 个 linux-firmware 文件） | 7 分 19 秒 |
+| 增量，直接用 `fedora:43`（每次重装 330 包） | 1 分 42 秒 |
+| 增量，用工具链镜像 `op8p-build:43` | **29 秒** |
+
+镜像只影响速度不影响正确性：容器内脚本仍会 `dnf install` 一遍（幂等），
+镜像过期时包会被补齐。`--bare` 参数强制不用镜像，用来验证脚本自身能独立跑。
+
+### 34.3 新产物**不等于**已验收的那份（别把"编出来了"当"没变"）
+
+这次重编的 Image 与 §28 验收那份：
+
+| | 旧（11:26，刷在 a 槽 / 曾用于验收） | 新（本轮） |
+|---|---|---|
+| `Image` 大小 | 35,887,616 | 35,887,616（一模一样） |
+| `Image` sha256 前 12 | `98d157c6bcc2` | `3857076c0753`（首编）/ `0ef5e5c317bf`（增量） |
+| 编译器 | `aarch64-linux-gnu-gcc` **15.2.1**（Red Hat Cross） | `gcc` **15.3.1**（Red Hat，原生） |
+| binutils AS/LD | 2.45.0 | 2.45.1 |
+
+`config` 的非注释行只差 **9 行**，全是编译器身份（`CC_VERSION_TEXT`、
+`GCC_VERSION`、`AS_VERSION`、`LD_VERSION`、`CC_CAN_LINK`），**配置契约一致**；
+二进制差异来自 gcc 15.2.1 → 15.3.1。
+
+两个结论都写下来：
+
+1. **Image 每次构建 sha 都不同，即使源码和配置一字未改** —— 内核会嵌入构建
+   时间戳（`UPD include/generated/compile.h`、`init/version-timestamp.o`）。
+   所以**不要用 sha 判断"源码有没有变"**；要判断看 `config` 和 `build.sh`
+   的 patch digest（它自己会打 `source already patched`）。
+2. **配置等价 ≠ 二进制等价，要上机就得重新验收。** 旧的已验收产物留在
+   `work/kernel-sm8250/output-1126-accepted/`（git-ignored），新产物在
+   `output/7.2.8-sm8250-steamos/`，两者不要混着说。
+
+### 34.4 这轮**没做**的两件事
+
+- `make-op8p.sh --install` / `--verify` 仍然只认"Linux 工具在 PATH"或 `wslc`。
+  macOS 上会走到 `[[ -x .../wslc ]]` 然后 die。要么 `brew install e2fsprogs`
+  并把 keg 路径放进 PATH，要么照 `op8p-build-docker.sh` 的样子改成 docker。
+- `flash-op8p.sh` / `make-op8p.sh` **都不调用 `assert-op8p-*`**。alioth 那边
+  是"断言不绿就拒绝刷机"，OP8P 这边只是仓库里放着。这是与 AGENTS.md
+  "规则被检查而不是被记住"最明显的一处差距。
