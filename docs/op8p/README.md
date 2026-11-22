@@ -2311,4 +2311,608 @@ phy0: Wireless LAN   Soft blocked: yes
 已写回 `0`；`NetworkManager.state` 里 `WirelessEnabled=true`。
 **下次开机会不会自动恢复 unblocked，还没验证过。**
 
+---
 
+## 26. 阶段 2：温控、电量计、DSP 固件（2026-11-21 深夜）
+
+阶段 1（电源键 / 音量键 / 游戏态调度 / 温度看门狗）是热部署，本轮这三项要动
+内核，所以放在一起构建、一次刷 `boot_a`。
+
+### 26.1 温控：两个 cluster 温区原来完全不参与降温
+
+真机实测（`/sys/class/thermal/thermal_zone*/`）：
+
+| 温区 | 温度 | 绑定的 cooling device |
+| --- | --- | --- |
+| cpu0-thermal … cpu3-thermal | 44 °C | 6 |
+| cpu4-top … cpu7-bottom | 43 °C | 12 |
+| gpu-top / gpu-bottom | 42 °C | 3 |
+| **cluster0-thermal (zone5)** | 44 °C | **0** |
+| **cluster1-thermal (zone6)** | 44 °C | **0** |
+| aoss / wlan / video / mem / npu … | 42-43 °C | 0 |
+
+`sm8250.dtsi` 给 cluster0/cluster1 只写了 `type = "hot"` 的 90 °C trip，既没有
+passive trip 也没有 cooling-maps —— hot 只上报、不降频。CPU 温区虽然绑了
+cooling device，但被动降频阈值是 **90 °C / 95 °C**，而这台机器跑 Steam 时
+稳定在 80-90 °C，等于永远踩不到线。
+
+改法（`dts/sm8250-oneplus-instantnoodlep.dts` 末尾）：
+
+- 12 个 CPU 温区的一档 90 → **84**，二档 95 → **88**
+- GPU 的 85 → **82**（上下两个温区）
+- cluster0 补一档 84 °C 的 passive trip，绑 cpu0-3；cluster1 同样，绑 cpu4-7
+- critical 110 °C 一个都没动 —— 那是最后关机线
+
+两层结构：用户态 `op8p-thermal-guard` 按 78/84/88 进、72/79/84 退压
+`scaling_max_freq`（阶段 1 已上线），内核这层是它没跑起来时的兜底。两者写
+同一个文件，谁最后写谁生效，所以内核这层只负责"不至于完全不降"。
+
+### 26.2 电量计：这块 gauge 有四处不符合 datasheet
+
+DTS 里 compatible 写的是 `ti,bq27541`，但直读芯片命令寄存器得到
+`DeviceType() = 0x0421`（BQ27742-G1）。寄存器表本身和 bq27541 一致，问题是
+**同一组寄存器里的数值语义不同**：
+
+| 属性 | 上游解析 | 实测原始值 | 真值 |
+| --- | --- | --- | --- |
+| `capacity` | SOC 0-100 % | 寄存器 0x2C = **0x0EDF = 3807** | 38.07 %（0.01 % 单位） |
+| `temp` | 0.1 K，减 2731 | 0x06 = 0x0108 = 264 | 26.4 °C（0.1 °C 单位） |
+| `charge_full` | FCC × 1000 µAh | 0x12 = **0xFFFE** | 未学习，用设计容量 4455 mAh |
+| `health` | FLAGS 的 SOCF 位 | 0x0A = **0x0F3B**（FC 与 SOCF 同时置位） | 正常 |
+
+判定依据不是猜的：`temp = 264` 减 2731 得 −246.7 °C；同时电压 3692 mV、
+放电 2142 mA 与 38 % 自洽（86 % 对应 OCV 4.05 V，与实测对不上）。SOC 与
+NAC 的 3823 mAh 那条线是矛盾的，真正可信的是 SOC 与电压。
+
+补丁 `patches/0032-power-supply-bq27xxx-tolerate-off-spec-soc-temp-units.patch`
+（6 个 hunk）全部采用**越界才修正**的写法，正常 gauge 走原路径：
+
+1. `read_soc`：>100 且 ≤10000 时按 0.01 % 换算；>10000 返回 `-ENODATA`
+2. `read_temperature`：减 2731 后低于 −100 °C 判定为 0.1 °C，直接用
+3. `read_fcc`：≥0xFFFE×1000 视为未学习，回落到 `read_dcap`
+4. `read_health`：SOCF 位置位但容量 >5 % 时不再报 `DEAD`
+5. `capacity_level`：FC 与 SOCF 同时置位时（自相矛盾）改按 capacity 分档
+6. `current_and_status`：放电中（curr < 0）不再被 FC 位盖成 `FULL`
+
+### 26.3 DSP 固件：路径是 `postmarketos/`，不是 `qcom/sm8250/`
+
+dmesg 说得很清楚：
+
+```
+Direct firmware load for postmarketos/adsp.mbn failed with error -2
+```
+
+镜像里放的是 `qcom/sm8250/adsp.mbn`（soc.env 的 FW_BUILTIN 带上来的），而
+DTS 的 `firmware-name` 指 `postmarketos/`。补上路径后固件能加载（
+`Booting fw image postmarketos/adsp.mbn, size 17166524`），但接着报
+
+```
+qcom_q6v5_pas 17300000.remoteproc: error -22 setting up firmware
+```
+
+`-22` 是 `-EINVAL`。alioth 的记录（`docs/alioth.md` §阶段 2）说这类
+`qcom_scm_pas_init_image` 的 EINVAL 是 TrustZone 拒收通用签名镜像，必须用
+机内签名的那份。这里已经照做 —— 从本机 `modem_a` 的
+`image/adsp.mdt` + `adsp.b00..b18` 用 `scripts/squash-qcom-mdt.py` 拼成
+17,166,524 字节的 `adsp.mbn`，**仍然 −22**。所以 op8p 这条不是（或不只是）
+签名问题，待查。硬件排除了两件事：modem 分区里有 adsp/cdsp/slpi 三套完整
+mdt，且 a650_zap 用的是 linux-firmware 版（与设备上 sha256 相同）却能正常
+初始化 GPU —— 说明 TZ 并不一概拒收通用签名。
+
+落地方式与固件分发：**机内签名的固件不进镜像**。新增
+`op8p-overlay/usr/lib/steamos-arm/op8p-dsp-firmware` +
+`op8p-dsp-firmware.service`，开机时从 `modem_a` 现取、squash、再重绑
+`qcom_q6v5_pas`。与 Nura 的 "first boot copies the DSP firmware from your own
+partitions" 同一个思路。
+
+### 26.4 构建与断言
+
+```
+./work/wslc-op8p-build.sh            5 分 53 秒（wslc + fedora:43）
+work/kernel-sm8250/output/current/
+  boot/Image                          35,887,616 B
+  dtbs/…instantnoodlep.dtb               136,412 B（+432，温控节点）
+work/steamos-op8p/boot-op8p-gzip.img    15,265,792 B
+scripts/assert-op8p-stage2.sh           21 通过 / 0 失败
+```
+
+### 26.5 下一次要做的验证
+
+1. `fastboot flash boot_a` + `erase dtbo_a` + `set-active=a` 后确认能起来
+2. `thermal_zone5/cdev*` 从 0 变成 4、`trip_point_0_temp` 读到 84000
+3. 电量计在 `/sys/class/power_supply/bq27541-0/`（**不是 `bms/`**，2026-11-21
+   实测就是这个名字）：`capacity` 在 30-50 之间、`temp` 在 200 左右（0.1 °C）、
+   `health` 不再是 Dead
+4. adsp 的 −22：换 7.2.8 侧 `qcom_scm` 的 debug 或对比 Nura 的 DTS/固件流程
+
+
+
+
+---
+
+## 27. 刷 b 槽之前：打包链上两个静默故障和一条被推翻的结论（2026-11-21 深夜）
+
+### 27.1 `make-op8p.sh` 报 `boot/Image` 不存在 —— 其实是 python 变了
+
+现象：`Image` 明明在（35,887,616 B），打包却抛
+
+```
+FileNotFoundError: '/d/Developer/Repo/SteamOSforAlioth/work/kernel-sm8250/
+                    output/7.2.8-sm8250-steamos/boot/Image'
+```
+
+原因不在内核产物，在**解释器**：这台机器上 `python3` 现在解析到
+WorkBuddy 自带的原生 Windows 版（`C:/Users/moeka/.workbuddy/binaries/
+python\versions\3.13.12\python3.exe`）。win32 python 不认 MSYS 的
+`/d/Developer/...`，会把它当成「当前盘符下的 /d/...」，于是把一个好文件
+报成不存在。之前能跑通是因为当时的 PATH 里排在前面的是一份能读 MSYS 路径
+的解释器。
+
+修法（`make-op8p.sh`）：新增 `python3w()`，把所有以 `/` 开头的参数先过
+`cygpath -w`；没有 `cygpath` 的环境（Linux）原样透传。三处 `python3`
+（`stage_payload`、`mkbootimg-v0.py`、`mkbootimg-v2.py`）都改用它。
+
+顺带修掉一个**静默失败**：`stage_payload` 的最后一句是 `echo "$payload"`，
+所以 python 挂了函数照样返回 0，`set -e` 不触发，后面 `cat` 一个不存在的
+`Image.gz` 才报错，日志看起来像「DTB 打包出错」。现在改成
+`|| return 1` + 调用处 `|| die`。
+
+### 27.2 GPU ramdisk 的 96 KB 必须验内容，不能看大小的近似
+
+`gpu-fw-ramdisk.cpio.gz` 新旧两版都是 94,994 B（6 个文件、两个搜索路径、
+页对齐），光看大小分辨不出里面装的是谁的 zap。验法：解出 cpio 后按 newc
+头部（`filesize` 在偏移 54、`namesize` 在 94、名字从 110 开始，均 4 字节
+对齐）取出数据段算 sha256。当前产物：
+
+```
+qcom/a650_zap.mdt          size=13964  sha256=0624d84e…  ← linux-firmware 那份
+updates/qcom/a650_zap.mdt  size=13964  sha256=0624d84e…
+```
+
+顺带把 ramdisk 脚本里 `dnf install` 的输出从 `>/dev/null 2>&1` 改成只吞
+stdout：容器里 dnf 抖一下会让整个脚本静默 exit 1，外层只看到「没产出」。
+
+### 27.3 【结论作废，2026-11-22 更正】方向推反了：TZ 要的是本机签名
+
+本节原先写的「TZ 接受 linux-firmware 那条链、拒收 vendor_a」是**反的**。
+真正的事实，三处独立记录早就写死：
+
+- `docs/alioth.md:1643`（10-24）：**TrustZone 拒收通用签名的 PAS 镜像**，
+  `a650_zap.mbn` / `adsp.mbn` 用 linux-firmware 那份都报
+  `error -22 initializing firmware`（`qcom_scm_pas_init_image` 返 -EINVAL）；
+  必须用机内签名那份，两份连大小都一样（zap 都是 13,964 B），只有签名不同。
+- `§25` 第 6 条：21:00 能进 Steam 登录页的修法就是「**本机签名的 zap
+  四件套塞进 initramfs**」。
+- 提交 `f3ef29c` 的 `scripts/make-op8p-gpu-ramdisk.sh`：用的正是
+  `work/op8p-firmware/a650_zap.mdt + .b00/.b01/.b02`。
+
+被拒的是 **linux-firmware / `California / SecTools / Test User`** 那条链，
+被接受的是本机 `vendor_a` 的 **`OEM CA / Technologies / US`** 那条。
+
+**事故经过**：按这节的错误推论，两个生成脚本里的 zap 从「本机签名四件套」
+换成了「linux-firmware 的 `.mbn` 改名 `.mdt`」（sha `0624d84e…`）。结果 GPU
+zap shader 被 TZ 拒收（`error -22` 累计 302 次）、gamescope 拿不到 Vulkan、
+sddm 反复 `Removing display / Adding new display`，屏幕回到纯黑 —— 把
+`f3ef29c` 已经跑通的图形会话弄坏了。
+
+修法已固化：两个脚本都改回四件套，合成脚本加 `b01` 的 sha256 防呆断言
+（`2cccbd69…`）。校验产物：`.mdt` 6860 B / `d059d0d2…`，
+`.b01` 6712 B / `2cccbd69…`。
+
+**顺带纠正另一条误判**：Linux 的 `populate_rootfs()` 是内置 initramfs 与
+外部 initrd **叠加**解包，不是「有 initrd 就跳过内置」。当时那个 `~ #`
+救援 shell 的真因是 ABL 给了 `androidboot.startupmode=dc_charger`，
+不是 ramdisk 缺 `/init`。
+
+逐段比对本身没错，错的只是「谁被接受」：
+
+| 段 | 用途 | 长度 | 结果 |
+|---|---|---|---|
+| b00 | hash table | 0x94 | 相同 `ec9b9d5a…` |
+| b01 | 签名段（X.509 证书链） | 0x1a38 | **不同** `2cccbd69…`（本机，可用） vs `efaaffe6…`（通用，被拒） |
+| b02 | 代码段 | 0x68c | 相同 `a415e545…` |
+
+`scripts/squash-qcom-mdt.py` 的拼装逐字节正确，它只拼不签。所以 adsp 也
+照 `§25.5` 从 `modem_a` 取**本机签名**那份即可，不需要另找别的签名。
+
+### 27.4 刷 b 槽的操作序列
+
+`misc`（`/dev/sda3`）写引导标记进 fastboot —— 2026-11-21 实测仍然有效：
+
+```
+dd if=/dev/zero of=/dev/sda3 bs=512 count=1 conv=notrunc
+printf "boot-fastboot" | dd of=/dev/sda3 bs=1 seek=0 conv=notrunc
+sync; reboot -f
+```
+
+进 fastboot 后核对的几何（本次实读）：`current-slot: a`、`boot_a`/`boot_b`
+都是 `0x6000000`（100,663,296）、`dtbo_a` `0x1800000`、`abl_a` 存在、
+`product` 这次答的是 `OnePlus8Pro`（§24 记的 `kona` 是旧 ABL 的答案，两种
+都要接受）。写 `boot_b` + `erase dtbo_b` 由 `./flash-op8p.sh --test` 做，
+脚本要求 TTY 输入 `YES`。
+
+闲聊级别的一条：设备上 `/lib/firmware/postmarketos/` 只有 `adsp.mbn` 和
+`cdsp.mbn`，没有 `slpi.mbn` —— 正好印证删掉 `ConditionPathExists=!…/adsp.mbn`
+那条判断是对的（否则三个里缺一个整个 unit 就被跳过）。
+
+---
+
+## 28. 验收：Steam 登录页上屏（2026-11-22 00:24）
+
+**屏幕上显示 Steam 登录页**（用户确认）。阶段 2 的温控、电量计也都在位。
+本轮用的镜像是 `work/steamos-op8p/boot-op8p-gzip.img`（15,937,536 B，
+前 4096 B 指纹 `4ed3126d…`，`ramdisk_size=767975`），已刷 `boot_a` +
+`erase dtbo_a` + `--set-active=a`，`boot_b` 仍是坏实验镜像（勿切）。
+
+### 28.1 真机快照（COM4 实测，00:24）
+
+| 判据 | 实测 | 结论 |
+|---|---|---|
+| `pgrep -c steamwebhelper` | 8 | Steam UI 进程组完整 |
+| gamescope 主进程 | PID 1723，`--backend drm --prefer-output DSI-1` | DRM 后端在跑 |
+| gamescope 子进程 | `gamescopereaper`×2 + `mangoapp` | READY 链路活 |
+| `dmesg` 里 `error -22` 计数 | **2**（回归时是 302） | 剩余 2 条 = `adsp.mbn`/`cdsp.mbn` 音频 DSP，与 §25.5 待办一致，不是 GPU |
+| 电量计 | `bq27541-0`：`capacity=37`、`health=Good` | 阶段 2 保住 |
+| 温控 | `thermal_zone5` 42.6 °C，3 个 cdev | 阶段 2 保住 |
+| WiFi | `wlan0: wifi: connected: Xiaomi_0A83_5G` | **已连网，且是 5G 频段** |
+
+### 28.2 5G 连上了 —— 这一点比 alioth 强
+
+alioth（ath11k qca6390）当时 5G 认证阶段一直 `CONN_FAILED`，只能用 2.4G。
+这台 OP8P 是同款 `qca6390 hw2.0`，`nmcli` 实测直接连上了 `Xiaomi_0A83_5G`。
+可能的差异：OP8P 这边没做 `calibration-variant` 之类的额外要求、且 rfkill
+状态早已写回 unblocked。**别把"能连"当成已验证**：信号强度、吞吐、断线重连
+还没测。
+
+### 28.3 观测工具注记：COM4 是救援 shell，不是真系统 shell
+
+这轮实测发现 COM4（ttyGS1）的 shell 没有 PATH，`ls`/`grep`/`pgrep` 全
+`not found`，且 `/proc/1/root/usr/bin/<动态链接二进制>` 直接执行报
+`not found`（ELF 解释器路径按当前救援根解析，找不到 loader）。正确用法：
+
+```
+B=/dbg/bin/busybox          # 静态链接，永远可用
+$B chroot /proc/1/root /usr/bin/pgrep -c steamwebhelper
+$B dmesg | $B grep -c -e -22
+$B chroot /proc/1/root /usr/bin/nmcli -t -f DEVICE,STATE,CONNECTION device status
+```
+
+`op8p-sh.ps1` 本身不用改，改的是喂给它的命令。
+
+---
+
+## 29. 待完善清单（对照 `docs/alioth.md`）
+
+alioth 走完的路里，每一项在 OP8P 上的状态。排序按「阻塞日常使用的程度」。
+alioth 对应章节给的是 `docs/alioth.md` 的行号锚点，修 OP8P 时**先读那边**，
+不要现场试错——这是 11-21 深夜那轮回归的直接教训。
+
+| # | 项 | OP8P 现状 | alioth 已趟过的路 |
+|---|---|---|---|
+| 1 | **音频** | `adsp.mbn`/`cdsp.mbn` 缺（剩 2 条 `-22`），无声卡，pipewire 被绕过（§25.2 #5 的 `PIPEWIRE_RUNTIME_DIR` 空目录法） | §1857 扬声器通路四缺陷、§1965 后端是 Tertiary TDM 不是 MI2S；OP8P 是 TFA987x（补丁脚本 `regen-op8p-tfa987x-patch.sh` 已备） |
+| 2 | **充电** | ~~`qcom_pm8150b_charger.c` 缺~~ **2026-11-22 修复**：驱动一直在（ROCKNIX 0004/0011），真因是 `&pm8150b_typec` 未启用导致 charger 注册永远 defer；启用 typec/vbus + Nura 修复链后 `pm8150b-charger`/`tcpm-source-psy` 已注册（见 §30）。**插电验收未做** | §2591 2A→3A 与缺位的 JEITA |
+| 3 | **电量计校准** | `capacity`/`health` 已好，`temp`/电压单位换算未验 | alioth 阶段 2 验收清单 |
+| 4 | **触摸** | 驱动在（S6SY761）+ Nura 0069/0081 补强已编入（0037/0038，含休眠唤醒修复），真机未验 | §731/§790：诊断收口→被原厂实测推翻的两轮教训 |
+| 5 | **蓝牙** | `hci0 UP RUNNING`、有 MAC，扫描/配对/音频未验 | §1421 WiFi 与蓝牙阻塞点是一行配置 |
+| 6 | **GPU 占用率** | 未查；msm debugfs 缺文件 + MangoHud 写死 `dri/0` 两个坑大概率原样复现 | §2055、§2269 |
+| 7 | **USB-C host** | 未验（有线手柄） | §927、§1238 真机通过的那条线 |
+| 8 | **ramoops/pstore** | 未验；alioth 上结论是地址有但用不了 | §864 |
+| 9 | **双槽冗余** | `boot_b` 是坏实验镜像，要刷 a 槽镜像过去 | §1781 设备自己写 boot 槽 |
+| 10 | **WiFi 持久化** | 已连 5G；开机自连、`rfkill` 状态回写未验 | §25.6 |
+| 11 | **游戏验证** | 未装游戏；Proton/box64、帧率未测 | §2478 升频速度瓶颈、"绑大核"是负优化；`docs/custom-games.md` |
+| 12 | **振动** | ~~未进内核构建~~ **已完成**：驱动（0031）+ DTS（i2c11 @0x5a）+ CONFIG 全就绪，已编入；手电筒（pm8150l_flash 双 LED）同批完成——都待真机验证 | alioth 无对应（它没有这颗） |
+| 13 | **Steam 账号** | 登录页已显示，账号登录本身未完成 | alioth 阶段 2 验收 |
+
+优先级最高三项**按实施难度从低到高**：
+
+1. **触摸（#4）** —— 驱动已在内核里（S6SY761，原厂 Android 下 `event3` 正常），
+   SteamOS 下只差真机验证，成本最低，先做；
+2. **充电（#2）** —— `qcom_pm8150b_charger.c` 缺，要移植内核驱动，
+   有 alioth 的充电经验（§2591）可参照，是常规驱动工作量；
+3. **音频（#1）** —— 本移植最大的工作量（§4），且分两段：
+   固件提取（`adsp`/`cdsp` 四件套，照 GPU zap 的成熟做法，难度低、可先行）
+   和扬声器通路（TFA98xx 接进机器驱动，难度最高）。
+
+**注意**：难度序 ≠ 影响序。"没有音频/充电就不能当日常机用"的事实不变，
+只是实施顺序上先易后难、每一步都有可验收的产出。另：9（双槽冗余）只要
+一条 fastboot 命令，建议下次刷机时顺手做掉。
+
+### 29.1 像 alioth 那样沉淀的配套文档
+
+alioth 那边的文档结构是三件套：`alioth.md`（结论）+ `alioth-journal.md`
+（过程）+ `alioth-hardware.md`（硬件清单与 mainline 状态）。OP8P 这边对应：
+
+| alioth | op8p | 说明 |
+|---|---|---|
+| `docs/alioth.md` | `docs/op8p/README.md` | 本文件，结论性内容 |
+| `docs/alioth-journal.md` | `docs/op8p/journal.md` | 过程记录（新建，见 §28.1 同目录） |
+| `docs/alioth-hardware.md` | `docs/op8p/hardware.md` | 硬件清单 + mainline 状态（新建；原始 sysfs 转储在 `hardware-inventory.txt`） |
+| `docs/custom-games.md` | （待建） | 装游戏、Proton 验证之后再写 |
+
+---
+
+## 30. 充电：驱动一直在，缺的是一行 `status = "okay"`（2026-11-22）
+
+### 30.1 三个连续的误判
+
+| 之前的结论 | 实际 |
+|---|---|
+| "`qcom_pm8150b_charger.c` 缺" | ROCKNIX 20261001 的 `devices/SM8250/patches/linux/0004-pm8150b.patch`（charger/fg DTS 节点 + ADC 通道）和 `0011-qcom-pm8150b-charger.patch`（驱动本体 + qcom_fg.c + Kconfig/Makefile）**一直随构建进内核**，`CONFIG_CHARGER_QCOM_SMB5=y` 也在 ROCKNIX 设备配置里 |
+| "驱动缺所以没充电" | 真机 dmesg：`deferred probe pending: qcom-pm8150b-charger: failed to register power supply` —— 驱动在 probe，只是注册不出来 |
+| 注册不出来的原因 | 板级 DTS `power-supplies = <&pm8150b_typec>`，而 `pm8150b_typec` 从未 `status = "okay"` → typec 的 power_supply 永远不注册 → `devm_power_supply_register` 拿着这个 fwnode 永远 defer |
+
+结论：**一行 `&pm8150b_typec { status = "okay" }` + connector 图，充电器就上线。**
+Nura 仓库（`reference-nura-port.md`）在这轮的价值：它的 `docs/patches.md`
+明确标注 charging works，还带着 8 条针对这台机器的充电修复，且它的
+`docs/patches.md` 给出了内核基座 tag（`sm8250-7.2.0_git20261010`）。
+
+### 30.2 顺带发现的两份驱动差异（都看内容，别看大小）
+
+- pmOS soc 树基座（964 行）的浮压公式是**带 bug 的旧版**
+  （`(v−3487500)/7500+1`，4.35V 电池会被写成 4.76V——Nura 0068 修的就是它）；
+  ROCKNIX 的拷贝（950 行）**已经带正确公式** `(v−3600000)/10000`。
+- pmOS 树的 `include/linux/power_supply.h` 多一个
+  `POWER_SUPPLY_PROP_CHARGING_ENABLED`（mainline 没有）——Nura 修复链的
+  驱动用到它，pristine 7.2.8 编不过。→ 我们的 `0035` 补丁补上（只加枚举，
+  不加 sysfs 名，与 pmOS 一致）。
+
+### 30.3 落地（全部可复现）
+
+| 文件 | 内容 |
+|---|---|
+| `patches/0033-power-supply-pm8150b-apply-nura-fix-chain.patch` | 驱动整体重写：pmOS 基座 + Nura 0068/0073/0082/0083/0084/0085/0165/0166（1739 行）。0166 = 按外部电量计（`qcom,fuel-gauge` → 我们的 bq27541）的厂商充电策略，修"充到 88% 就停" |
+| `patches/0034-arm64-dts-qcom-pm8150b-add-the-charger-source-change.patch` | Nura 0086 原样：charger 节点补 `usbin-src-change` 中断 |
+| `patches/0035-power-supply-add-POWER_SUPPLY_PROP_CHARGING_ENABLED.patch` | power_supply.h 补枚举 |
+| 板级 DTS | 启用 `&pm8150b_typec`（vdd-pdphy=l2a_3p1、usb-c-connector、PDO 5V/3A dual、port@0 ↔ `usb_1_dwc3_hs_out`）+ `&pm8150b_vbus`（0.5–3A）；`#include <dt-bindings/usb/pd.h>` |
+| 刻意不动 | `&usb_1_dwc3` 保持 `dr_mode="peripheral"`（Nura 是 otg + usb-role-switch）——串口 gadget/NCM 调试依赖固定外设模式，角色切换留给 USB-C host 验证 |
+
+坑：`work/ref-instantnoodlep` 的补丁是 CRLF（Windows clone），`git apply`
+全 FAIL，`tr -d '\r'` 后逐条干净；手写 power_supply.h hunk 出 fuzz 2，
+用 diff 工具重新生成后干净。
+
+### 30.4 刷入与真机验证（2026-11-22 01:05，b 槽）
+
+用户选择刷 b 槽并切换（misc 写 `boot-fastboot` → `flash boot_b` +
+`erase dtbo_b` + `--set-active=b`）。b 槽头指纹核验一致；
+**a 槽保留 00:24 验收的可用镜像 = 真退路**，双槽冗余顺手完成。
+
+真机实测：
+
+```
+/sys/class/power_supply/: bq27541-0, pm8150b-charger, tcpm-source-psy-...typec@1500
+qcom-pm8150b-charger: float voltage 3980000 uV
+qcom-pm8150b-charger: charging policy uses bq27541-0   ← 0166 的厂商策略认到电量计
+qcom-pm8150b-charger: battery temperature zone -2 -> 6
+```
+
+`deferred probe pending` 消失。图形无回归（8 个 steamwebhelper，`-22` 仍
+只剩音频 DSP 的 2 条）。
+
+**还没做**：插电验收（`status` 仍是 Discharging，因为没插电源）。插充电器后
+要看：`status→Charging`、`current_now` 方向、float 电压随策略走
+（3.98 V 是低温区初值，应走到 4.35 V 档）、充满/回充行为。
+
+### 30.5 对照 Nura README 的状态表（2026-11-22）
+
+Nura 的自述：除快充/无线充电/回声消除外日常功能全部打通。OP8P SteamOS 侧
+逐项对照（工作目标不同——我们跑 Game Mode，它跑手机 UI——但硬件维度可比）：
+
+| 部件 | Nura | 我们 |
+|---|---|---|
+| 显示 1440×3168@120 | ✓ | ✓（同款面板驱动，AMS678UW01，§28 验收） |
+| 触摸 s6sy761 | ✓（含休眠唤醒重初始化，补丁 0069/0081） | 驱动在，**真机未验** |
+| GPU A650 | ✓ | ✓（Vulkan → gamescope，§28） |
+| 声音 | ✓（PipeWire 已调好） | ✗ **adsp/cdsp 固件未提取，无声卡**；TFA987x 功放补丁脚本已备（待办 #1） |
+| WiFi | ✓ | ✓ **已连 5G**（§28.2） |
+| 蓝牙 | ✓ | 驱动 UP、配对未验 |
+| USB | ✓ 网络共享 + DP 外接显示器 | 串口 gadget/NCM ✓；host 模式未验；**DP 外接未做**（dwc3 还固定 peripheral） |
+| 调制解调器 | ✓ VoLTE/短信/数据/GPS | ✗ **完全未做**（modem 固件/服务在 `work/ref-instantnoodlep/modem/` 有现成方案） |
+| NFC | ✓ 读标签 | ✗ 未做（驱动已绑定） |
+| 摄像头 ×5 | ✓ 全走 CAMSS+libcamera | ✗ 未做（Nura 补丁 0010–0014 现成可搬） |
+| 传感器 | ✓ 加速度/光线/接近/指南针 | ✗ 未做（Nura 0006–0008/0046/0061 现成） |
+| 指纹 | ✓ goodix + fprintd | ✗ 未做（`ref-instantnoodlep/fingerprint/` 现成） |
+| 视频编解码 Venus | ✓ H.264/HEVC/VP9 硬解硬编 | 未验（固件未确认在位） |
+| **充电** | ✓ 5V/2A + bq27411 电量计 | **链路通，被 gauge 温度挡住**（见 30.6） |
+| 震动 AW8697 | ✓ | 驱动+DTS 补丁脚本备好，**未进内核构建** |
+| 手电筒 | ✓ | 未做（PM8150L flash 通道） |
+| 电源/音量键 | ✓ | ✓（阶段 1） |
+
+### 30.6 充电卡点：可能是 gauge 型号认错（2026-11-22 01:20）
+
+充电链路已全通（charger/TCPM 注册、0166 策略跑起来），但策略读到 gauge
+温度 **恒 52 °C**（其余 27 个温度区 38–42 °C，47 分钟不变）→ `ZONE_TOO_HOT`
+→ 按 ≥50 °C 禁充，float 落到 3.98 V fallback。电流寄存器同样恒 −2142 mA
+（物理不成立：这个速率 40 分钟耗光，但 SOC 47 分钟没动）。电压/SOC 正常。
+
+**关键线索**：Nura README 明说他们充电用 **bq27411**，我们 DTS 绑
+`ti,bq27541`。两颗芯片 DeviceType **都是 0x0421**（TI 二义性），寄存器表
+完全不同（bq27411: Temp@0x02 / Volt@0x04 / SOC@0x1c；bq27541: Temp@0x06 /
+Volt@0x08 / SOC@0x2c）。`hardware-inventory.txt` 早就警告 hw_version 15
+批次器件可能与首批不同。矛盾点：若真为 bq27411，按 bq27541 表读 0x08
+应命中 NAC（~1477 mAh）而非 3.8 V 电压——所以不能只凭症状下定论。
+
+**裁决方法**：i2c 原始寄存器转储（0x02/0x04/0x06/0x08/0x1c/0x2c），
+对照两张表各自的自洽性。若确认 bq27411 → 改 DTS compatible → 温度/电流/
+SOC 全部原生正常 → 充电自然解锁，0032 的 0.01 % SOC 换算可能可删。
+
+### 30.7 裁决：TS 引脚悬空，bq27411 假设排除（2026-11-22 01:35）
+
+i2c 原始寄存器转储（`i2cget -f -y 16 0x55`；内核驱动占用地址，必须 `-f`
+强制访问）拿到了决定性证据：
+
+| 寄存器 | 原始值 | 与内核读数 |
+|---|---|---|
+| 0x08 电压 | 0x0ED2 = 3794 mV | ✅ 逐字节吻合 |
+| 0x14 电流 | 0xF7A2 = −2142 mA | ✅ 吻合（值卡死是 gauge 自身） |
+| 0x2c SOC | 0x0E99 = 3737 → 37% | ✅ 吻合（0032 的 0.01% 换算正确） |
+| 0x3c DCAP | 4455 mAh | ✅ 合理（设计容量 4410） |
+| 0x06 Temperature() | 521 → **52.1 °C 恒定** | ✅ 吻合（0032：固件直接报 0.1 °C） |
+| 0x28 InternalTemperature() | 3704→3692→3690 → **37.0 °C 且漂移** | gauge 结温，活的 |
+
+四张表全自洽 → **芯片就是 bq27541**，bq27411 假设（30.6 的猜想）排除——
+bq27411 寄存器表下电压/SOC 读出 4294 mV/100%，完全不自洽。
+
+**真根因（TI SLUS861 手册 + E2E 佐证）**：Pack Config 的 `TEMPS` 位默认 =1
+→ `Temperature()` 读 **TS 引脚热敏电阻**；这块板（hw_version 15）根本没接
+那颗 NTC——原厂的电池温度走 PM8150B 的 `batt_therm`（Android 清单里的
+`bms/temp`）。悬空引脚 → 恒 52.1 °C → 0166 策略 ZONE_TOO_HOT 禁充。
+`InternalTemperature()`（0x28）不受 TEMPS 位影响，实测 37.0 °C 且随温度
+漂移，与整机 38–42 °C 一致。
+
+先例：sdm845-mainline issue #36——一加 6/6T 同样按生产批次换 gauge
+（bq27411 ↔ bq27541），错绑的症状就是荒谬温度。0032 处理过的 SOC 0.01%
+单位、FCC 0xFFFF 哨兵、温度 0.1 °C 直报，全部是同一颗非标固件的表现。
+
+**修复（0036，已验证干跑、重建中）**：
+
+- `patches/0036-power-supply-bq27xxx-internal-temp-when-ts-unpopulated.patch`
+  —— 新 DT 属性 `ti,ts-pin-unused`：置位后 `Temperature()` 改读 0x28
+  内部温度，同固件直接报 0.1 °C，无开尔文换算。三处改动：header 加
+  `bool use_internal_temp`、i2c probe 读属性、read_temperature 分支。
+- 板级 DTS：`smart_battery` 节点置位 `ti,ts-pin-unused`。
+- alioth 的 DTS 不用 bq27xxx，共享内核不受影响。
+
+预期：策略温度源 36.9 °C → ZONE_NORMAL → 2 A / 4.435 V 充电解锁。
+后续正解（可选）：接 PM8150B `batt_therm`（NTC 查表），与原厂完全一致。
+
+观察工具注记：i2cget/i2cdump 在 SteamOS rootfs 里**有**（/usr/bin/），
+救援 shell 里跑要 `busybox chroot /proc/1/root`。
+
+---
+
+## 31. 可搬运清单：Nura 217 个补丁的分层盘点（2026-11-22）
+
+`work/ref-instantnoodlep/kernel-patches/`（217 个）+ 7 个用户态目录逐个过了一遍，
+按"对 SteamOS 游戏机形态的价值"分层。搬运铁律不变：先读对应补丁和 alioth/Nura
+的验证记录，再动手；内核补丁直接 `git am`/`patch`，DTS 改动进我们的
+`external-and-mods/kernel-sm8250/dts/`。
+
+### 31.1 高价值（游戏机直接受益）
+
+| 部件 | Nura 补丁 | 我们的现状 | 成本 |
+|---|---|---|---|
+| 触摸健壮性 | 0069 多点校验、0081 休眠唤醒重初始化 | 驱动在、真机未验 | 低 |
+| 震动 AW8697 | 0074（DTS 节点） | 驱动已进内核（我们 0031），只差 DTS + CONFIG | 低 |
+| Venus 硬解硬编 | 0223–0229（MMCX vote、vcodec0_core 调频、VP9 修复、解码顺序/延迟） | 未验，固件未确认 | 低-中 |
+| USB host / 角色切换 | 0096/0099 外部 VBUS 时序、0094/0097/0098 TCPM PR swap | dwc3 固定 peripheral | 中 |
+| USB-C DP 外接 | 0088–0093（fsa4480 四 lane、QMP PHY）、0138–0150（DP HDR/音频） | 未做 | 中-大 |
+| 音频收尾 | 0036 TFA987x 控件、0055–0057 USB-C 耳机/mbhc、0059 rx macro | 等声卡先通 | 低 |
+| 手电筒 | 0104 双闪光灯合一 LED | 未做 | 低 |
+
+### 31.2 中价值
+
+- **指纹**：0219–0222（Goodix SPI 驱动 + binding + DTS）+ `fingerprint/`
+  （libfprint-goodixoplus、PAM、overlay）。依赖 QSEECOM TEE 驱动组
+  0174–0218（约 40 个补丁），搬运量大。
+- **传感器**：0006–0008（OnePlus sensor devinfo，SLPI 通信前提）+
+  `sensors/`（setup-sensors.sh、slpi-guard）+ `iio-sensor-proxy-patches/`。
+- **面板/DPU 补强**：0070 背光 defer、0115 PPS 失败断电、0146/0147/0161–0163
+  cmd mode 清理与 DSC 配对——我们跑 video 模式暂不咬人。
+
+### 31.3 低价值（SteamOS 暂不需要，均现成）
+
+- **摄像头 ×5**：0010–0014、0033–0041（CAMSS C-PHY）、0042–0044
+  （IMX689/IMX586/GC5035）、0048–0054/0063/0066/0067（VCM/OIS）、
+  0114/0154/0155/0168–0170 + `libcamera-patches/`。
+- **modem/通话（WIP）**：0116–0137（SDX55 MHI + q6voice）+ `modem/`
+  （ModemManager 规则、sdx55 通话音频/GNSS 脚本）、0164/0171–0173（PCIe wake）。
+- **NFC**：0032 + neard 用户态。
+- **用户态媒体栈**：`ffmpeg-patches/`、`qcom-va-driver-patches/`、
+  `hexagonrpc-patches/`。
+
+### 31.4 已搬运的（避免重复盘点）
+
+| Nura | 我们 |
+|---|---|
+| 0001–0003（AMS678UW01 面板） | 0029 + DTS（§7，2026-11-21） |
+| 0068/0073/0082–0085/0165/0166（充电修复链） | 0033（§30.3） |
+| 0086（charger 中断） | 0034 |
+| ——（无对应，我们自己发现） | 0032/0035/0036（bq27541 非标固件三补丁） |
+| ——（ROCKNIX 自带） | TFA9872/9874（0030）、AW8697 驱动（0031）、bq27xxx（0032） |
+
+### 30.8 最终裁决修正：这颗芯片是 bq27411，0032/0036 的补偿全部作废（2026-11-22 10:56）
+
+刷入 fg-primary 镜像并交叉验证后，30.7 的结论要再修正一次：
+
+**芯片身份**：bq27541 假设作废。两条铁证：
+1. **DeviceType = 0x0421 = bq27411 家族**（bq27541-G1 报 0x0541——
+   sdm845-mainline 给 OnePlus 6/6T 的修复补丁把这两个型号的判别和踩坑
+   写得明明白白，同款错误）；一加按生产批次在这个位置换过 gauge，
+   Nura README 写 bq27411 是对的。
+2. **fg 交叉验证**：bq27541 寄存器表读出的"电压"（3.79 V）与独立 fg
+   实测（4.19 V）差 400 mV。30.7 说"四张表自洽"——那不是自洽，是
+   驱动和转储出自同一张错误的表。
+
+0032/0036 的全部补偿（SOC 0.01% 换算、温度 0.1 °C 直报、内部温度切换）
+都是在给读错寄存器打补丁，等效于用错的地图解释错的风景。**教训升级**：
+寄存器读数"自洽"不能当芯片身份证据；身份判据 = DeviceType + 独立第三方
+交叉验证。
+
+**当前配置（已刷 b 槽验证全绿）**：
+- `battery` psy（qcom_fg，PMIC FG Gen4）= 唯一电池源：
+  90% / 4.19 V / 521 mA / 24 °C，实时
+- 充电策略 `qcom,fuel-gauge` → fg，`zone -2 -> 4`（正常档）
+- aw8697 `GPIO_ACTIVE_LOW` 修复后 probe 成功
+- `&smart_battery`（bq27541 compatible）`status = "disabled"`
+
+**后续可选项**：DTS compatible 改 `ti,bq27411` 重新启用这颗芯片作
+第二意见（mainline bq27411 支持完整，0032/0036 可删）；fg 是主源，
+不急。
+
+### 30.9 独立求证：同刻七寄存器交叉验证（2026-11-22 11:00，应用户要求）
+
+不采信任何一方的口头判断，设计同刻对照实验：i2c 直读芯片的两套候选寄存器表，
+同一时刻与 fg（独立第二方、原厂正牌数据源）的实时读数对比。
+fg 基准：**capacity=89 / voltage=4237 mV / current=−76 mA / temp=24.0 °C**。
+
+| 寄存器 | 原始值 | bq27411 表解释 | bq27541 表解释 | fg 基准 | 判决 |
+|---|---|---|---|---|---|
+| 0x04 vs 0x08（电压） | 4229 / 3526 | **4229 mV** | 3526 mV | 4237 mV | 27411（Δ8 vs Δ711 mV） |
+| 0x1c vs 0x2c（SOC） | 93 / 3716 | **93%** | 37.16% | 89% | 27411（Δ4 vs Δ52） |
+| 0x10 vs 0x14（电流） | 45 / −2142 | **平均 45 mA** | 瞬时 −2142 mA（昨至今恒死值） | −76 mA | 27411（量级吻合 vs 恒死） |
+| 0x0c+0x0e（RC/FCC） | 3431 / 3704 | **92.6%** 自洽容量三角 | 无此解释 | 89% | 27411 ✅ |
+| 0x02 vs 0x06（温度） | 3084 / 392 | 0x02 漂移中（30.8 °C 结温） | 0x06 恒死 521 | 24.0 °C（测量点不同，不判分） | — |
+| 0x3c（DCAP） | 4455 | 两表同址（4455 ≈ 设计 4410） | 同左 | — | 不构成判据，正确排除 |
+
+**bq27411 表在每一个可判别寄存器上同时命中；bq27541 表全军覆没。**
+第二次独立 dump（隔 9 小时、两次开机）重复同一模式，可复现。
+
+方法论修正（对自己之前错误的记录）：
+1. 30.7 的"四表自洽 = bq27541"论证无效——驱动和转储出自同一张错误的表，
+   自洽是循环论证。正确的对照物是独立第三方（fg）。
+2. 前会话记录的 DeviceType 0x0421 与本结论一致（bq27411），但本次用
+   用户态 i2ctransfer 复读 DeviceType 未成功（裸读指针行为问题，读回的
+   是温度寄存器漂移值）——身份结论最终建立在七寄存器同刻交叉验证上，
+   DeviceType 仅作旁证。
+3. 昨夜 0032（"SOC 报 0.01% 单位"）与 0036（温度源切换）的本质：
+   给"读错寄存器"打补丁。fg 启用后二者皆多余；bq27541 节点已停用。
+4. 若将来要启用这颗芯片当第二意见：DTS compatible 改 `ti,bq27411`，
+   mainline bq27411 支持完整，无需任何补偿补丁。
+
+### 30.10 bq27411 正确绑定上线：双电量计互相印证（2026-11-22 11:30）
+
+DTS compatible 改 `ti,bq27411`、删 `ti,ts-pin-unused`、恢复启用后刷 b 槽：
+
+| 项 | bq27411-0 | fg（battery，主源） |
+|---|---|---|
+| 容量 | 94% | 90% |
+| 电压 | 4221 mV | 4194 mV |
+| 电流 | −365 mA（活值） | +571 mA（活值） |
+| 温度 | 36.3 °C | 24.0 °C |
+
+SOC/电压高度一致（Δ4%/Δ27mV）；电流方向与数值有差异——测量点不同
+（bq sense 电阻 vs PMIC IBAT）+ 符号约定不同，不影响使用。
+
+dmesg 记录了驱动的 data flash 写入（pmOS 同款 `bq27xxx_dt_to_nvm` 行为）：
+`update design-capacity to 4410`、`update design-energy to 17060`、
+`cfgupdate 0, retries 10` —— **这块从出厂起未被配置的 gauge，第一次
+被正确配置**（此前 0032 时代的"bq27541 绑定"下 flash 更新不支持）。
+
+充电策略 `qcom,fuel-gauge` 仍指 fg（不受影响）。系统现在有两个电池
+psy：`battery`（fg，主）与 `bq27411-0`（第二意见）。0032/0036 补丁
+保留在树里（对 bq27411 无副作用：SOC≤100 不触发换算、温度走标准
+开尔文换算、FCC 哨兵逻辑未触发），后续可择机删除。
+
+**挂起**：aw8697 FF 链路 RC=0（EVIOCSFF 修复 = struct ff_effect 48 字节）
+但用户未感觉到震动——play_effect 路径待查（挂到音频/触感阶段）。
+ffplay 工具沉淀在 `work/fftool-src/`。
