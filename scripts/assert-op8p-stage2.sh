@@ -6,7 +6,15 @@
 # 没被补丁循环读到、overlay 里有文件却没有 wants 链接。
 #
 # 用法: scripts/assert-op8p-stage2.sh [KOUT]
+#
+# 关于 set -e：这个脚本用 check() 手动累计失败，本不该被任何一条裸命令
+# 终止。2026-11-22 换机后它就以退出码 1 静默结束了整整一轮 ——
+# `DTB="$(find "$KOUT/dtbs" ...)"` 在 dtbs 目录不存在时让 find 返回 1，
+# 赋值语句继承该状态，set -e 直接把脚本杀掉，一行输出都没有。所以：
+# ① 所有可能"没得可查"的命令都显式兜底；② ERR trap 说明"是脚本自身
+# 出错，不是断言失败"，免得把异常退出读成规则被破坏。
 set -euo pipefail
+trap 'rc=$?; printf "\n断言脚本自身在第 %s 行异常退出（rc=%s）—— 这不是断言失败，是脚本出错，请修脚本\n" "$LINENO" "$rc" >&2' ERR
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 KOUT="${1:-${ROOT}/work/kernel-sm8250/output/current}"
@@ -37,14 +45,36 @@ check "含 FCC 哨兵兜底"             "grep -q '0xfffe \\* 1000' '$PATCH'"
 check "含 Dead 判定收紧"            "grep -q 'di->cache.capacity <= 5' '$PATCH'"
 
 echo "== 构建产物 =="
-if [[ -d "$KOUT" ]]; then
-	DTB="$(find "$KOUT/dtbs" -name 'sm8250-oneplus-instantnoodlep.dtb' 2>/dev/null | head -1)"
-	check "dtb 存在" "[[ -n '$DTB' ]]"
-	check "config 里 AW8697 已开" "grep -q '^CONFIG_INPUT_AW8697=y' '$KOUT'/config-*"
-	check "config 里 CPU_THERMAL 已开" "grep -q '^CONFIG_CPU_THERMAL=y' '$KOUT'/config-*"
-	check "config 里 DEVFREQ_THERMAL 已开" "grep -q '^CONFIG_DEVFREQ_THERMAL=y' '$KOUT'/config-*"
+# 三种状态要分开：没编译（跳过，明说）、编译了一半（失败，因为这正是
+# "改了但没生效"的孪生症状）、完整（逐项查）。
+skipped=""
+if [[ ! -d "$KOUT" ]]; then
+	skipped="KOUT 目录不存在（$KOUT）"
+elif [[ ! -d "$KOUT/dtbs" ]]; then
+	skipped="KOUT 里没有 dtbs/（$KOUT）"
+elif ! compgen -G "$KOUT/config-*" >/dev/null; then
+	skipped="KOUT 里没有 config-*（$KOUT）"
+fi
+
+if [[ -n "$skipped" ]]; then
+	printf '  SKIP 产物检查：%s\n' "$skipped"
+	printf '       → 先编译内核（scripts/op8p-build-docker.sh），否则"dtb 里到底有没有\n'
+	printf '         这些节点"这一层完全没验过 —— 刷机前别把 SKIP 当通过\n'
 else
-	echo "  （没有 $KOUT，跳过产物检查）"
+	DTB="$(find "$KOUT/dtbs" -name 'sm8250-oneplus-instantnoodlep.dtb' 2>/dev/null | head -1 || true)"
+	CONF_OUT="$(compgen -G "$KOUT/config-*" | head -1)"
+	check "dtb 存在" "[[ -n '$DTB' ]]"
+	check "config 里 AW8697 已开" "grep -q '^CONFIG_INPUT_AW8697=y' '$CONF_OUT'"
+	check "config 里 CPU_THERMAL 已开" "grep -q '^CONFIG_CPU_THERMAL=y' '$CONF_OUT'"
+	check "config 里 DEVFREQ_THERMAL 已开" "grep -q '^CONFIG_DEVFREQ_THERMAL=y' '$CONF_OUT'"
+	# 产物里真的有这次改动才叫生效：源码树 grep 通过而 dtb 是旧的，
+	# 是这套移植历史上最常见的一种"改了没生效"。
+	if command -v dtc >/dev/null; then
+		check "产出的 dtb 里带 aw8697 节点" \
+			"dtc -I dtb -O dts '$DTB' 2>/dev/null | grep -q 'awinic,aw8697'"
+	else
+		printf '  SKIP dtb 内容检查：没有 dtc（brew install dtc / dnf install dtc）\n'
+	fi
 fi
 
 echo "== overlay =="
@@ -56,4 +86,10 @@ check "squash 脚本会进镜像" \
 	"grep -q 'squash-qcom-mdt.py' '${ROOT}/scripts/make-op8p-rootfs.sh'"
 
 printf '\n%d 通过, %d 失败\n' "$pass" "$fail"
+if [[ -n "$skipped" ]]; then
+	printf '产物检查被跳过（%s）—— 源码契约成立，但"编出来的东西对不对"没验\n' "$skipped"
+fi
+# 到这里为"正常收尾"：下面那个 exit 1 是断言失败的**结果**，不是脚本出错，
+# 所以先把 ERR trap 摘掉，否则失败反而会打出一句误导人的"脚本自身异常"。
+trap - ERR
 [[ "$fail" == 0 ]]
