@@ -92,7 +92,7 @@ fastboot reboot
 | 功能 | 现状 |
 |---|---|
 | `make-op8p.sh --install` / `--verify` | **已搬**：`scripts/op8p-rootfs-docker.sh` 在容器里做（`--verify` 已实测，`--install` 未实测） |
-| 串口 | **已搬但真机未验证**：`scripts/op8p-sh.py`（pty 上端到端测过；真机要 `--list` 后确认哪个口是 shell） |
+| 串口 | **已搬，真机已验证**：`scripts/op8p-sh.py`。`usbmodem101` = ttyGS0 console、`usbmodem103` = ttyGS1 initramfs 救援 shell（系统命令要 `/dbg/bin/busybox chroot /proc/1/root ...`） |
 
 ### 已经在 macOS 上验证过的
 
@@ -100,6 +100,7 @@ fastboot reboot
 - `./make-op8p.sh --gzip`：打包 + 自动跑 `assert-op8p-boot-image.sh`
 - `./make-op8p.sh --verify`：7 组检查全 ok（12.9 GB 镜像）
 - `./flash-op8p.sh --test` 的门禁：断言通过后才碰设备（用假 fastboot 验证过顺序）
+- `./scripts/op8p-sh.py`：短命令 / 长命令 / 多行 / 超时四类，真机各跑过
 
 ## 5. 设备当前状态（2026-11-22）
 

@@ -2976,6 +2976,38 @@ SteamOS 默认时区是 `America/Los_Angeles`，用户看到的时间差 16 小�
 
 ---
 
+### 32.7 真机复核（2026-11-22 18:30）：**cdsp 已经 up 了**，adsp 仍 -22
+
+用刚做好的串口工具第一次上机复核，dmesg 给出的现状和 §32.2 的表不一样：
+
+```
+[    7.585] remoteproc remoteproc2: Booting fw image postmarketos/adsp.mbn, size 15523964
+[    7.595] remoteproc remoteproc1: remote processor cdsp is now up      ← §32.2 说它 -22
+[    7.631] qcom_q6v5_pas ...: error -22 initializing firmware postmarketos/adsp.mbn
+[   19.942] platform sound: deferred probe pending: snd-sm8250: MultiMedia1: error getting cpu dai name
+[   19.942] platform 3210000.soundwire: deferred probe pending: ... supplier 3200000.rxmacro not ready
+```
+
+三件事要分开说：
+
+1. **cdsp 通了**。§32.2 里"cdsp 验签过但 `auth_and_reset -22`"是那次用的那份
+   文件；现在设备上这份 3,868,436 字节的 `cdsp.mbn` 能起来。所以 §32.5 的
+   三选一里，"DSP 侧还有几块能起"要按这份重新算。
+2. **adsp 仍是唯一缺的**：文件在（15,523,964 字节）、被 boot 尝试、`-22 initializing`
+   —— 与 §32.2 的判断一致，TZ 拒。
+3. **声卡还是没起**，而且原因链比"缺 adsp"多一环：`snd-sm8250` 报
+   `MultiMedia1: error getting cpu dai name`，SoundWire 的两条 macro 都
+   `supplier ... not ready` —— LPASS 的 RX/TX macro 依赖 ADSP 起来，所以这是
+   adsp 的下游，不是独立的第二个故障。
+
+还有一个**部署状态**的坑：`/lib/firmware/postmarketos/` 里那三件
+（`adsp.mbn` 11:45、`cdsp.mbn`/`slpi.mbn` 11:37）是**手工推上去的**，
+`op8p-dsp-firmware.service` 在设备上 `not-found` —— 因为设备里的 rootfs 是
+11-21 17:56 生成的，而服务是 11-22 才随 0682fe9 入库、还没进过镜像。
+**下次刷 rootfs 会把这套手工固件丢掉**，除非先把服务装进去。
+
+
+
 ## 33. 震动的 reset 极性：ACTIVE_HIGH 把芯片按在复位里（2026-11-22）
 
 驱动在树里（0031）、DTS 节点齐全、`CONFIG_INPUT_AW8697=y`，probe 却失败，
@@ -3137,17 +3169,35 @@ squashfs-tools / btrfs-progs / util-linux）：`mkfs.ext4 -d`、`unsquashfs`、
 - 与 Windows 那条路的唯一差异：不用 `/scratch` 中转。那边是 DrvFs 不保留
   Unix 权限位，这边 virtiofs 保留。
 
-**③ 串口：`scripts/op8p-sh.py`（新，真机未验证）**
+**③ 串口：`scripts/op8p-sh.py`（新，真机已验证）**
 
 Windows 上是 COM3/COM4；macOS 上同一根线枚举成 `/dev/cu.usbmodem*`，
-**设备节点名不带端口号**，所以没法靠命名区分内核 console 和 root shell ——
-`--list` 列出来，再拿 `uname -a` 试哪个输出干净。只用 python3 标准库
-（termios + select），不引入 pyserial。
+**设备节点名不带端口号**，所以没法靠命名区分两个口 —— `--list` 列出来，再拿
+`uname -a` 试。只用 python3 标准库（termios + select），不引入 pyserial。
 
-用 pty 假设备做了端到端测试，抓到一个**会让调试全错**的 bug：设备会把命令
-回显一遍，而回显行里就含完成标记，只做子串匹配时"设备根本没回"会被读成
-"成功、输出为空"（超时用例返回 0 和一行空）。改成"标记必须独占一行"才对。
-真机尚未验证 —— 手机没连，所以这条只能说"逻辑在 pty 上是对的"。
+2026-11-22 18:20 上机实测，两个口的身份：
+
+| 节点 | 是 | 特征 |
+|---|---|---|
+| `/dev/cu.usbmodem101` | ttyGS0 内核 console | 输出混着 dmesg；命令也能执行但没 PATH |
+| `/dev/cu.usbmodem103` | ttyGS1 救援 shell | 根是 **initramfs**（有 `/newroot`、`/dbg`，没有 `/usr`），`PATH=[/bin]`，`uname`/`cat` 都没有 |
+
+所以系统命令要走 §28.3 那条老路：
+`/dbg/bin/busybox chroot /proc/1/root /usr/bin/<命令>`。
+
+**两个 bug 都是"只在真实时序下才出现"**，pty 假设备只能抓到第一个：
+
+1. 设备会把命令回显一遍，回显行里就带完成标记 —— 只做子串匹配时"设备根本
+   没回"会被读成"成功、输出为空"（pty 上复现：超时用例返回 0 和一行空）。
+2. **更隐蔽的那个**：改成"标记独占一行"之后，break 条件写的还是
+   `END + "\n"` 这个子串 —— 而回显行 `echo STARTS; cmd; echo ENDE` 自己就
+   带着 `END` 和换行，于是循环**第一次读到回显就 break**，那时 start 行还没
+   到，于是被判成超时。真机上稳定复现，而 **raw 模式反而一切正常**（raw 不
+   检查标记，一直读到超时，所以看得到输出）—— 这个不对称是最误导人的地方。
+   最终做法：起止双标记，**两端都必须是独占行**才认。
+
+真机验证过的四类：短命令、长命令（两条 `chroot` 拼接）、多行输出、超时
+（退出码 1 且 stderr 说明原因）。另外顺手确认了 §32.7 那件事。
 
 ### 34.5 顺带确认的两件事
 
