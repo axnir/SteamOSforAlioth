@@ -76,12 +76,27 @@ def drain(fd, quiet_for=0.25, cap=2.0):
 
 
 def run(port, command, timeout, raw, baud):
-    marker = "OP8P_" + uuid.uuid4().hex[:8] + "_DONE"
-    payload = command if raw else "%s; echo %s" % (command, marker)
-    # 完成标记必须**独占一行**才算数。设备会把我们写进去的命令回显一遍，而那
-    # 一行里就带着 marker —— 只做子串匹配的话，"设备根本没回"会被读成"成功
-    # 返回空"。这个错在 pty 上复现过：超时用例返回了 0 和一行空输出。
-    mark_re = re.compile(rb"(?:^|\n)" + re.escape(marker.encode()) + rb"\r?(?:\n|$)")
+    # 起止双标记，取两者**之间**的输出。为什么不是"一个 marker + 子串匹配"：
+    #   1. 设备会把命令回显一遍，回显行里就含 marker —— 子串匹配会把"设备根本
+    #      没回"读成"成功、输出为空"（pty 上复现过：超时用例返回 0 和一行空）；
+    #   2. 命令一长，回显会在终端 80 列处折行，只删"整行等于命令"会留下残片
+    #      （真机上第一次跑就看到了半截 `oot /proc/1/root ...`）。
+    # 用独占行的两端标记，回显（不论折不折行）天然落在 start 之前，整段丢掉。
+    tag = uuid.uuid4().hex[:8]
+    start = "OP8P" + tag + "S"
+    end = "OP8P" + tag + "E"
+    payload = command if raw else "echo %s; %s; echo %s" % (start, command, end)
+    if os.environ.get("OP8P_DEBUG"):
+        # 串口调试的第一原则：先确认自己发出去的是什么字节。
+        print("payload=%r (%d 字符)" % (payload, len(payload)), file=sys.stderr)
+    # 两端都必须是**独占一行**才算数。只找 "END\n" 这种子串会在回显阶段就
+    # 成立 —— 回显行是 `echo STARTS; cmd; echo ENDE`，它自己就带着 END 和
+    # 一个换行，于是循环第一次读到回显就 break，然后 start 行还没到，被当成
+    # "超时"。真机上稳定复现（raw 模式反而正常，因为 raw 不检查标记，一直
+    # 读到超时，所以看得到输出）。pty 假设备上没暴露，因为它在同一次 write
+    # 里就把回显和执行结果都吐出来了。
+    start_re = re.compile(rb"(?m)^" + re.escape(start.encode()) + rb"\r?$")
+    end_re = re.compile(rb"(?m)^" + re.escape(end.encode()) + rb"\r?$")
 
     try:
         fd = os.open(port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
@@ -107,29 +122,42 @@ def run(port, command, timeout, raw, baud):
             if not chunk:
                 break
             acc += chunk
-            if not raw and mark_re.search(acc):
-                break
+            if not raw:
+                norm = acc.replace(b"\r\n", b"\n")
+                if start_re.search(norm) and end_re.search(norm):
+                    break
     finally:
         os.close(fd)
 
     text = acc.decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "\n")
     lines = text.split("\n")
-    # 串口默认会把我们写进去的命令回显一遍；连完成标记那行一起去掉，
-    # 否则调用方拿到的第一行永远是自己的命令。
-    out = []
-    for line in lines:
-        if not raw and line.strip() == marker:      # echo 标记输出那一行
-            continue
-        if line.strip() == payload.strip():          # 回显的命令行
-            continue
-        out.append(line)
-    print("\n".join(out).strip("\n"))
 
-    if not raw and not mark_re.search(acc):
-        print("op8p-sh: 超时 %ss 没等到完成标记 —— 设备可能没在跑 shell，"
+    if raw:
+        print(text.strip("\n"))
+        return 0
+
+    try:
+        i = lines.index(start) if start in lines else -1
+    except ValueError:
+        i = -1
+    if i < 0:
+        # 没看到起始行：要么设备没回，要么命令把 start 那行吃掉了。原文照出，
+        # 让人自己看 —— 静默吞掉一段输出比多打几行糟得多。
+        print(text.strip("\n"))
+        print("op8p-sh: 超时 %ss 没等到起始标记 —— 设备可能没在跑 shell，"
               "或者换另一个 ACM 口试试" % timeout, file=sys.stderr)
         return 1
-    return 0
+
+    body = lines[i + 1:]
+    if end in body:
+        body = body[:body.index(end)]
+        rc = 0
+    else:
+        print("op8p-sh: 看到起始标记但 %ss 内没等到结束标记 —— 命令可能还在跑，"
+              "用 -t 加长" % timeout, file=sys.stderr)
+        rc = 1
+    print("\n".join(body).strip("\n"))
+    return rc
 
 
 def main():
