@@ -3303,3 +3303,76 @@ Windows 上是 COM3/COM4；macOS 上同一根线枚举成 `/dev/cu.usbmodem*`，
   差 4096 = `Image` 大小变化引起的页对齐差异；DTB 与产物**逐字节相同**
   （dtb 编译可复现，只有 `Image` 含时间戳）。
 - 旧的 11:26 验收镜像已备份：`work/steamos-op8p/boot-op8p-gzip.img.1126-accepted`。
+
+### 34.6 蓝牙：控制器、固件、扫描都正常（2026-11-22 19:35）
+
+一开始 `Powered: no`，`bluetoothctl power on` 之后 `Powered: yes`。固件链完整：
+
+```
+hci0: QCA Downloading qca/htbtfw20.tlv
+hci0: QCA Downloading qca/htnv20.bin
+hci0: Generated BD_ADDR: 00:03:7f:31:34:27
+hci0: QCA setup on UART is completed
+```
+
+地址是驱动**生成**的（不是芯片 OTP 里的），但 `systemctl restart bluetooth` 后仍是
+同一个 —— 生成算法是确定性的，所以配对记录不会每次失效。这点和 raphael 不同
+（那边需要 `/etc/raphael-bdaddr` 手工钉住）。扫描 15 秒发现多台设备。
+
+**未验证**：配对/连接/音频。注意 **音频（A2DP）要过 ALSA**，而声卡至今没起来
+（§32.7），所以蓝牙耳机现在连上也听不到；**蓝牙手柄不受影响**（走 evdev）。
+
+### 34.7 Steam 登录卡在 CM：`'Try another CM'`（2026-11-22 20:15，**未解决**）
+
+现象：扫码认证通过 → 屏幕显示 logging in → 几秒后回到未登录界面。
+
+`connection_log.txt` 的原话：
+
+```
+[20:05:33] ConnectionCompleted() (205.196.6.133:443, WebSocket)
+[20:05:41] [Connected, 0, 11] ScheduledAttemptReconnect() not reconnecting due to already having an hConnection
+[20:06:40] RecvMsgClientLogOnResponse() : 'Try another CM' / 'Failure', ignored since we're not waiting for a logon response
+```
+
+所以认证（扫码）是成功的，卡在**用 token 登录 CM** 这一步，而且 CM 是**主动拒绝**
+（`Try another CM`），不是网络断开。
+
+已排除：
+
+| 怀疑 | 依据 |
+|---|---|
+| 时间错导致 TLS 全挂 | `date` 正确（CST 2026-11-22），`client-update.steamstatic.com` 返回 304 |
+| DNS | CM 域名解析到真实 IP（`cmp1-hkg1` → 103.28.54.100） |
+| CM 不可达 | hkg1 / sea1 / jnb1 等多个 CM 都 `ConnectionCompleted` |
+| 出口 IP 被 CM 拒 | **同一 WiFi 下 Mac 上的 Steam 正常，用户不需要加速器** |
+
+试过并**已回滚**的方案：把 58 个 `(cmp|ext)*.steamserver.net` 写进 hosts 指向
+127.0.0.1，配一个用户态转发器（经 Mac 的 Clash SOCKS5 连 `cm0`，实测 27017/
+27018/27019/27020/443 全部 `rep=0`）。失败原因：**Steam 的 CM 域名有上百个且
+动态变化** —— 抓了 58 个，它下一次连的 `ext2-jnb1` 不在名单里，转发器一个连接都
+没接到。半成品留着会让 Steam 连到不通的地址，所以 hosts 和转发器都已复原。
+
+下一步（没做，下次接着查）：
+
+1. 读 `console_log.txt`（这次被中断，没读到）；
+2. 用 steamcmd / 另一台机器同账号验证，把"客户端问题"和"账号问题"分开；
+3. **主要怀疑：ARM64 SteamOS 客户端**。这台跑的是
+   `steam_client_steamdeck_stable_linuxarm64`（Steam Frame 的固件），而 raphael
+   上也是卡在同一个位置（memory 2026-11-08 "二维码空是 CM 握手失败"）。两台
+   完全不同的硬件、同一个症状，指向客户端而不是设备。
+
+### 34.8 这一轮结束时的状态（2026-11-22 20:20）
+
+| 功能 | 状态 |
+|---|---|
+| 显示 / GPU / 触摸 / 按键 / 手电筒 / 温控 | 通 |
+| 振动 | **通**（§33.1，修的是测试工具的结构偏移） |
+| WiFi（含 5G）+ 开机自连配置 | 通 |
+| 蓝牙控制器 / 固件 / 扫描 | 通（配对与音频未验） |
+| 充电（双电量计） | 通 |
+| 音频 | **阻塞**：adsp 被 TZ 拒，四个来源全部试过（§32.3–§32.8） |
+| Steam 登录 | **阻塞**：CM 返回 `Try another CM`（§34.7） |
+| 摄像头 / 指纹 / 传感器 / NFC / GPS / USB-C host | 无驱动或未验（§34 盘点） |
+
+设备侧没有留下任何临时改动：hosts 已复原（`/etc/hosts.bak.op8p` 也还在）、
+CM 转发器已停、`/tmp` 下的测试文件已删。
