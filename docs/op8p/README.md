@@ -3069,6 +3069,39 @@ PIL**（TZ 用设备密钥解密），而拼接产物没有那个标记；AYN �
 | `/dev/cu.usbmodem101` | ttyGS0 + getty → bash（`[root@frame ~]#`） | 内核 console 的 dmesg 也混在这里，命令输出要挑着看 |
 | `/dev/cu.usbmodem103` | ttyGS1 | 开机时是 initramfs 救援 shell（`/dbg/bin/busybox chroot /proc/1/root`）；`serial-getty@ttyGS1` 重启之后也是完整系统 shell |
 
+### 32.10 P0 实验：干净重启也过不了 TZ（2026-11-24 22:05）
+
+线索来自 Nura：pmaports 的 `firmware-oneplus-instantnoodlep` 包用的就是
+pangwalla 仓库 `2dce2681` + `pil-squasher` —— 和我们试的**完全同一份**；而
+Nura 的 `docs/audio.md` 写着 "the packaged ADSP firmware starts"（前提是 SLPI
+用手机自己的）。所以怀疑我之前的测试方法（运行时换文件 + unbind/bind）把 PAS
+上下文搞坏了。
+
+两次**干净重启**实验：
+
+| # | adsp 来源 | 大小 | 结果 |
+|---|---|---|---|
+| 1 | pangwalla `2dce2681`（与 Nura 同 commit） | 15,921,292 | `-22 setting up` |
+| 2 | 本机 `modem_a` 现拼 | 17,166,524 | `-22 setting up` |
+
+同一次启动里：SLPI 在 7.5 s 正常 `slpi is now up`，cdsp/slpi 用手机自己的
+（md5 与 modem_a 一致），型号 `OnePlus 8 Pro (instantnoodlep)` —— 与 Nura 相同。
+
+**于是排除了**：测试方法（运行时热替换）、SLPI 缺失、型号不同、固件来源。
+剩下的解释只有**设备批次 / TZ 版本**：Nura 在 **IN2023** 上验过，我们这台是
+IN2020/21/25 之一。
+
+支持这个解释的证据：AYN 的**完整 mbn** 能过 `setting up`（说明 TZ 不是一律
+拒外厂签名），而三份**分段拼接产物**全被拒。最可能的原因是 TZ 按"原始签名
+覆盖的文件范围"校验，拼接虽然按 `p_offset` 放置，但整体文件已经和签名时不同。
+
+**结论**：在不动 bootloader 的前提下，音频这条路走不通了。突破只有两条，都
+不建议：刷 Android 13 的完整固件（要动 `abl`/`tz`/`xbl`，违反硬规则且可能变砖）、
+或者拿到 OnePlus 签名的**完整** `adsp.mbn`（公开渠道没有）。
+
+设备已恢复成 AYN 那份（`3d833b38`，唯一过了 `setting_up` 的），留着以后如果
+能查到 `auth_and_reset -22` 的原因可以继续。
+
 ## 33. 震动的 reset 极性：ACTIVE_HIGH 把芯片按在复位里（2026-11-22）
 
 驱动在树里（0031）、DTS 节点齐全、`CONFIG_INPUT_AW8697=y`，probe 却失败，
