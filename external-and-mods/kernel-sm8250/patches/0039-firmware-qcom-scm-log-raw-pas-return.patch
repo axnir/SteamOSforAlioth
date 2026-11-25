@@ -1,0 +1,36 @@
+From: shouchen <TheOneovb@petlover.com>
+Subject: [PATCH] firmware: qcom: scm: log raw TZ return for PAS calls
+
+IN2020 (instantnoodlep) ADSP boot fails at qcom_scm_pas_mem_setup() with
+-EINVAL. qcom_scm_remap_error() collapses several distinct TrustZone return
+codes (EINVAL_ADDR, EINVAL_ARG, generic ERROR, unknown) into that single
+errno, so the dmesg line cannot tell a bad address from an unsupported
+command. Log smc_res.a0/a1/a2/a3 from __scm_smc_call() for PIL service
+commands (INIT_IMAGE=0x01, MEM_SETUP=0x02, AUTH_RESET=0x03) before remap,
+so a single boot reveals what the TZ actually returned.
+
+Scoped to QCOM_SCM_SVC_PIL (0x02): no other SCM consumers are affected.
+---
+ drivers/firmware/qcom/qcom_scm-smc.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/drivers/firmware/qcom/qcom_scm-smc.c b/drivers/firmware/qcom/qcom_scm-smc.c
+--- a/drivers/firmware/qcom/qcom_scm-smc.c
++++ b/drivers/firmware/qcom/qcom_scm-smc.c
+@@ -210,8 +210,14 @@ int __scm_smc_call(struct device *dev, const struct qcom_scm_desc *desc,
+ 	ret = __scm_smc_do(dev, &smc, &smc_res, atomic);
+ 
+ 	trace_scm_smc_done(ret, smc.args[0], &smc_res);
+ 
++	/* IN2020 PAS diagnosis: raw TZ return before qcom_scm_remap_error(). */
++	if (desc->svc == QCOM_SCM_SVC_PIL)
++		pr_err("PAS_RAW: svc=0x%02x cmd=0x%02x a0=0x%lx a1=0x%lx a2=0x%lx a3=0x%lx\n",
++		       desc->svc, desc->cmd, smc_res.a0, smc_res.a1,
++		       smc_res.a2, smc_res.a3);
++
+ 	if (ret)
+ 		return ret;
+ 
+ 	if (res) {
+-- 
+2.43.0

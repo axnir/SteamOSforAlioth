@@ -241,8 +241,17 @@
 			no-map;
 		};
 
-		adsp_mem: memory@91b00000 {
-			reg = <0x00 0x91b00000 0x00 0x2500000>;
+		/*
+		 * ADSP carveout. Use the upstream/mainline address and span
+		 * (0x8a100000 + 0x1d00000), the same value Nura ships and the
+		 * one that works on IN2023. The previous value (0x91b00000 +
+		 * 0x2500000) made TrustZone answer 0xffcfffba from
+		 * PAS_MEM_SETUP; see docs/op8p/README.md §32.11.
+		 * 0x8a100000 sits inside removed_mem (0x80b00000 + 0xcd00000),
+		 * which is expected: DSP carveouts are subranges of it.
+		 */
+		adsp_mem: memory@8a100000 {
+			reg = <0x0 0x8a100000 0x0 0x1d00000>;
 			no-map;
 		};
 

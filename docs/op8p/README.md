@@ -3089,7 +3089,8 @@ Nura 的 `docs/audio.md` 写着 "the packaged ADSP firmware starts"（前提是 
 
 **于是排除了**：测试方法（运行时热替换）、SLPI 缺失、型号不同、固件来源。
 剩下的解释只有**设备批次 / TZ 版本**：Nura 在 **IN2023** 上验过，我们这台是
-IN2020/21/25 之一。
+用户已明确的 **IN2020**（`hardware.md` / `hardware-inventory.txt` / `display-findings.md`
+三处均记为 `instantnoodlep / IN2020`）。此前本文写成"IN2020/21/25 之一"是错的。
 
 支持这个解释的证据：AYN 的**完整 mbn** 能过 `setting up`（说明 TZ 不是一律
 拒外厂签名），而三份**分段拼接产物**全被拒。最可能的原因是 TZ 按"原始签名
@@ -3101,6 +3102,385 @@ IN2020/21/25 之一。
 
 设备已恢复成 AYN 那份（`3d833b38`，唯一过了 `setting_up` 的），留着以后如果
 能查到 `auth_and_reset -22` 的原因可以继续。
+
+### 32.11 不要把 §32.10 的"签名死局"当成定论（2026-11-25 跨机型检索）
+
+> **A / B 两方案的最终结论已单独整理成
+> [`audio-pas-diagnosis.md`](audio-pas-diagnosis.md)**（含"方案 B 实际未执行"的更正、
+> 五份固件验签对照、7 组地址矩阵、方案 A 真实驱动日志、回滚状态）。
+> 本节保留推演过程，结论以那份专题文档为准。
+
+用户要求不局限 IN2020 查同类案例。结论：**`-22` 至少有两种完全不同的根因，
+而我们只验证了"换固件"这一种；"必须刷 bootloader"是过早下的结论。**
+
+#### 外部案例（全部是高通 PAS/remoteproc，不是 IP 类比）
+
+| 设备 / 来源 | 表面日志 | 真因 | 解法 |
+|---|---|---|---|
+| Galaxy Tab S6 (SM8150, `gts6l`) | `error -22 setting up firmware`（与我们逐字相同） | `qcom_scm_pas_init_image()` **成功**，倒在 `qcom_scm_pas_mem_setup()`：`adsp_mem` 26 MB < 固件 39 MB span，扩到 39 MB 又撞 live modem | 改 DTS 4 行：区域换到 `0x98900000` + 39 MB |
+| Moto G 5G Plus (SM7250, `nairo`)，2026-10 上游补丁 | `failed to authenticate image and release reset: -22` | 负 errno 可能是 **Linux 侧** clock / interconnect / SHM bridge，也可能是 SCM 状态；正值才是 PIL 服务返回码 | 上游给 `qcom_q6v5_pas.c` 加 3 行错误码打印 |
+| OnePlus 6T (SDM845, `fajita`)，Kali bug 9780 | PBL `-22` | 通用 modem 固件与设备 trust root 不匹配；必须用**本机** modem 分区固件 | 已满足（我们的 cdsp/slpi 就是本机的） |
+| Xiaomi Mi 8 (SDM845, `dipper`) | — | 从自己 stock ROM 的 `modem.img` 取 `adsp.*` + `pil-squash.py`，装到带厂商子目录的固件路径 | 路径与做法已对齐 |
+| Nura (IN2023, SM8250) | — | packaged ADSP 能起，**前提是 SLPI 用手机自己的**（否则共享内存表被写坏，ADSP 启动超时） | 已满足（§32.10 同轮 SLPI 是 `slpi is now up`） |
+| `qebspil` + Linux late attach | `-22 EINVAL` | bootloader 阶段先加载 DSP，Linux 改为 attach 而非重新认证 | 需 UEFI 驱动；OP8P 是 ABL，**不适用** |
+
+关键认知：TZ 原始返回 `0xffcfffba` 被 `qcom_scm_remap_error()` 压成 `-EINVAL`，
+所以 "`-22 setting up` = 签名被拒" 只是**一种解释**，不是日志本身能证明的事实。
+
+#### 本地的数字（已核验，推翻"区域太小"这一具体假设）
+
+- `work/src-peek/linux-7.2.8/.../sm8250.dtsi:852`：`adsp_mem` = `0x8a100000` + `0x1d00000`（29 MiB）；
+  `spss_mem` 紧邻 `0x8be00000`，`cdsp_secure_heap` 紧邻 `0x8bf00000`。
+- 本地两份 `adsp.mbn` 的 ELF LOAD span：通用版 15,503,508 B（14.79 MiB）、
+  AYN 版 15,511,676 B（14.79 MiB）—— **都远小于 29 MiB**。
+  所以 Tab S6 那种"span 超过保留区"的直接原因在我们这里不成立；
+  但**地址与 TZ 已占用区重叠**仍未被排除。
+- 高通官方说明：`dsp_a`（我们这里 `sde9`）放的是 ADSP **动态模块**，
+  签名分段 `.mdt/.bNN` 在 `modem` 分区的 `/vendor/firmware_mnt/image/`。
+  → 之前只取 modem 分区是对的，`dsp_a` 里没有藏着"完整 adsp.mbn"。
+
+#### 下一步选项（按代价排序，均未执行）
+
+1. **PAS SCM API 矩阵实验（推荐，零刷机）**：`qcom_scm_pas_init_image`、
+   `qcom_scm_pas_mem_setup`、`qcom_scm_pas_shutdown`、`qcom_scm_assign_mem`
+   都是 `EXPORT_SYMBOL_GPL`（本机 `System.map` 已确认存在）。照 Tab S6 的做法写
+   out-of-tree 模块，`insmod` 传地址/大小，init 返回 `-EAGAIN` 不驻留，一次开机跑完矩阵。
+   判据：某组合返回 0 → 真因是内存布局，改 DTS 即可；全 -22 → 排除此路。
+2. **错误码打印补丁**：把 2026-10 上游那 3 行打印搬进我们的 `qcom_q6v5_pas.c`，
+   重编 Image（Image 与模块必须成对部署），专门定性 AYN 那份的
+   `auth_and_reset -22` 是 Linux 侧还是 TZ 侧。
+3. **只读核对 DTB**：读真机 `/sys/firmware/devicetree/base/reserved-memory/`、
+   `/proc/iomem`，看 `removed_mem`（Nura DTS 有 `0x80b00000 + 0xcd00000`）是否与
+   `adsp_mem` 重叠、`&adsp` 的 `memory-region`/`iommus` 是否指向正确区域。
+4. **刷同型号 OOS 13 全套**（`tz`/`abl`/`xbl`/`dsp`/`modem` 同时更新）：让 TZ 与固件
+   同版本。代价是动 bootloader、有变砖风险，违反现有硬规则——**只在 1–3 全排除后
+   由用户明确决定**。
+
+#### 方案 1 的工具已编译（2026-11-25，未上机）
+
+`scripts/op8p-pas-probe/`：
+
+| 文件 | 作用 |
+|---|---|
+| `op8p-pas-probe.c` | 一次性模块，分别打印 `init_image` / `mem_setup` / `auth_and_reset` / `shutdown` 的返回码；init 返回 `-EAGAIN`，insmod 报 `Invalid argument` 是预期 |
+| `Makefile` / `build.sh` | `KDIR=<内核源码树> ./build.sh`；必须与真机同一棵 7.2.8 源码树（ctx 结构体布局） |
+| `run-on-device.sh` | 设备端地址×大小矩阵；第 1 段只测 `mem_setup`，第 2 段加 `do_init=1`，第 3 段 `do_auth=1` 默认只打印命令不执行 |
+| `op8p-pas-probe.ko` | 已编译产物，aarch64；初版 sha256 `90406033…`（传整份镜像当 metadata，**测法有误**）；修后的有效版本 sha256 `23d44193b092bb8f4d2f33ed0d44c5a596dbbcbf258b58738a5ae4ae1a136348` |
+
+**源码树在哪里**（这是最容易找错的一件事）：不在仓库里，而在 macOS
+构建用的 docker named volume `op8p-build-work` 内：
+
+```
+/work/kernel-sm8250/linux-7.2.8        # SRC = $WORK/linux-$KVER
+  .config / Module.symvers 都在（2026-11-22 09:09 编译留下）
+```
+
+推导链：`scripts/op8p-build-container.sh` 的 `WORK=/work/kernel-sm8250` →
+`external-and-mods/kernel-common/build.sh` 的 `SRC="${WORK}/linux-${KVER}"`。
+宿主只把 `output/` 同步回 `work/kernel-sm8250/output/`，源码树留在卷里；
+本机 `work/src-peek/` 只有为读代码而拷出的少量文件，不能拿来编译。
+
+编译命令（native aarch64，无需签名）：
+
+```sh
+docker run --rm \
+  -v "$PWD:/repo" -v op8p-build-work:/work \
+  -w /repo/scripts/op8p-pas-probe op8p-build:43 \
+  bash -c 'KDIR=/work/kernel-sm8250/linux-7.2.8 sh ./build.sh'
+```
+
+2026-11-25 00:51 已按此编译成功：头文件解析到
+`include/linux/firmware/qcom/qcom_scm.h`，函数原型与模块调用一致，
+`file` 报 `ELF 64-bit LSB relocatable, ARM aarch64`。中间产物已清理，
+目录只留源码、脚本和 `.ko`。**没有推设备、没有刷机。**
+
+实现细节：本机内核 `init_image` 的第 4 参数是
+`devm_qcom_scm_pas_context_alloc()` 分配的 `struct qcom_scm_pas_context *`，
+模块注册一个空 platform device 作为载体，ctx 一律用 `void *` 传，避免重复声明
+随版本变化的结构体。头文件用 `__has_include` 兼容新旧两种路径。
+`CONFIG_MODULE_SIG is not set`，模块不需要签名。
+
+##### 2026-11-25 01:0x 真机第一轮结果：裸 `mem_setup` 全 `-22`，**不能据此判地址**
+
+设备已接，走 `/dev/cu.usbmodem101`（完整 root shell；103 是 initramfs 救援 shell）。
+串口 `--push` 推 12 KB 的 `.ko` 会卡死（进程被 SIGTERM），改用 WiFi HTTP
+（设备 `192.168.5.21` ← 宿主 `192.168.5.7:8000`）秒传，sha256 与本地一致。
+脚本加了 `PHASE=1` 只跑第 1 段开关；第 3 段仍只打印、不执行。
+
+| 阶段 | 结果 |
+|---|---|
+| `remoteproc` 状态 | slpi / cdsp = running，**adsp = offline** |
+| `pre_shutdown(1)` / `post_shutdown(1)` | 每轮都返回 **0** → SCM 通道和 PAS shutdown 是通的 |
+| 裸 `mem_setup` 9 组 | **全部 -22**，包括真机正确地址 `0x91b00000`、span `0x1d00000` 和全容量 `0x2500000` |
+| DSP / 固件 | 未验签、未启动；设备状态未变 |
+
+**为什么这轮不构成结论**：源码里 `qcom_scm_pas_mem_setup()` 只由
+`drivers/soc/qcom/mdt_loader.c` 在 `qcom_scm_pas_init_image()` 成功之后调用，
+且仅对带 `QCOM_MDT_RELOCATABLE`（`BIT(27)`）的段生效。本机两份 `adsp.mbn`
+都有 18–19 个可重定位段，`p_paddr` span 都是 `0x1d00000`（29 MiB）。
+也就是说没有 metadata 上下文的裸 `mem_setup` 被 TZ 以 `-EINVAL` 拒绝是预期的，
+它只证明 SCM 调用链可用，**不能排除 Tab S6 式的内存布局问题**。
+
+另外纠正一处坐标错误：矩阵第一版用的 `0x8a100000` 是 raphael（SM8150）的
+`adsp_mem`；op8p 真机 DT 里 `adsp_mem = memory@91b00000 + 0x2500000`
+（`external-and-mods/kernel-sm8250/dts/sm8250-oneplus-instantnoodlep.dts:244`），
+已从 `/sys/firmware/devicetree/base/reserved-memory/` 逐个读 reg 核实。
+脚本矩阵已改成真机地址。**下一步才是有效的实验**：`PHASE=all`
+（先 `init_image` 验签、再 `mem_setup`），仍不启动 DSP；若那时某组返回 0，
+才是内存布局问题；若 `init_image` 本身就 -22，则是固件验签问题。
+
+##### 2026-11-25 01:20 第二轮：`init_image` 用真 metadata 复测，**验签阶段定论**
+
+第一轮 `init_image` 全 `-22` 是模块自身的错：它把整份 15 MB `adsp.mbn`
+当成 metadata 传了；内核真实路径走 `qcom_mdt_read_metadata()`，只取
+ELF 头 + hash 段（这里 8220 B）。模块已改为调用该导出函数并重编
+（`.ko` sha256 `23d44193b092bb8f4d2f33ed0d44c5a596dbbcbf258b58738a5ae4ae1a136348`），
+并把 `request_firmware_direct()` 的 device 从 NULL 改为 platform device
+（`firmware_loader` 里有 `dev_dbg(device, ...)`，NULL 不安全）。
+
+**五份固件对照**（同一地址 `0x91b00000`、同一 metadata 提取路径）：
+
+| 固件 | fw_size | metadata_len | `init_image` |
+|---|---|---|---|
+| `postmarketos/adsp.mbn`（本机拼接） | 15,523,964 | 8220 | **-22** |
+| `postmarketos/adsp-gh.mbn`（GitHub pangwalla） | 15,921,292 | 8220 | **0** ✅ |
+| `postmarketos/adsp.mbn.ayn-bak` | 15,523,964 | 8220 | -22 |
+| `qcom/sm8250/adsp.mbn` | 15,515,796 | 8300 | -22 |
+| `qcom/sm8250/ayn/thor/adsp.mbn` | 15,523,964 | 8220 | -22 |
+
+这是**第一次有固件通过验签**。它推翻了先前"所有 OnePlus 固件都倒在验签"
+的记录——之前把整份镜像当 metadata，`-22` 的来源不可信。
+**验签失败只针对本机拼接/厂商通用固件，GitHub 那份能通过**，说明 TZ
+的 trust root 认它的 hash 段。
+
+但用这份验签通过的固件扫 7 组地址（真机 `0x91b00000` span/全容量、
+Tab S6 成功地址 `0x98900000`、raphael、alioth、高内存），
+`init_image` 全部 0、**`mem_setup` 全部 -22**。于是：
+
+- **Tab S6 式"内存区太小/地址冲突"被排除**：换到它成功的地址大小也一样拒；
+- 卡点精确定位在 `qcom_scm_pas_mem_setup()`（PIL `PAS_MEM_SETUP`），
+  且与固件验签、内存地址均无关；
+- 结合 `pas_shutdown` 恒 0、slpi/cdsp 正常 running，SCM 通道本身健康。
+
+剩下最可能是 **PAS_MEM_SETUP 命令在这台机的 TZ 版本上不可用/需前置条件**
+（例如需 bootloader 先做过某次 PIL 初始化，或 iommu/SMMU 上下文未建）。
+这已经不是"换固件/改 DTS"能解决的，要么接受音频不可用，要么动 bootloader
+（用户硬规则禁止，需本人明确授权）。**未启动 DSP、未刷机。**
+
+##### 2026-11-25 01:25 方案 A 上机：真实驱动路径同样卡 `mem_setup`
+
+把验签通过的 `adsp-gh.mbn` 覆盖到 DTS 指定的 `postmarketos/adsp.mbn`
+（原文件备份为 `adsp.mbn.orig-20261125`，sha `ccd2aae6…`，可回滚），
+在线 `echo start > /sys/class/remoteproc/remoteproc2/state`：
+
+```
+[1984.095] remoteproc remoteproc2: powering up adsp
+[1984.131] remoteproc remoteproc2: Booting fw image postmarketos/adsp.mbn, size 15921292
+[1984.164] qcom_q6v5_pas 17300000.remoteproc: error -22 setting up firmware postmarketos/adsp.mbn
+[1984.175] remoteproc remoteproc2: Boot failed: -22
+```
+
+**`initializing firmware` 这一条消失了**（说明 `init_image` 过了），
+但停在 `setting up firmware` = `qcom_scm_pas_mem_setup()`，与 probe 结论逐字一致。
+→ 驱动路径里的 iommu 映射 / clock / power domain 前置动作**不能**让这关通过。
+方案 A 排除。
+
+另注：这段时间 dmesg 里 slpi 在反复 crash + recovering（已 #47，`dog_virtual_user.c`
+stalled initialization），与 adsp 无关，但会持续刷日志，排障时要过滤。
+
+当前设备状态：`adsp.mbn` = gh 版（验签过但 mem_setup 仍 -22），
+原版备份在 `adsp.mbn.orig-20261125`；adsp offline，未刷机、未启动 DSP。
+
+##### 2026-11-25 09:31 方案 A 内核已编译（待刷机）
+
+用户选 A：打补丁看 TZ 原始返回码。新增
+`external-and-mods/kernel-sm8250/patches/0039-firmware-qcom-scm-log-raw-pas-return.patch`，
+在 `drivers/firmware/qcom/qcom_scm-smc.c` 的 `__scm_smc_call()` 中、`qcom_scm_remap_error()`
+**之前**打印 `smc_res.a0/a1/a2/a3`，只对 PIL svc（0x02）生效。
+这样一次启动就能看到 INIT_IMAGE / MEM_SETUP / AUTH_RESET 各自拿到的 TZ 原始码，
+而不是被统一压成的 `-EINVAL`。
+
+`scripts/op8p-build-docker.sh` 全量重编（补丁 digest 变化触发重新打补丁）：
+8 分 08 秒完成，零 error，`work/op8p-build.log:132` 确认 0039 已应用，
+`strings Image | grep PAS_RAW` 命中，源码树 `grep -c PAS_RAW = 1`。
+
+| 产物 | 值 |
+|---|---|
+| `output/current/boot/KERNEL` | 16,685,056 B，md5 `7f3d2faf6709a4be52b0e7325c21607a` |
+| `output/current/boot/Image` | 35,887,616 B |
+| 旧验收镜像 md5（对比） | `81ce93e40960beb0db847cb545f121f0` |
+
+**未刷机**：刷 `boot_a` 会替换掉当前能正常启动的内核，按约定先留给用户确认。
+回滚路径：`work/kernel-sm8250/output-1126-accepted/boot/KERNEL`（旧 md5 如上）。
+
+##### 2026-11-25 10:00 方案 A 上机结果：TZ 私有错误码 `0xffcfffba`
+
+用户确认后进 fastboot（活动槽 b），终端执行
+`./flash-op8p.sh --test`（写 `boot_a` + erase `dtbo_a`）+
+`fastboot --set-active=a && fastboot reboot`。新内核正常启动。
+`flash-op8p.sh` 强制 TTY 输入 YES，脚本外无法代劳，符合硬规则。
+
+启动日志 `dmesg | grep PAS_RAW`（共 23 条，cmd 编号见 qcom_scm.h）：
+
+| 时刻 | cmd | a0 | 含义 |
+|---|---|---|---|
+| 1.64 / 7.35 / 7.43 / 47 / 87 / 127 s | 0x01 INIT_IMAGE | 0x0 | 验签成功 |
+| 多处 | 0x02 MEM_SETUP | 0x0 | **其他 DSP（cdsp/slpi）的 mem_setup 成功** |
+| **7.522** | **0x02 MEM_SETUP** | **`0xffcfffba`** | **仅 ADSP 这一次失败** |
+| 多处 | 0x05 AUTH_RESET | 0x0 | — |
+| 47 s 起 | 0x06 SHUTDOWN | 0x0 | — |
+
+对应 `remoteproc2: Booting ... adsp.mbn` → `error -22 setting up firmware`。
+
+**两个决定性发现**：
+
+1. **TZ 不是一律拒绝 `PAS_MEM_SETUP`**——其他 DSP 的 cmd=0x02 全部 a0=0。
+   这排除了"这条命令在本机 TZ 上不存在/被禁"的假设。
+2. `0xffcfffba`（有符号 −3,145,798）**不是**标准 SCM 码
+   （`QCOM_SCM_ERROR=-1` / `EINVAL_ARG=-2` / `EINVAL_ADDR=-3` / `EOPNOTSUPP=-4` /
+   `ENOMEM=-5` 都不是），是 **TZ 私有错误码**，被 `qcom_scm_remap_error()`
+   的默认分支压成 `-EINVAL`。这正是 Galaxy Tab S6 那篇文章指出的机制。
+
+**结论修正**：卡点不是"命令不支持"，而是 TZ 对**这次特定的 MEM_SETUP 调用**
+返回了设备私有错误。结合其他 DSP 成功，最可能指向 ADSP 保留区
+（`memory@91b00000 + 0x2500000`）与这台 IN2020 的 TZ 期望不符——
+和我们 probe 里换地址全 -22 不矛盾：probe 传的地址虽然不同，但都没经过
+驱动的 iommu/SMMU 映射流程，TZ 看到的上下文不一样。
+###### `0xffcfffba` 查证：就是"区域太小 / 与 TZ 已占用内存重叠"
+
+权威来源：Galaxy Tab S6（SM8150）那篇排障记录（bentlybro.com），逐字写着
+`TZ answers 0xffcfffba and qcom_scm_remap_error() knows five small codes and
+flattens everything else onto -EINVAL` —— **同一个码**。TZ 在 PAS_MEM_SETUP
+同时强制两个条件：
+
+1. 传入的 `size` 是**固件 ELF 的 loadable span**（不是保留区大小），区域必须 ≥ 它；
+2. 该区域**不能与 TZ 已占用的内存重叠**。
+
+Tab S6：26 MB 区 < 39 MB span 被拒，扩到 39 MB 又撞 live modem，两种失败
+都是 `0xffcfffba`；换 `0x98900000` + 39 MB 才接受，改 4 行 DTS 解决。
+
+**对照 IN2020——先纠正一个错误推断**：曾以为"固件 p_paddr 与 adsp_mem 差
+36 MB、毫无交集导致拒绝"。**这是错的**：固件带 `QCOM_MDT_RELOCATABLE`，
+`p_paddr` 只是链接器写下的基准地址，TZ 本来就会把它重定位到 `adsp_mem`，
+两者不同是正常现象，不是错误。
+
+真正可疑的是 **adsp_mem 这个值本身**。三个来源对照：
+
+| 来源 | `adsp_mem` | 结果 |
+|---|---|---|
+| mainline `sm8250.dtsi:853` | `0x8a100000` + `0x1d00000` | — |
+| **Nura（IN2023，音频能起）** | **未改，沿用 mainline 默认值**（217 个补丁里没有 `adsp_mem`） | 能起 |
+| **我们（IN2020）** | 删掉默认节点，改成 `0x91b00000` + `0x2500000` | `0xffcfffba` |
+
+关键差异：Nura 从来没有动过 `adsp_mem`；只有我们把默认值换掉了。
+
+另一个支持性观察：`removed_mem` = `0x80b00000` + `0xcd00000` =
+`0x80b00000`–`0x8d80000`。mainline 的默认 adsp 区
+`0x8a100000`–`0x8be00000` **整段落在 removed_mem 内部**；
+我们改后的 `0x91b00000`–`0x94000000` **完全在 removed_mem 之外**。
+Nura 和我们用的是同一个 `removed_mem`。这与"我们给 TZ 的区域不在它认可的
+那一块"吻合。注意这仍是**推断**，不是证明——`removed_mem` 是 Linux 侧
+no-map 声明，不等于 TZ 内部的布局表。
+
+**已改（2026-11-25 10:10，待刷机）**：`external-and-mods/kernel-sm8250/dts/
+sm8250-oneplus-instantnoodlep.dts` 的 `adsp_mem` 从 `0x91b00000 + 0x2500000`
+改回 mainline/Nura 的 `0x8a100000 + 0x1d00000`。改前 double-check：
+`adsp` 节点引用 `memory-region = <&adsp_mem>` ✓；新地址与其他 13 个保留区
+零冲突（仅与 `removed_mem` 重叠，这是 DSP 子区的正常形态）✓；
+span = 固件 ELF span ✓。
+
+只重编 DTB（`make -C <src> ARCH=arm64 qcom/sm8250-oneplus-instantnoodlep.dtb`，
+注意目标是相对 `arch/arm64` 的路径，`dtbs/xxx.dtb` 和全路径写法都会报
+"No rule to make target"），fdtget 验证 `reg = 0 8a100000 0 1d00000`、
+旧节点不存在。`make-op8p.sh` 重打包，全部断言通过。
+
+| 新 boot 镜像 | 值 |
+|---|---|
+| `work/steamos-op8p/boot-op8p-gzip.img` | 15,937,536 B |
+| sha256 | `4103322b3b39dfc3dc7a1e52bb464bda3cdf4cfc28f1e607ff00359b4274ca0a` |
+| 上一版（仅 PAS_RAW 打印，未改 DTS） | `59843fdd9a37edef1394e630c464e31fe349929622631a8278bcdc9bc13e7014` |
+
+**已刷机上机（2026-11-25 21:36）**：用户执行 `flash-op8p.sh --test` +
+`set-active=a` 启动。DTB 确认生效（真机 `memory@8a100000/reg = 0 8a100000 0 1d00000`），
+但 **a0 仍是 `0xffcfffba`**，adsp 仍 offline、无 soundcard。
+→ **"adsp_mem 地址错"假设排除**：两个截然不同的地址（`0x91b00000`、`0x8a100000`）
+得到完全相同的 TZ 拒绝。
+
+###### 同一启动内的三 DSP 对照（决定性）
+
+```
+[7.719] slpi Booting, 7.802 cmd=0x02 a0=0x0  → 7.942 slpi is now up
+[7.765] cdsp Booting, 7.805 cmd=0x02 a0=0x0  → 7.954 cdsp is now up
+[7.928] adsp Booting, 7.962 cmd=0x02 a0=0xffcfffba → 7.967 error -22
+```
+
+三个 DSP 的 `init_image`(cmd=0x01) 与 `mem_setup`(cmd=0x02) 序列完全相同，
+**只有 adsp 的 mem_setup 被拒**。差异量化：
+
+| DSP | pas_id | 固件 | loadable span | 保留区 | 结果 |
+|---|---|---|---|---|---|
+| slpi | 3 | 7,400,612 B | — | `0x90600000`+`0x1500000` | ✓ |
+| cdsp | 2 | 3,868,436 B | 0x1400000 (20 MiB) | `0x8f200000`+`0x1400000` | ✓ |
+| **adsp** | **1** | **15,921,292 B** | **0x1d00000 (29 MiB)** | 改前/后都拒 | ✗ |
+
+固件大小差 4 倍、span 差 9 MiB。Tab S6 规则里 `size` 参数 = ELF span
+（adsp 29 MiB > cdsp 20 MiB）。**新假设**：TZ 对 adsp 的拒绝与固件 span/
+加载映像本身相关，而非地址——可能这台 IN2020 的 TZ 对 adsp 段有额外校验
+（如要求特定 `p_paddr` 基址、或某个段越界）。probe 里扫地址全 -22 一致。
+
+另一个独立问题：slpi 在 48 s / 88 s 反复 `dog_virtual_user.c stalled
+initialization` 崩溃并 recovering（与 adsp 无关，但持续刷日志）。
+
+**仍未启动 DSP、未刷 bootloader**；设备从 `boot_a`（调试内核）启动，
+回退 `fastboot --set-active=b`。
+
+###### 2026-11-25 21:45 方案 A（扫 span/size）：全部 -22，**size 也排除**
+
+`/tmp` 重启即清空，模块重新经 WiFi 推送（sha `23d44193…` 一致；vermagic
+`7.2.8-sm8250-steamos` 与当前内核匹配——改 DTS 没重编 Image，模块仍兼容）。
+固定验签通过的 gh 固件、固定 `addr=0x8a100000`，扫 `mem_setup` 的 size：
+
+| size | 说明 | `init_image` | `mem_setup` |
+|---|---|---|---|
+| `0x1d00000` | ELF span 精确值 29 MiB | 0 | **-22** |
+| `0x2500000` | 旧保留区 37 MiB | 0 | **-22** |
+| `0x1e00000` | span + 1 MiB | 0 | **-22** |
+| `0x2000000` | 32 MiB | 0 | **-22** |
+| `0x100000` | 1 MiB（故意过小） | 0 | **-22** |
+
+**结论**：size 参数完全不影响结果——从 1 MiB 到 37 MiB 全部被拒，
+且 `init_image` 每次都是 0。结合前面地址扫描（7 组全 -22）和驱动路径
+（两个地址都 `0xffcfffba`），`mem_setup` 的**地址和大小两个参数都排除**。
+
+至此 tab S6 式的"区域太小 / 地址冲突"整条假设链彻底排除。剩下的唯一变量
+是 **pas_id=1 这个 PAS 通道本身**在这台 IN2020 的 TZ 上不可用——
+但同启动里 cdsp(pas_id=2)/slpi(pas_id=3) 的 mem_setup 都成功，
+所以更精确的说法是：**TZ 对 ADSP(pas_id=1) 这一路有设备特定的限制**,
+无论固件、地址、大小如何组合都拒绝。这与 AYN 完整 mbn 能过 setting_up、
+唯独自家固件被拒的旧记录一致。
+
+**音频在这台 IN2020 上基本可判定为 TZ 层硬限制**。除非刷 bootloader
+更新 TZ（用户硬规则禁止）或拿到这台机 TZ 认可的 adsp 固件形态，否则无解。
+未启动 DSP、未刷 bootloader、未动内核 Image。
+
+###### 收尾状态（2026-11-25 21:50，用户决定停止折腾）
+
+用户："记录一下吧，不想折腾了"。停止一切上机操作。记录时的设备状态：
+
+- 端口 `0025ed26` 停在 **fastboot**（串口节点已消失，符合 fastboot 模式）。
+- `current-slot = b` —— 记录过程中设备发生一次重启（`mhi0: Device failed to
+  clear MHI Reset` → `arm-smmu ... disabling translation` → `reboot`），
+  ABL 在反复启动失败后把活动槽从 a 回退到 b。这是 bootloader 自动回退，
+  **不是本轮主动 set-active**。
+- 槽 a 里是最后一版调试内核（PAS_RAW 打印 + `adsp_mem=0x8a100000`）；
+  槽 b 是此前能正常启动的系统（Android 或旧 SteamOS，未核实）。
+- 固件侧：`/lib/firmware/postmarketos/adsp.mbn` = gh 版（验签过但 mem_setup 仍 -22），
+  原版备份 `adsp.mbn.orig-20261125` 保留，随时可回滚。
+- 本轮**未再写任何分区**（最后一次刷机是 10:10 的 boot_a，用户确认过的那次）。
+
+需要回到稳定系统时：设备已在 fastboot，`fastboot --set-active=b && fastboot reboot`
+即可（b 槽未被本轮改动）。若要把槽 a 恢复成原样，需重新刷
+`output-1126-accepted` 的 KERNEL 并把 DTS 改回 `0x91b00000`——用户已决定不做。
 
 ## 33. 震动的 reset 极性：ACTIVE_HIGH 把芯片按在复位里（2026-11-22）
 

@@ -117,4 +117,10 @@ work/
 # bundled into the initramfs when present (build.sh checks -x).
 external-and-mods/kernel-common/initramfs/drmtest
 
+# Out-of-tree PAS probe module: source and scripts are tracked, build output
+# is not (rebuild with scripts/op8p-pas-probe/build.sh; sha256 recorded in
+# docs/op8p/README.md §32.11 and docs/op8p/audio-pas-diagnosis.md).
+scripts/op8p-pas-probe/*.ko
+scripts/op8p-pas-probe/*.mod.c
+
 .workbuddy
